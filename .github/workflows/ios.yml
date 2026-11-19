@@ -1,0 +1,61 @@
+name: Build iOS app
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  engine-tests:
+    name: TorrentKit tests (macOS)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run engine tests
+        working-directory: TorrentKit
+        run: swift test
+
+  ios-app:
+    name: Build TorrentStream.ipa
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show Xcode
+        run: xcodebuild -version
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate Xcode project
+        run: xcodegen generate
+      - name: Install MobileVLCKit (CocoaPods)
+        run: pod install --repo-update
+      - name: Build (device, unsigned)
+        run: |
+          xcodebuild -workspace TorrentStream.xcworkspace -scheme TorrentStream -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build > xcodebuild.log 2>&1 \
+            || { grep -E "error:|warning: .*unavailable" xcodebuild.log | sort -u | head -80; tail -30 xcodebuild.log; exit 1; }
+          tail -3 xcodebuild.log
+      - name: Package unsigned IPA
+        run: |
+          mkdir -p Payload
+          cp -R build/Build/Products/Release-iphoneos/TorrentStream.app Payload/
+          zip -qry TorrentStream-unsigned.ipa Payload
+          ls -lh TorrentStream-unsigned.ipa
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TorrentStream-unsigned-ipa
+          path: TorrentStream-unsigned.ipa
+      - name: Build (simulator)
+        run: |
+          xcodebuild -workspace TorrentStream.xcworkspace -scheme TorrentStream -configuration Debug \
+            -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' -derivedDataPath build-sim \
+            CODE_SIGNING_ALLOWED=NO build > xcodebuild-sim.log 2>&1 \
+            || { grep -E "error:" xcodebuild-sim.log | sort -u | head -80; tail -30 xcodebuild-sim.log; exit 1; }
+          tail -3 xcodebuild-sim.log
+      - name: Package simulator app
+        run: cd build-sim/Build/Products/Debug-iphonesimulator && zip -qry "$GITHUB_WORKSPACE/TorrentStream-simulator.zip" TorrentStream.app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TorrentStream-simulator-app
+          path: TorrentStream-simulator.zip

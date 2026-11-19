@@ -1,0 +1,13 @@
+.build/
+.swiftpm/
+build/
+build-sim/
+DerivedData/
+Pods/
+Payload/
+*.ipa
+*.xcodeproj/
+*.xcworkspace/
+Podfile.lock
+xcuserdata/
+.DS_Store

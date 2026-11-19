@@ -1,0 +1,90 @@
+name: TorrentStream
+options:
+  bundleIdPrefix: com.simonfalke
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+
+packages:
+  TorrentKit:
+    path: TorrentKit
+
+targets:
+  TorrentStream:
+    type: application
+    platform: iOS
+    sources:
+      - path: App/Sources
+    dependencies:
+      - package: TorrentKit
+        product: TorrentKit
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.simonfalke.TorrentStream
+        PRODUCT_NAME: TorrentStream
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SWIFT_VERSION: "5.0"
+        CODE_SIGN_STYLE: Automatic
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+        INFOPLIST_KEY_CFBundleDisplayName: TorrentStream
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleDisplayName: TorrentStream
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        UILaunchScreen: {}
+        UIRequiresFullScreen: false
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        # Keeps torrent + local stream server alive while audio plays / while VLC streams from us.
+        UIBackgroundModes:
+          - audio
+        # Plain-HTTP trackers and the 127.0.0.1 stream server.
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+          NSAllowsLocalNetworking: true
+        NSLocalNetworkUsageDescription: TorrentStream connects to BitTorrent peers that may be on your local network.
+        LSApplicationQueriesSchemes:
+          - vlc
+          - vlc-x-callback
+        CFBundleURLTypes:
+          - CFBundleURLName: Magnet link
+            CFBundleURLSchemes:
+              - magnet
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: BitTorrent file
+            CFBundleTypeRole: Viewer
+            LSHandlerRank: Owner
+            LSItemContentTypes:
+              - org.bittorrent.torrent
+        UTImportedTypeDeclarations:
+          - UTTypeIdentifier: org.bittorrent.torrent
+            UTTypeDescription: BitTorrent file
+            UTTypeConformsTo:
+              - public.data
+            UTTypeTagSpecification:
+              public.filename-extension:
+                - torrent
+              public.mime-type:
+                - application/x-bittorrent
+        LSSupportsOpeningDocumentsInPlace: false
+
+schemes:
+  TorrentStream:
+    build:
+      targets:
+        TorrentStream: all
+    run:
+      config: Debug
+    archive:
+      config: Release
