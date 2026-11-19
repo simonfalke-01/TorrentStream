@@ -118,7 +118,7 @@ struct DownloadsView: View {
         let url = model.localURL(e.item.torrent, e.file.file)
         return HStack(spacing: 14) {
             ZStack {
-                RoundedRectangle(cornerRadius: 10, style: .continuous).fill(accentColor(for: e.item.id).gradient)
+                RoundedRectangle(cornerRadius: 10, style: .continuous).fill(torrentTint(for: e.item.id).gradient)
                 Image(systemName: e.file.file.kind == .audio ? "music.note" : "play.fill").foregroundStyle(.white)
             }
             .frame(width: 44, height: 44)

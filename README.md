@@ -8,7 +8,14 @@ An iOS app that streams video and audio straight out of a torrent — like VLC, 
 * Built-in **VLC player** (MobileVLCKit): MKV, AVI, WebM, HEVC, etc., **audio-track switching**, **embedded subtitles**,
   **subtitle files from the torrent** (auto-loaded), **load your own subtitle file**, subtitle/audio delay, playback speed.
 * **One tap "Open in VLC"** hands the stream to the VLC for iOS app (TorrentStream keeps serving it in the background).
-* Optional Apple AVPlayer engine (MP4/MOV, AirPlay, Picture in Picture).
+* Optional Apple AVPlayer engine (MP4/MOV, AirPlay, Picture in Picture), switchable mid-playback.
+* **iOS 26 Liquid Glass** UI: glass tab bar, glass player controls, a seek bar that shows which parts of the file
+  are already downloaded, double-tap to skip ±10 s, resume where you left off, and Up Next autoplay for episodes.
+* **Downloads tab**: active downloads with progress, a "Ready to Watch" list, and storage usage.
+* Finished files can be **saved to Files, saved to Photos (MP4/MOV), or shared** instead of being discarded.
+  Removing a torrent offers to save what's downloaded first.
+
+Requires **iOS 26** or later.
 
 ## How it works
 
@@ -28,12 +35,13 @@ needed pieces are downloaded and tells the engine where playback is, so download
 ## Getting the app
 
 ### Option A — prebuilt IPA (no Mac needed)
-Every push builds the app on GitHub Actions (macOS). Download the **TorrentStream-unsigned-ipa** artifact from the
+Every push builds the app on GitHub Actions (macOS 26, Xcode 26). Download the **TorrentStream-unsigned-ipa** artifact from the
 latest run on the Actions tab and install it with [Sideloadly](https://sideloadly.io) or
 [AltStore](https://altstore.io), which sign it with your Apple ID.
 
 ### Option B — build with Xcode
 ```sh
+# Xcode 26 or later
 brew install xcodegen cocoapods
 xcodegen generate
 pod install

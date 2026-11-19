@@ -359,14 +359,18 @@ final class AppModel: ObservableObject {
     func refreshStorage() {
         let dir = client.downloadDirectory
         Task.detached(priority: .utility) {
-            var total: Int64 = 0
-            if let e = FileManager.default.enumerator(at: dir, includingPropertiesForKeys: [.totalFileAllocatedSizeKey]) {
-                for case let u as URL in e {
-                    total += Int64((try? u.resourceValues(forKeys: [.totalFileAllocatedSizeKey]).totalFileAllocatedSize) ?? 0)
-                }
-            }
+            let total = AppModel.allocatedSize(of: dir)
             await MainActor.run { self.storageUsed = total }
         }
+    }
+
+    nonisolated private static func allocatedSize(of dir: URL) -> Int64 {
+        var total: Int64 = 0
+        guard let e = FileManager.default.enumerator(at: dir, includingPropertiesForKeys: [.totalFileAllocatedSizeKey]) else { return 0 }
+        for case let u as URL in e {
+            total += Int64((try? u.resourceValues(forKeys: [.totalFileAllocatedSizeKey]).totalFileAllocatedSize) ?? 0)
+        }
+        return total
     }
 
     func removeAll() {

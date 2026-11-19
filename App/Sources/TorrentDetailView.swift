@@ -165,7 +165,7 @@ struct TorrentDetailView: View {
         return Button { play(fs.file, item: item) } label: {
             HStack(spacing: 14) {
                 ZStack {
-                    RoundedRectangle(cornerRadius: 10, style: .continuous).fill(accentColor(for: item.id).gradient)
+                    RoundedRectangle(cornerRadius: 10, style: .continuous).fill(torrentTint(for: item.id).gradient)
                     Image(systemName: fs.file.kind == .audio ? "music.note" : "play.fill")
                         .font(.headline).foregroundStyle(.white)
                 }

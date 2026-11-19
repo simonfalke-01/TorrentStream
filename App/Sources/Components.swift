@@ -45,7 +45,7 @@ extension TorrentFile {
 }
 
 /// Deterministic accent colour per torrent so placeholders are distinguishable.
-func accentColor(for hash: String) -> Color {
+func torrentTint(for hash: String) -> Color {
     let palette: [Color] = [.indigo, .purple, .pink, .orange, .teal, .blue, .mint, .cyan, .red]
     let v = hash.unicodeScalars.reduce(0) { ($0 &* 31 &+ Int($1.value)) & 0xffff }
     return palette[v % palette.count]
@@ -59,7 +59,7 @@ struct ArtworkView: View {
     var cornerRadius: CGFloat = 12
 
     var body: some View {
-        let tint = accentColor(for: hash)
+        let tint = torrentTint(for: hash)
         ZStack {
             LinearGradient(colors: [tint.opacity(0.9), tint.opacity(0.45)], startPoint: .topLeading, endPoint: .bottomTrailing)
             Image(systemName: symbol)
