@@ -9,7 +9,7 @@ on:
 jobs:
   engine-tests:
     name: TorrentKit tests (macOS)
-    runs-on: macos-15
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
       - name: Run engine tests
@@ -18,11 +18,11 @@ jobs:
 
   ios-app:
     name: Build TorrentStream.ipa
-    runs-on: macos-15
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
       - name: Show Xcode
-        run: xcodebuild -version
+        run: xcodebuild -version && xcodebuild -showsdks | grep -i ios
       - name: Install XcodeGen
         run: brew install xcodegen
       - name: Generate Xcode project

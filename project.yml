@@ -2,7 +2,7 @@ name: TorrentStream
 options:
   bundleIdPrefix: com.simonfalke
   deploymentTarget:
-    iOS: "16.0"
+    iOS: "26.0"
   createIntermediateGroups: true
 
 packages:
@@ -22,8 +22,8 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.simonfalke.TorrentStream
         PRODUCT_NAME: TorrentStream
-        MARKETING_VERSION: "1.0"
-        CURRENT_PROJECT_VERSION: "1"
+        MARKETING_VERSION: "2.0"
+        CURRENT_PROJECT_VERSION: "2"
         TARGETED_DEVICE_FAMILY: "1,2"
         SWIFT_VERSION: "5.0"
         CODE_SIGN_STYLE: Automatic
@@ -54,6 +54,7 @@ targets:
           NSAllowsArbitraryLoads: true
           NSAllowsLocalNetworking: true
         NSLocalNetworkUsageDescription: TorrentStream connects to BitTorrent peers that may be on your local network.
+        NSPhotoLibraryAddUsageDescription: TorrentStream saves downloaded videos to your photo library when you choose Save to Photos.
         LSApplicationQueriesSchemes:
           - vlc
           - vlc-x-callback

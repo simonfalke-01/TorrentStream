@@ -10,98 +10,208 @@ struct LibraryView: View {
     @EnvironmentObject var model: AppModel
     @ObservedObject private var keeper = BackgroundKeeper.shared
     @State private var showAdd = false
-    @State private var showSettings = false
-    @State private var pendingDelete: Torrent?
+    @State private var search = ""
+    @State private var pendingRemoval: LibraryItem?
+    @State private var export: ExportItem?
+
+    private var filtered: [LibraryItem] {
+        let q = search.trimmingCharacters(in: .whitespaces)
+        guard !q.isEmpty else { return model.items }
+        return model.items.filter { $0.status.name.localizedCaseInsensitiveContains(q) }
+    }
 
     var body: some View {
         NavigationStack(path: $model.navigationPath) {
             List {
                 if keeper.isActive {
-                    Section {
-                        HStack {
-                            Image(systemName: "dot.radiowaves.left.and.right").foregroundStyle(.green)
-                            VStack(alignment: .leading) {
-                                Text("Streaming to VLC").font(.subheadline.bold())
-                                Text("TorrentStream stays active in the background to feed VLC.").font(.caption).foregroundStyle(.secondary)
+                    Section { VLCBanner(keeper: keeper) }
+                        .listRowBackground(Color.clear)
+                        .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
+                }
+                ForEach(filtered) { item in
+                    NavigationLink(value: item.id) {
+                        TorrentRow(item: item, artwork: model.artworkURL(item))
+                    }
+                    .swipeActions(edge: .trailing) {
+                        Button(role: .destructive) { pendingRemoval = item } label: { Label("Remove", systemImage: "trash") }
+                        if item.status.phase == .ready && !item.status.isComplete {
+                            Button { model.togglePause(item.torrent) } label: {
+                                item.status.isPaused ? Label("Resume", systemImage: "play.fill") : Label("Pause", systemImage: "pause.fill")
                             }
-                            Spacer()
-                            Button("Stop") { keeper.stop() }.buttonStyle(.bordered)
+                            .tint(.orange)
                         }
                     }
-                }
-                if model.items.isEmpty {
-                    Section {
-                        VStack(spacing: 12) {
-                            Image(systemName: "play.rectangle.on.rectangle").font(.system(size: 44)).foregroundStyle(.tint)
-                            Text("No torrents yet").font(.headline)
-                            Text("Add a magnet link or a .torrent file, pick a video and it starts playing while it downloads.")
-                                .font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center)
-                            Button { showAdd = true } label: { Label("Add Torrent", systemImage: "plus") }
-                                .buttonStyle(.borderedProminent)
-                        }
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 24)
+                    .contextMenu {
+                        TorrentActionsMenu(item: item, onRemove: { pendingRemoval = item })
                     }
-                }
-                ForEach(model.items) { item in
-                    NavigationLink(value: item.id) { TorrentRow(status: item.status) }
-                        .swipeActions {
-                            Button(role: .destructive) { pendingDelete = item.torrent } label: { Label("Remove", systemImage: "trash") }
-                        }
                 }
             }
-            .navigationTitle("TorrentStream")
+            .listStyle(.insetGrouped)
+            .overlay {
+                if model.items.isEmpty {
+                    ContentUnavailableView {
+                        Label("Nothing to Watch Yet", systemImage: "play.rectangle.on.rectangle")
+                    } description: {
+                        Text("Add a magnet link or a .torrent file. Pick a video and it starts playing in seconds, while it downloads.")
+                    } actions: {
+                        Button { showAdd = true } label: { Label("Add Torrent", systemImage: "plus") }
+                            .buttonStyle(.glassProminent)
+                            .controlSize(.large)
+                    }
+                } else if filtered.isEmpty {
+                    ContentUnavailableView.search(text: search)
+                }
+            }
+            .searchable(text: $search, prompt: "Search library")
+            .navigationTitle("Library")
             .navigationDestination(for: String.self) { hash in TorrentDetailView(infoHash: hash) }
             .toolbar {
-                ToolbarItem(placement: .navigationBarLeading) {
-                    Button { showSettings = true } label: { Image(systemName: "gearshape") }
-                }
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    Button { showAdd = true } label: { Image(systemName: "plus") }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button { showAdd = true } label: { Label("Add Torrent", systemImage: "plus") }
+                        .buttonStyle(.glassProminent)
                 }
             }
             .sheet(isPresented: $showAdd) { AddTorrentView() }
-            .sheet(isPresented: $showSettings) { SettingsView() }
-            .confirmationDialog("Remove torrent?", isPresented: Binding(get: { pendingDelete != nil }, set: { if !$0 { pendingDelete = nil } }),
-                                titleVisibility: .visible) {
-                Button("Remove and delete downloaded data", role: .destructive) {
-                    if let t = pendingDelete { model.remove(t, deleteData: true) }
-                }
-                Button("Remove, keep data") { if let t = pendingDelete { model.remove(t, deleteData: false) } }
-            }
-            .alert("Error", isPresented: Binding(get: { model.errorMessage != nil }, set: { if !$0 { model.errorMessage = nil } })) {
-                Button("OK", role: .cancel) {}
-            } message: { Text(model.errorMessage ?? "") }
+            .sheet(item: $export) { e in DocumentExporter(urls: e.urls).ignoresSafeArea() }
+            .removeTorrentDialog(item: $pendingRemoval, export: $export)
         }
     }
 }
 
-struct TorrentRow: View {
-    let status: TorrentStatus
+/// Shown while TorrentStream is feeding the VLC app from the background.
+struct VLCBanner: View {
+    @ObservedObject var keeper: BackgroundKeeper
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(status.name).font(.headline).lineLimit(2)
-            switch status.phase {
-            case .fetchingMetadata:
-                Label("Fetching file list… \(status.connectedPeers) peers", systemImage: "magnifyingglass")
-                    .font(.caption).foregroundStyle(.secondary)
-            case .failed(let msg):
-                Label(msg, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(.red)
-            case .ready:
-                ProgressView(value: status.progress)
-                HStack {
-                    Text("\(Format.bytes(status.downloadedBytes)) of \(Format.bytes(status.totalLength))")
-                    Spacer()
-                    Image(systemName: "person.2")
-                    Text("\(status.connectedPeers)")
-                    Image(systemName: "arrow.down")
-                    Text(Format.rate(status.downloadRate))
+        HStack(spacing: 12) {
+            Image(systemName: "dot.radiowaves.left.and.right")
+                .symbolEffect(.variableColor.iterative, options: .repeating)
+                .foregroundStyle(.orange)
+                .font(.title3)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Streaming to VLC").font(.subheadline.weight(.semibold))
+                Text("Stays active in the background while VLC plays.").font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button("Stop") { keeper.stop() }.buttonStyle(.glass)
+        }
+        .padding(14)
+        .glassEffect(.regular.tint(.orange.opacity(0.15)), in: .rect(cornerRadius: 22))
+    }
+}
+
+struct TorrentRow: View {
+    let item: LibraryItem
+    let artwork: URL?
+
+    var body: some View {
+        let s = item.status
+        HStack(spacing: 14) {
+            ArtworkView(hash: item.id, url: artwork, symbol: "film.stack", cornerRadius: 10)
+                .frame(width: 54, height: 72)
+            VStack(alignment: .leading, spacing: 6) {
+                Text(s.name).font(.headline).lineLimit(2)
+                statusLine(s)
+                if s.phase == .ready && !s.isComplete && s.downloadedBytes > 0 {
+                    ProgressView(value: s.progress)
+                        .tint(s.isPaused ? .secondary : .accentColor)
                 }
-                .font(.caption).foregroundStyle(.secondary).monospacedDigit()
             }
         }
         .padding(.vertical, 4)
+    }
+
+    @ViewBuilder
+    private func statusLine(_ s: TorrentStatus) -> some View {
+        Group {
+            switch s.phase {
+            case .fetchingMetadata:
+                Label("Finding peers… \(s.connectedPeers) connected", systemImage: "antenna.radiowaves.left.and.right")
+            case .failed(let msg):
+                Label(msg, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red)
+            case .ready:
+                if s.isComplete {
+                    Label("\(Format.bytes(s.totalLength)) · Downloaded", systemImage: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                } else if s.isPaused {
+                    Label("Paused · \(Format.bytes(s.downloadedBytes)) of \(Format.bytes(s.totalLength))", systemImage: "pause.circle.fill")
+                } else if s.downloadRate > 0 {
+                    Label("\(Format.rate(s.downloadRate)) · \(s.connectedPeers) peers", systemImage: "arrow.down")
+                } else {
+                    let videos = s.files.filter { $0.file.kind == .video }.count
+                    Text("\(Format.bytes(s.totalLength))" + (videos > 0 ? " · \(videos) video\(videos == 1 ? "" : "s")" : ""))
+                }
+            }
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .monospacedDigit()
+    }
+}
+
+/// Pause / download / share / remove actions for a torrent (context menu and detail toolbar).
+struct TorrentActionsMenu: View {
+    @EnvironmentObject var model: AppModel
+    let item: LibraryItem
+    let onRemove: () -> Void
+
+    var body: some View {
+        let s = item.status
+        if s.phase == .ready && !s.isComplete {
+            Button { model.togglePause(item.torrent) } label: {
+                s.isPaused ? Label("Resume", systemImage: "play.fill") : Label("Pause", systemImage: "pause.fill")
+            }
+            if s.hasActiveDownloads {
+                Button { model.stopAllDownloads(item.torrent) } label: { Label("Stop All Downloads", systemImage: "stop.circle") }
+            }
+            if s.files.contains(where: { !$0.isComplete && !$0.wanted && !$0.file.isPadding }) {
+                Button { model.downloadAll(item.torrent) } label: { Label("Download Everything", systemImage: "arrow.down.circle") }
+            }
+        }
+        Section {
+            Button { model.copyMagnet(item.torrent) } label: { Label("Copy Magnet Link", systemImage: "link") }
+            ShareLink(item: item.torrent.magnetLink) { Label("Share Magnet Link", systemImage: "square.and.arrow.up") }
+        }
+        Section {
+            Button(role: .destructive, action: onRemove) { Label("Remove Torrent", systemImage: "trash") }
+        }
+    }
+}
+
+extension View {
+    /// Confirmation for removing a torrent; offers to save finished files first so nothing is lost.
+    func removeTorrentDialog(item: Binding<LibraryItem?>, export: Binding<ExportItem?>) -> some View {
+        modifier(RemoveTorrentDialog(item: item, export: export))
+    }
+}
+
+private struct RemoveTorrentDialog: ViewModifier {
+    @EnvironmentObject var model: AppModel
+    @Binding var item: LibraryItem?
+    @Binding var export: ExportItem?
+
+    func body(content: Content) -> some View {
+        let saved = item.map { model.completedMediaURLs($0) } ?? []
+        content.confirmationDialog(
+            "Remove “\(item?.status.name ?? "")”?",
+            isPresented: Binding(get: { item != nil }, set: { if !$0 { item = nil } }),
+            titleVisibility: .visible,
+            presenting: item
+        ) { it in
+            if !saved.isEmpty {
+                Button("Save \(saved.count) Downloaded File\(saved.count == 1 ? "" : "s") to Files…") {
+                    export = ExportItem(urls: saved)
+                }
+            }
+            Button("Remove and Delete Data", role: .destructive) { model.remove(it.torrent) }
+            Button("Cancel", role: .cancel) {}
+        } message: { _ in
+            if saved.isEmpty {
+                Text("Downloaded data for this torrent will be deleted from this device.")
+            } else {
+                Text("Downloaded data will be deleted from this device. Save finished files to the Files app first to keep them.")
+            }
+        }
     }
 }
 
@@ -110,89 +220,81 @@ struct AddTorrentView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var magnet = ""
     @State private var importing = false
+    @FocusState private var focused: Bool
+
+    private var isValid: Bool {
+        let t = magnet.trimmingCharacters(in: .whitespacesAndNewlines)
+        return (try? TorrentDescriptor.parse(magnet: t)) != nil
+    }
 
     var body: some View {
         NavigationStack {
             Form {
                 Section {
                     TextField("magnet:?xt=urn:btih:…", text: $magnet, axis: .vertical)
-                        .lineLimit(3...6)
+                        .lineLimit(2...5)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .font(.system(.footnote, design: .monospaced))
-                    Button {
-                        if let s = UIPasteboard.general.string { magnet = s }
-                    } label: { Label("Paste from Clipboard", systemImage: "doc.on.clipboard") }
-                    Button {
-                        if model.addMagnet(magnet) { dismiss() }
-                    } label: { Label("Add Magnet Link", systemImage: "link") }
-                        .disabled(magnet.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                } header: { Text("Magnet link") }
+                        .focused($focused)
+                        .submitLabel(.go)
+                        .onSubmit(add)
+                    HStack {
+                        PasteButton(payloadType: String.self) { strings in
+                            if let s = strings.first { magnet = s.trimmingCharacters(in: .whitespacesAndNewlines) }
+                        }
+                        .labelStyle(.titleAndIcon)
+                        .buttonBorderShape(.capsule)
+                        Spacer()
+                        if !magnet.isEmpty {
+                            Image(systemName: isValid ? "checkmark.circle.fill" : "xmark.circle.fill")
+                                .foregroundStyle(isValid ? .green : .red)
+                                .transition(.scale.combined(with: .opacity))
+                        }
+                    }
+                } header: {
+                    Text("Magnet link")
+                } footer: {
+                    Text("Tip: tapping a magnet link in Safari opens it here directly.")
+                }
 
                 Section {
-                    Button { importing = true } label: { Label("Choose .torrent File…", systemImage: "doc.badge.plus") }
-                } header: { Text("Torrent file") } footer: {
-                    Text("You can also open .torrent files and magnet links directly from Safari, Files or other apps.")
+                    Button { importing = true } label: {
+                        Label("Choose a .torrent File", systemImage: "doc.badge.plus")
+                    }
+                } header: {
+                    Text("Torrent file")
+                } footer: {
+                    Text("You can also share or open .torrent files from Files, Mail or Safari.")
                 }
             }
+            .animation(.snappy, value: isValid)
             .navigationTitle("Add Torrent")
             .navigationBarTitleDisplayMode(.inline)
-            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } } }
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button(role: .cancel) { dismiss() } label: { Label("Cancel", systemImage: "xmark") }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(action: add) { Label("Add", systemImage: "checkmark") }
+                        .buttonStyle(.glassProminent)
+                        .disabled(!isValid)
+                }
+            }
             .fileImporter(isPresented: $importing, allowedContentTypes: [.torrent, .data], allowsMultipleSelection: false) { result in
-                if case .success(let urls) = result, let url = urls.first {
-                    model.addTorrentFile(at: url)
-                    if model.errorMessage == nil { dismiss() }
-                } else if case .failure(let error) = result {
+                switch result {
+                case .success(let urls):
+                    if let url = urls.first, model.addTorrentFile(at: url) { dismiss() }
+                case .failure(let error):
                     model.errorMessage = error.localizedDescription
                 }
             }
-            .onAppear {
-                if magnet.isEmpty, let s = UIPasteboard.general.string, s.lowercased().hasPrefix("magnet:") { magnet = s }
-            }
         }
+        .presentationDetents([.medium, .large])
     }
-}
 
-struct SettingsView: View {
-    @Environment(\.dismiss) private var dismiss
-    @AppStorage("playerEngine") private var engine: String = PlayerEngine.vlc.rawValue
-
-    var body: some View {
-        NavigationStack {
-            Form {
-                Section {
-                    Picker("Built-in player", selection: $engine) {
-                        ForEach(PlayerEngine.allCases) { e in Text(e.title).tag(e.rawValue) }
-                    }
-                    .pickerStyle(.inline)
-                    .disabled(!VLCAvailability.isAvailable)
-                } header: { Text("Playback") } footer: {
-                    if VLCAvailability.isAvailable {
-                        Text("VLC plays MKV, AVI, WebM, HEVC and more, and lets you switch audio tracks and subtitles. AVPlayer supports embedded tracks of MP4/MOV files only.")
-                    } else {
-                        Text("This build was made without MobileVLCKit, so only AVPlayer is available. Use “Open in VLC” for other formats.")
-                    }
-                }
-                Section("About") {
-                    LabeledContent("Engine", value: "TorrentKit (BitTorrent v1, DHT, PEX, ut_metadata)")
-                    LabeledContent("Streaming port", value: "127.0.0.1")
-                }
-            }
-            .navigationTitle("Settings")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
-        }
-    }
-}
-
-enum Format {
-    static func bytes(_ v: Int64) -> String {
-        ByteCountFormatter.string(fromByteCount: v, countStyle: .file)
-    }
-    static func rate(_ v: Double) -> String { bytes(Int64(v)) + "/s" }
-    static func time(_ ms: Int64) -> String {
-        let s = max(0, ms / 1000)
-        let h = s / 3600, m = (s % 3600) / 60, sec = s % 60
-        return h > 0 ? String(format: "%d:%02d:%02d", h, m, sec) : String(format: "%d:%02d", m, sec)
+    private func add() {
+        guard isValid else { return }
+        if model.addMagnet(magnet) { dismiss() }
     }
 }

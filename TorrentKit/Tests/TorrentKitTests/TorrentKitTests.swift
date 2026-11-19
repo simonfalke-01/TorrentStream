@@ -121,6 +121,34 @@ final class TorrentKitTests: XCTestCase {
         XCTAssertEqual(body, content.subdata(in: 5_000 + 150_000 ..< 5_000 + 200_000))
     }
 
+    func testPauseResumeAndAvailability() throws {
+        let (data, content) = makeTorrent(files: [("clip.mp4", 200_000)], pieceLength: 16384)
+        let desc = try TorrentDescriptor.parse(torrentData: data)
+        let seeder = try FakeSeeder(info: desc.info!, content: content)
+        defer { seeder.stop() }
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let client = TorrentClient(downloadDirectory: dir, useDHT: false, extraTrackers: [])
+        defer { client.shutdown() }
+        let torrent = try client.add(torrentData: data)
+        torrent.pause()
+        XCTAssertTrue(torrent.status().isPaused)
+        torrent.addPeers([PeerAddress(ip: 0x7f00_0001, port: seeder.port)], source: "test")
+        // Reading from a paused torrent resumes it.
+        XCTAssertTrue(try torrent.waitForData(fileIndex: 0, offset: 0, length: 20_000, readerID: UUID(), timeout: 20))
+        XCTAssertFalse(torrent.status().isPaused)
+        torrent.setWanted(true, fileIndex: 0)
+        let deadline = Date().addingTimeInterval(20)
+        while !(torrent.status().files.first?.isComplete ?? false) && Date() < deadline { Thread.sleep(forTimeInterval: 0.1) }
+        let fs = try XCTUnwrap(torrent.status().files.first)
+        XCTAssertTrue(fs.isComplete)
+        XCTAssertFalse(fs.isDownloading)
+        XCTAssertEqual(torrent.availability(fileIndex: 0, buckets: 8), Array(repeating: 1.0, count: 8))
+        let local = try XCTUnwrap(torrent.localURL(fileIndex: 0))
+        XCTAssertEqual(try Data(contentsOf: local), content)
+        XCTAssertTrue(torrent.magnetLink.hasPrefix("magnet:?xt=urn:btih:\(desc.infoHashHex)"))
+    }
+
     func testMetadataExchangeFromMagnet() throws {
         let (data, content) = makeTorrent(files: [("a.mkv", 70_000)], pieceLength: 16384)
         let desc = try TorrentDescriptor.parse(torrentData: data)

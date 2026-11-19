@@ -179,6 +179,12 @@ final class TrackerAnnouncer {
         while true {
             cond.lock(); let isStopped = stopped; forceAnnounce = false; cond.unlock()
             guard !isStopped, let torrent = torrent else { return }
+            if torrent.isPaused {
+                cond.lock()
+                _ = cond.wait(until: Date().addingTimeInterval(5))
+                cond.unlock()
+                continue
+            }
             let req = torrent.makeAnnounceRequest(event: event)
             var wait: TimeInterval
             do {

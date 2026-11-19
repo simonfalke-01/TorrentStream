@@ -35,6 +35,9 @@ public struct FileStatus: Identifiable, Hashable {
     public let wanted: Bool
     public var id: Int { file.index }
     public var progress: Double { file.length == 0 ? 1 : Double(downloadedBytes) / Double(file.length) }
+    public var isComplete: Bool { downloadedBytes >= file.length }
+    /// Being fetched in the background (wanted, not finished yet).
+    public var isDownloading: Bool { wanted && !isComplete }
 }
 
 public struct TorrentStatus {
@@ -47,6 +50,7 @@ public struct TorrentStatus {
     public let infoHashHex: String
     public let name: String
     public let phase: Phase
+    public let isPaused: Bool
     public let files: [FileStatus]
     public let totalLength: Int64
     public let downloadedBytes: Int64
@@ -56,6 +60,9 @@ public struct TorrentStatus {
     public let metadataProgress: Double
 
     public var progress: Double { totalLength == 0 ? 0 : Double(downloadedBytes) / Double(totalLength) }
+    public var isComplete: Bool { totalLength > 0 && downloadedBytes >= totalLength }
+    /// True when some files are queued for download and not finished yet.
+    public var hasActiveDownloads: Bool { files.contains { $0.isDownloading && !$0.file.isPadding } }
 }
 
 public struct StreamStatus {
@@ -113,6 +120,7 @@ public final class Torrent {
     private var currentRate: Double = 0
     private var failure: String?
     private var stopped = false
+    private var paused = false
     private var resumeDirty = false
     private var lastResumeSave = Date()
     private var lastDHTLookup = Date.distantPast
@@ -130,6 +138,27 @@ public final class Torrent {
     }
 
     var isStopped: Bool { lock.lock(); defer { lock.unlock() }; return stopped }
+    public var isPaused: Bool { lock.lock(); defer { lock.unlock() }; return paused }
+
+    /// Disconnects from the swarm and stops all network activity until `resume()` (or a playback request).
+    public func pause() {
+        lock.lock()
+        guard !paused else { lock.unlock(); return }
+        paused = true
+        let ps = Array(peers.values)
+        saveResumeLocked()
+        lock.unlock()
+        ps.forEach { $0.close() }
+    }
+
+    public func resume() {
+        lock.lock()
+        let was = paused
+        paused = false
+        if was { retryAfter.removeAll() }
+        lock.unlock()
+        if was { trackers.forEach { $0.poke() } }
+    }
 
     private var dataDirectory: URL { directory.appendingPathComponent("data", isDirectory: true) }
     private var infoFile: URL { directory.appendingPathComponent("info.bencode") }
@@ -186,6 +215,11 @@ public final class Torrent {
         rateMeter.add(bytesSinceTick)
         bytesSinceTick = 0
         currentRate = rateMeter.rate()
+        if paused {
+            if resumeDirty { saveResumeLocked() }
+            lock.unlock()
+            return true
+        }
 
         let now = Date()
         let connecting = peers.values.filter { !handshaked.contains(ObjectIdentifier($0)) }.count
@@ -405,6 +439,7 @@ public final class Torrent {
         lock.lock(); defer { lock.unlock() }
         var actions = PeerActions()
         if stopped { actions.disconnectReason = "stopped"; return actions }
+        if paused { actions.disconnectReason = "paused"; return actions }
         let now = Date()
 
         guard let info = info else {
@@ -606,6 +641,13 @@ public final class Torrent {
         let start = file.offset + offset
         let end = min(file.offset + file.length, start + Int64(max(length, 1)))
         let range = info.pieces(from: start, to: end)
+        if paused && !range.allSatisfy({ have[$0] }) {
+            // Playing something un-pauses the torrent.
+            paused = false
+            retryAfter.removeAll()
+            let ts = trackers
+            DispatchQueue.global().async { ts.forEach { $0.poke() } }
+        }
         if readers[readerID]?.piece != range.lowerBound || readers[readerID]?.fileIndex != fileIndex {
             orderDirty = true
         }
@@ -667,6 +709,7 @@ public final class Torrent {
             infoHashHex: infoHashHex,
             name: info?.name ?? descriptor.displayName ?? infoHashHex,
             phase: phase,
+            isPaused: paused,
             files: files,
             totalLength: info?.totalLength ?? 0,
             downloadedBytes: downloaded,
@@ -675,6 +718,32 @@ public final class Torrent {
             downloadRate: currentRate,
             metadataProgress: info != nil ? 1 : metaProgress
         )
+    }
+
+    /// Downloaded fraction of a file split into `buckets` equal segments (for a "buffered" bar).
+    public func availability(fileIndex: Int, buckets: Int) -> [Double] {
+        lock.lock(); defer { lock.unlock() }
+        guard let info = info, fileIndex >= 0, fileIndex < info.files.count, buckets > 0 else { return [] }
+        let file = info.files[fileIndex]
+        guard file.length > 0 else { return Array(repeating: 1, count: buckets) }
+        var out = [Double](repeating: 0, count: buckets)
+        for b in 0..<buckets {
+            let s = file.offset + file.length * Int64(b) / Int64(buckets)
+            let e = max(s + 1, file.offset + file.length * Int64(b + 1) / Int64(buckets))
+            let range = info.pieces(from: s, to: e)
+            out[b] = Double(range.filter { have[$0] }.count) / Double(range.count)
+        }
+        return out
+    }
+
+    /// Magnet link for sharing this torrent.
+    public var magnetLink: String {
+        if let m = descriptor.magnetURI, m.lowercased().hasPrefix("magnet:") { return m }
+        var s = "magnet:?xt=urn:btih:\(infoHashHex)"
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._~"))
+        if let n = descriptor.displayName ?? torrentInfo?.name { s += "&dn=" + (n.addingPercentEncoding(withAllowedCharacters: allowed) ?? "") }
+        for t in descriptor.trackers.prefix(10) { s += "&tr=" + (t.addingPercentEncoding(withAllowedCharacters: allowed) ?? "") }
+        return s
     }
 
     public func streamStatus(fileIndex: Int) -> StreamStatus {

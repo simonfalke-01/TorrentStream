@@ -13,12 +13,48 @@ struct TorrentStreamApp: App {
 
     var body: some Scene {
         WindowGroup {
-            LibraryView()
+            RootView()
                 .environmentObject(model)
                 .onOpenURL { url in model.handleOpen(url: url) }
         }
-        .onChange(of: scenePhase) { phase in
-            if phase == .active { model.client.ensureStreamingServer() }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active {
+                model.client.ensureStreamingServer()
+                model.refreshStorage()
+            }
+        }
+    }
+}
+
+struct RootView: View {
+    @EnvironmentObject var model: AppModel
+
+    var body: some View {
+        TabView(selection: $model.selectedTab) {
+            Tab("Library", systemImage: "play.square.stack.fill", value: AppTab.library) {
+                LibraryView()
+            }
+            Tab("Downloads", systemImage: "arrow.down.circle.fill", value: AppTab.downloads) {
+                DownloadsView()
+            }
+            .badge(model.activeDownloadCount)
+            Tab("Settings", systemImage: "gearshape.fill", value: AppTab.settings) {
+                SettingsView()
+            }
+        }
+        .tabBarMinimizeBehavior(.onScrollDown)
+        .overlay(alignment: .top) {
+            if let toast = model.toast {
+                ToastView(toast: toast)
+                    .padding(.top, 8)
+                    .allowsHitTesting(false)
+            }
+        }
+        .sensoryFeedback(.success, trigger: model.toast)
+        .alert("Something went wrong", isPresented: Binding(get: { model.errorMessage != nil }, set: { if !$0 { model.errorMessage = nil } })) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(model.errorMessage ?? "")
         }
     }
 }
