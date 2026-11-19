@@ -8,13 +8,19 @@ struct LibraryItem: Identifiable {
     var id: String { torrent.infoHashHex }
 }
 
+/// A subtitle file shipped inside the torrent, exposed as a stream URL.
+struct SubtitleRef: Hashable {
+    let name: String
+    let url: URL
+}
+
 /// What the player needs to stream one file.
 struct PlaybackRequest: Identifiable {
     let torrent: Torrent
     let file: TorrentFile
     let url: URL
-    /// Subtitle files shipped inside the torrent, as stream URLs, best match first.
-    let subtitles: [(name: String, url: URL)]
+    /// Subtitle files shipped inside the torrent, best match first.
+    let subtitles: [SubtitleRef]
     var id: String { "\(torrent.infoHashHex)/\(file.index)" }
 }
 
@@ -139,7 +145,7 @@ final class AppModel: ObservableObject {
                 return ma != mb ? ma : a.displayPath < b.displayPath
             }
             .prefix(40)
-            .map { (name: $0.displayPath, url: client.streamURL(for: torrent, fileIndex: $0.index, fileName: $0.fileName)) }
+            .map { SubtitleRef(name: $0.displayPath, url: client.streamURL(for: torrent, fileIndex: $0.index, fileName: $0.fileName)) }
         persist()
         return PlaybackRequest(torrent: torrent, file: file, url: url, subtitles: Array(subs))
     }

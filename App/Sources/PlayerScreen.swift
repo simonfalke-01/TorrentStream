@@ -152,7 +152,6 @@ struct MediaTrack: Identifiable, Hashable {
     let name: String
 }
 
-@MainActor
 final class VLCPlayerModel: ObservableObject {
     let player = VLCMediaPlayer()
     @Published var isPlaying = false
@@ -415,7 +414,7 @@ struct TracksSheet: View {
                     Button { importing = true } label: { Label("Load Subtitle File…", systemImage: "doc.badge.plus") }
                     if !request.subtitles.isEmpty {
                         Menu {
-                            ForEach(request.subtitles, id: \.url) { s in
+                            ForEach(request.subtitles, id: \.self) { s in
                                 Button(s.name) { vlc.addSubtitleFile(s.url) }
                             }
                         } label: { Label("Subtitle files in this torrent (\(request.subtitles.count))", systemImage: "captions.bubble") }
