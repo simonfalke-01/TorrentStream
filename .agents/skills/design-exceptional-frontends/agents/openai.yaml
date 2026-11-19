@@ -1,0 +1,4 @@
+interface:
+  display_name: "Exceptional Frontend Design"
+  short_description: "Design and refine coherent, distinctive interfaces"
+  default_prompt: "Use $design-exceptional-frontends to design or refine this interface, apply the failure preflight proactively, and finish the required visual QA before presenting it."

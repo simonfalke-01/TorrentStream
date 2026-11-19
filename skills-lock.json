@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "skills": {
+    "design-exceptional-frontends": {
+      "source": "../../../.agents/skills/design-exceptional-frontends",
+      "sourceType": "local",
+      "computedHash": "089c3936d6fa8cf877c457e7eab8e8d2986dd1004f613da777dfbda6d24568fa"
+    }
+  }
+}
