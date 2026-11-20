@@ -19,6 +19,9 @@ jobs:
   ios-app:
     name: Build TorrentStream.ipa
     runs-on: macos-26
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@v4
       - name: Show Xcode
@@ -113,6 +116,20 @@ jobs:
             (cd previous && unzip -q TorrentStream-simulator.zip)
             sign previous/TorrentStream.app
             xcrun simctl install "$UDID" previous/TorrentStream.app
+            # Something watched, as on a phone in use: Home then loads those shows at launch.
+            DATA=$(xcrun simctl get_app_container "$UDID" "$BID" data)
+            mkdir -p "$DATA/Library/Application Support/TorrentStream"
+            python3 - "$DATA/Library/Application Support/TorrentStream/shows.json" <<'EOF'
+          import json, sys, time
+          now = time.time() - 978307200
+          shows = [(191656, "Student Council"), (21, "One Piece"), (154587, "Frieren"), (16498, "Attack on Titan"), (182255, "Frieren 2")]
+          show = lambda i, t: {"id": i, "title": t, "synonyms": [], "genres": []}
+          json.dump({
+              "myList": [show(i, t) for i, t in shows],
+              "history": [{"show": show(i, t), "seasonID": i, "season": 1, "episode": 2, "watchedAt": now - n} for n, (i, t) in enumerate(shows)],
+              "progress": {}, "sources": {}, "groups": {}, "roots": {},
+          }, open(sys.argv[1], "w"))
+          EOF
             check "previous release"
             xcrun simctl install "$UDID" "$APP"
             check "update"
