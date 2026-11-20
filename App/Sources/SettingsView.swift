@@ -4,6 +4,7 @@ import TorrentKit
 /// Opened from the gear button on Home.
 struct SettingsView: View {
     @EnvironmentObject var model: AppModel
+    @EnvironmentObject var shows: ShowsModel
     @Environment(\.dismiss) private var dismiss
     @AppStorage(SettingsKey.playerEngine) private var engine: String = PlayerEngine.vlc.rawValue
     @AppStorage(SettingsKey.resumePlayback) private var resumePlayback = true
@@ -13,6 +14,8 @@ struct SettingsView: View {
     @AppStorage(SettingsKey.publicTrackers) private var publicTrackers = true
     @AppStorage(SettingsKey.nyaaAddress) private var nyaaAddress = ""
     @AppStorage(SettingsKey.cacheLimitGB) private var cacheLimitGB = 5
+    @AppStorage(SettingsKey.preferredResolution) private var resolution = 1080
+    @AppStorage(SettingsKey.preferDub) private var preferDub = false
     @State private var confirmClear = false
 
     private var selectedEngine: PlayerEngine { PlayerEngine(rawValue: engine) ?? .vlc }
@@ -36,12 +39,33 @@ struct SettingsView: View {
                 }
 
                 Section {
+                    Picker("Quality", selection: $resolution) {
+                        Text("4K").tag(2160)
+                        Text("1080p").tag(1080)
+                        Text("720p").tag(720)
+                        Text("480p").tag(480)
+                    }
+                    .pickerStyle(.menu)
+                    Picker("Audio", selection: $preferDub) {
+                        Text("Japanese with Subtitles").tag(false)
+                        Text("English Dub").tag(true)
+                    }
+                    .pickerStyle(.menu)
+                } header: {
+                    Text("Streaming")
+                } footer: {
+                    Text("Play picks the closest match that starts quickly. To choose a specific version, touch and hold an episode.")
+                }
+                .onChange(of: resolution) { shows.preferencesChanged() }
+                .onChange(of: preferDub) { shows.preferencesChanged() }
+
+                Section {
                     Toggle("Show Artwork and Details", isOn: $showArtwork)
                         .onChange(of: showArtwork) { _, on in
                             if on { model.refresh() } else { model.clearCatalog() }
                         }
                 } footer: {
-                    Text("Looks up posters and synopses by title on AniList and Cinemeta. Turn off to keep titles on this device.")
+                    Text("For titles added by link, looks up posters and synopses on AniList and Cinemeta. Turn off to keep those titles on this device.")
                 }
 
                 Section {
@@ -54,9 +78,9 @@ struct SettingsView: View {
                             .submitLabel(.done)
                     }
                 } header: {
-                    Text("Search")
+                    Text("Sources")
                 } footer: {
-                    Text("Search results come from Nyaa. Use a mirror if nyaa.si is blocked on your network.")
+                    Text("Episodes are found on Nyaa. Use a mirror if nyaa.si is blocked on your network.")
                 }
 
                 Section {
@@ -79,13 +103,13 @@ struct SettingsView: View {
                     LabeledContent("In Use", value: Format.bytes(model.storageUsed))
                         .monospacedDigit()
                     Button("Clear Cache") { model.clearCache() }
-                        .disabled(model.items.isEmpty)
-                    Button("Remove All Titles…", role: .destructive) { confirmClear = true }
+                        .disabled(model.storageUsed == 0)
+                    Button("Remove Titles Added by Link…", role: .destructive) { confirmClear = true }
                         .disabled(model.items.isEmpty)
                 } header: {
                     Text("Storage")
                 } footer: {
-                    Text("TorrentStream loads up to ten minutes ahead of what you're watching and the start of the next episode. Older titles are cleared on their own; your progress is kept.")
+                    Text("TorrentStream loads up to ten minutes ahead of what you’re watching and the start of the next episode. Older episodes are cleared on their own; your progress is kept.")
                 }
 
                 Section {
@@ -100,11 +124,11 @@ struct SettingsView: View {
                 }
             }
             .onAppear { model.refreshStorage() }
-            .confirmationDialog("Remove all titles from My List?", isPresented: $confirmClear, titleVisibility: .visible) {
+            .confirmationDialog("Remove every title added by link?", isPresented: $confirmClear, titleVisibility: .visible) {
                 Button("Remove All", role: .destructive) { model.removeAll() }
                 Button("Cancel", role: .cancel) {}
             } message: {
-                Text("Every title is removed from My List.")
+                Text("Shows in My List and your progress stay.")
             }
         }
     }

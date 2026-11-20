@@ -1,30 +1,63 @@
 import SwiftUI
 import UniformTypeIdentifiers
 import TorrentKit
+import CatalogKit
 
 extension UTType {
     static let torrent = UTType(importedAs: "org.bittorrent.torrent")
 }
 
+/// A show or a title added by link that the viewer started and didn't finish.
+enum ContinueItem: Identifiable {
+    case show(WatchEntry, ShowUpNext?)
+    case link(ContinueEntry, Date)
+
+    var id: String {
+        switch self {
+        case .show(let e, _): return "show.\(e.show.id)"
+        case .link(let c, _): return "link.\(c.id)"
+        }
+    }
+
+    var date: Date {
+        switch self {
+        case .show(let e, _): return e.watchedAt
+        case .link(_, let at): return at
+        }
+    }
+}
+
 // MARK: - Home
 
-/// What to watch: the title to pick up, then shelves of titles.
+/// What to watch: the show to pick up, what's been started, My List, then shelves from the catalog.
 struct HomeView: View {
     @EnvironmentObject var model: AppModel
+    @EnvironmentObject var shows: ShowsModel
     @ObservedObject private var keeper = BackgroundKeeper.shared
     @State private var showAdd = false
     @State private var showSettings = false
     @State private var pendingRemoval: LibraryItem?
     @State private var export: ExportItem?
     @State private var playing: PlaybackRequest?
+    @State private var launch: EpisodeLaunch?
 
     /// Shelves show this many posters before offering See All.
     private let shelfLimit = 12
 
+    private var continuing: [ContinueItem] {
+        let fromShows = shows.continueWatching.map { ContinueItem.show($0.entry, $0.next) }
+        let fromLinks = model.continueWatching.map { ContinueItem.link($0, model.watchedAt($0.item.id) ?? .distantPast) }
+        return (fromShows + fromLinks).sorted { $0.date > $1.date }
+    }
+
+    private var isEmpty: Bool {
+        shows.rows.isEmpty && shows.history.isEmpty && shows.myList.isEmpty && model.items.isEmpty
+    }
+
     var body: some View {
         NavigationStack(path: $model.navigationPath) {
             Group {
-                if model.items.isEmpty {
+                if isEmpty {
                     emptyState
                 } else {
                     content
@@ -40,29 +73,46 @@ struct HomeView: View {
                     Button { showSettings = true } label: { Label("Settings", systemImage: "gearshape") }
                 }
             }
+            .task { await load() }
             .sheet(isPresented: $showAdd) { AddLinkView() }
             .sheet(isPresented: $showSettings) { SettingsView() }
             .fullScreenCover(item: $playing) { req in PlayerScreen(request: req) }
+            .fullScreenCover(item: $launch) { PlaybackLauncher(launch: $0) }
             .exportSheet($export)
             .removeTitleDialog(item: $pendingRemoval, export: $export)
         }
     }
 
+    private func load(force: Bool = false) async {
+        await shows.loadRows(force: force)
+        // Continue Watching needs each started show's episodes to know what plays next.
+        for h in shows.history.prefix(10) {
+            _ = try? await shows.loadDetails(h.show)
+        }
+    }
+
+    @ViewBuilder
     private var emptyState: some View {
-        ContentUnavailableView {
-            Label("Nothing to Watch Yet", systemImage: "play.tv")
-        } description: {
-            Text("Search for a show or movie, or add one from a magnet link.")
-        } actions: {
-            Button("Search") { model.selectedTab = .search }
-                .buttonStyle(.borderedProminent)
-            Button("Add by Link") { showAdd = true }
+        if shows.rowsFailed {
+            ContentUnavailableView {
+                Label("Can’t Load Shows", systemImage: "wifi.exclamationmark")
+            } description: {
+                Text("Check your connection and try again.")
+            } actions: {
+                Button("Try Again") { Task { await load(force: true) } }
+                    .buttonStyle(.borderedProminent)
+                Button("Add by Link") { showAdd = true }
+            }
+        } else {
+            ProgressView()
+                .controlSize(.large)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 
     private var content: some View {
-        let continuing = model.continueWatching
-        let hero = continuing.first?.item ?? model.items.first
+        let continuing = continuing
+        let listCount = shows.myList.count + model.items.count
 
         return ScrollView {
             VStack(alignment: .leading, spacing: Space.xxl) {
@@ -71,32 +121,105 @@ struct HomeView: View {
                         .padding(.horizontal, Space.l)
                 }
 
-                if let hero {
-                    HeroCard(item: hero, onPlay: { play(hero) })
-                        .frame(maxWidth: Metrics.heroMaxWidth)
-                        .padding(.horizontal, Space.l)
-                        .frame(maxWidth: .infinity)
-                }
+                hero(continuing.first)
+                    .frame(maxWidth: Metrics.heroMaxWidth)
+                    .padding(.horizontal, Space.l)
+                    .frame(maxWidth: .infinity)
 
                 if !continuing.isEmpty {
                     Shelf(title: "Continue Watching") {
-                        ForEach(continuing) { entry in
-                            ContinueCard(item: entry.item, next: entry.next,
-                                         onPlay: { play(entry.item, file: entry.next.file) },
-                                         onRemove: { pendingRemoval = entry.item })
+                        ForEach(continuing) { continueCard($0) }
+                    }
+                }
+
+                if listCount > 0 {
+                    Shelf(title: "My List", seeAll: listCount > shelfLimit ? .myList : nil) {
+                        ForEach(shows.myList.prefix(shelfLimit)) { show in
+                            ShowPosterCard(show: show) { launch = EpisodeLaunch(show: show) }
+                                .frame(width: Metrics.shelfPoster.width)
+                        }
+                        ForEach(model.items.prefix(max(0, shelfLimit - shows.myList.count))) { item in
+                            PosterCard(item: item, onPlay: { play(item) }, onRemove: { pendingRemoval = item })
+                                .frame(width: Metrics.shelfPoster.width)
                         }
                     }
                 }
 
-                Shelf(title: "My List", seeAll: model.items.count > shelfLimit ? .myList : nil) {
-                    ForEach(model.items.prefix(shelfLimit)) { item in
-                        PosterCard(item: item, onPlay: { play(item) }, onRemove: { pendingRemoval = item })
-                            .frame(width: Metrics.shelfPoster.width)
+                ForEach(shows.rows) { row in
+                    Shelf(title: row.title) {
+                        ForEach(row.shows) { show in
+                            ShowPosterCard(show: show) { launch = EpisodeLaunch(show: show) }
+                                .frame(width: Metrics.shelfPoster.width)
+                        }
                     }
+                }
+
+                if shows.rows.isEmpty && shows.rowsFailed {
+                    VStack(alignment: .leading, spacing: Space.s) {
+                        Text("Shows couldn’t be loaded.")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                        Button("Try Again") { Task { await load(force: true) } }
+                            .buttonStyle(.bordered)
+                    }
+                    .padding(.horizontal, Space.l)
                 }
             }
             .padding(.top, Space.s)
             .padding(.bottom, Space.xxl)
+        }
+        .refreshable { await load(force: true) }
+    }
+
+    // MARK: hero
+
+    /// The show to pick up, else the first trending one.
+    @ViewBuilder
+    private func hero(_ first: ContinueItem?) -> some View {
+        switch first {
+        case .show(let entry, let next):
+            HeroCard(posterURL: entry.show.posterURL, title: entry.show.title,
+                     caption: ShowContinueCard.detail(entry: entry, next: next, details: shows.details[entry.show.id]),
+                     playTitle: next?.resumeAt != nil ? "Resume" : "Play",
+                     details: .show(entry.show)) {
+                launch = EpisodeLaunch(show: entry.show, seasonID: next?.season.id, episode: next?.episode.number)
+            }
+        case .link(let c, _):
+            HeroCard(posterURL: model.posterURL(c.item), title: model.displayTitle(c.item),
+                     caption: linkCaption(c.item, c.next),
+                     playTitle: c.next.resumeAt != nil ? "Resume" : "Play",
+                     isLoading: c.item.status.phase == .fetchingMetadata,
+                     details: .title(c.item.id)) {
+                play(c.item, file: c.next.file)
+            }
+        case nil:
+            if let show = shows.rows.first?.shows.first {
+                HeroCard(posterURL: show.posterURL, title: show.title,
+                         caption: show.genres.isEmpty ? nil : show.genres.prefix(3).joined(separator: ", "),
+                         playTitle: "Play", canPlay: !show.isUpcoming, details: .show(show)) {
+                    launch = EpisodeLaunch(show: show)
+                }
+            }
+        }
+    }
+
+    private func linkCaption(_ item: LibraryItem, _ next: UpNext) -> String? {
+        guard let remaining = next.remaining, let left = Format.remaining(remaining) else { return nil }
+        guard model.playlist(item.status).count > 1 else { return left }
+        return "\(model.episodeLabel(next.file) ?? next.file.title), \(left)"
+    }
+
+    @ViewBuilder
+    private func continueCard(_ c: ContinueItem) -> some View {
+        switch c {
+        case .show(let entry, let next):
+            ShowContinueCard(entry: entry, next: next) {
+                launch = EpisodeLaunch(show: entry.show, seasonID: next?.season.id, episode: next?.episode.number)
+            }
+        case .link(let entry, _):
+            ContinueCard(item: entry.item, next: entry.next,
+                         onPlay: { play(entry.item, file: entry.next.file) },
+                         onRemove: { pendingRemoval = entry.item })
         }
     }
 
@@ -148,18 +271,20 @@ struct Shelf<Content: View>: View {
 /// The title to watch now: a large poster with Play and Details.
 struct HeroCard: View {
     @EnvironmentObject var model: AppModel
-    let item: LibraryItem
+    let posterURL: URL?
+    let title: String
+    let caption: String?
+    let playTitle: String
+    var isLoading = false
+    var canPlay = true
+    let details: Route
     let onPlay: () -> Void
 
     var body: some View {
-        let title = model.displayTitle(item)
-        let next = model.upNext(item)
-        let loading = item.status.phase == .fetchingMetadata
-
-        PosterImage(url: model.posterURL(item), title: title, showsTitle: false, cornerRadius: Radius.large)
+        PosterImage(url: posterURL, title: title, showsTitle: false, cornerRadius: Radius.large)
             .aspectRatio(2 / 3, contentMode: .fit)
             .overlay {
-                if loading { ProgressView().controlSize(.large) }
+                if isLoading { ProgressView().controlSize(.large) }
             }
             .overlay(alignment: .bottom) {
                 VStack(spacing: Space.m) {
@@ -168,7 +293,7 @@ struct HeroCard: View {
                         .multilineTextAlignment(.center)
                         .lineLimit(3)
                         .accessibilityAddTraits(.isHeader)
-                    if let caption = caption(next) {
+                    if let caption {
                         Text(caption)
                             .font(.subheadline)
                             .foregroundStyle(.white.opacity(0.8))
@@ -176,12 +301,12 @@ struct HeroCard: View {
                     }
                     HStack(spacing: Space.m) {
                         Button(action: onPlay) {
-                            Label(next?.resumeAt != nil ? "Resume" : "Play", systemImage: "play.fill")
+                            Label(playTitle, systemImage: "play.fill")
                         }
                         .buttonStyle(PrimaryPlayButtonStyle(fullWidth: false))
-                        .disabled(next == nil)
+                        .disabled(!canPlay)
 
-                        NavigationLink(value: Route.title(item.id)) {
+                        NavigationLink(value: details) {
                             Label("Details", systemImage: "info.circle")
                                 .frame(minHeight: Metrics.playButtonHeight - Space.l)
                         }
@@ -201,23 +326,11 @@ struct HeroCard: View {
             }
             .clipShape(.rect(cornerRadius: Radius.large, style: .continuous))
             .contentShape(.rect(cornerRadius: Radius.large, style: .continuous))
-            .onTapGesture { model.navigationPath.append(.title(item.id)) }
-    }
-
-    private func caption(_ next: UpNext?) -> String? {
-        let isSeries = model.playlist(item.status).count > 1
-        if let next, let remaining = next.remaining, let left = Format.remaining(remaining) {
-            guard isSeries else { return left }
-            return "\(model.episodeLabel(next.file) ?? next.file.title), \(left)"
-        }
-        if let genres = model.entry(for: item)?.genres, !genres.isEmpty {
-            return genres.prefix(3).joined(separator: ", ")
-        }
-        return nil
+            .onTapGesture { model.navigationPath.append(details) }
     }
 }
 
-/// A started title: wide artwork, watched progress, and what plays next.
+/// A started title added by link: wide artwork, watched progress, and what plays next.
 struct ContinueCard: View {
     @EnvironmentObject var model: AppModel
     let item: LibraryItem
@@ -279,7 +392,7 @@ struct ContinueCard: View {
     }
 }
 
-/// A poster in My List. Tap opens the title page.
+/// A title added by link in My List. Tap opens the title page.
 struct PosterCard: View {
     @EnvironmentObject var model: AppModel
     let item: LibraryItem
@@ -327,18 +440,23 @@ struct PosterCard: View {
     }
 }
 
-/// Every title in My List.
+/// Every show and title in My List.
 struct MyListView: View {
     @EnvironmentObject var model: AppModel
+    @EnvironmentObject var shows: ShowsModel
     @State private var pendingRemoval: LibraryItem?
     @State private var export: ExportItem?
     @State private var playing: PlaybackRequest?
+    @State private var launch: EpisodeLaunch?
 
     private let columns = [GridItem(.adaptive(minimum: 104, maximum: 160), spacing: Space.m, alignment: .top)]
 
     var body: some View {
         ScrollView {
             LazyVGrid(columns: columns, spacing: Space.l) {
+                ForEach(shows.myList) { show in
+                    ShowPosterCard(show: show) { launch = EpisodeLaunch(show: show) }
+                }
                 ForEach(model.items) { item in
                     PosterCard(item: item, onPlay: { play(item) }, onRemove: { pendingRemoval = item })
                 }
@@ -346,8 +464,15 @@ struct MyListView: View {
             .padding(.horizontal, Space.l)
             .padding(.vertical, Space.s)
         }
+        .overlay {
+            if shows.myList.isEmpty && model.items.isEmpty {
+                ContentUnavailableView("My List Is Empty", systemImage: "plus.square.on.square",
+                                       description: Text("Add shows from their page to find them here."))
+            }
+        }
         .navigationTitle("My List")
         .fullScreenCover(item: $playing) { req in PlayerScreen(request: req) }
+        .fullScreenCover(item: $launch) { PlaybackLauncher(launch: $0) }
         .exportSheet($export)
         .removeTitleDialog(item: $pendingRemoval, export: $export)
     }
@@ -409,7 +534,7 @@ private struct RemoveTitleDialog: ViewModifier {
             Button("Remove", role: .destructive) { model.remove(it.torrent) }
             Button("Cancel", role: .cancel) {}
         } message: { _ in
-            Text("You can add it again from Search.")
+            Text("You can add it again with its magnet link or torrent file.")
         }
     }
 }

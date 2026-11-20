@@ -8,7 +8,7 @@ extension View {
         navigationDestination(for: Route.self) { route in
             switch route {
             case .title(let hash): TitleView(infoHash: hash)
-            case .nyaa(let result): NyaaResultView(result: result)
+            case .show(let show): ShowView(show: show)
             case .myList: MyListView()
             }
         }

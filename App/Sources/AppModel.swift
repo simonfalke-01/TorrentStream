@@ -3,6 +3,7 @@ import SwiftUI
 import TorrentKit
 import NyaaKit
 import CatalogKit
+import SourceKit
 
 struct LibraryItem: Identifiable {
     let torrent: Torrent
@@ -30,7 +31,23 @@ struct PlaybackRequest: Identifiable {
     let title: String
     /// "Episode 5", or nil for a movie.
     let episode: String?
+    /// The catalog episode this plays, when started from a show page.
+    var show: ShowPlayback? = nil
     var id: String { "\(torrent.infoHashHex)/\(file.index)" }
+
+    func with(title: String, episode: String?, resumeAt: Double?, show: ShowPlayback?) -> PlaybackRequest {
+        PlaybackRequest(torrent: torrent, file: file, url: url, subtitles: subtitles, resumeAt: resumeAt,
+                        title: title, episode: episode, show: show)
+    }
+}
+
+/// What the player offers when a video ends.
+struct UpNextItem {
+    /// "Episode 6" or "S2 E1".
+    let title: String
+    /// The episode's name, when known.
+    let subtitle: String?
+    let resolve: @MainActor () async -> PlaybackRequest?
 }
 
 enum PlayerEngine: String, CaseIterable, Identifiable {
@@ -48,16 +65,15 @@ enum AppTab: Hashable { case home, search }
 enum Route: Hashable {
     /// A title in My List, by info hash.
     case title(String)
-    /// A search result that is added to My List when opened.
-    case nyaa(NyaaResult)
+    /// A show or movie from the catalog.
+    case show(Show)
     /// Every title in My List as a grid.
     case myList
 
     var hash: String {
         switch self {
         case .title(let h): return h
-        case .nyaa(let r): return r.infoHash ?? ""
-        case .myList: return ""
+        case .show, .myList: return ""
         }
     }
 }
@@ -76,11 +92,11 @@ enum SettingsKey {
     static let useDHT = "useDHT"
     static let publicTrackers = "usePublicTrackers"
     static let nyaaAddress = "nyaaAddress"
-    static let searchSort = "searchSort"
-    static let searchAscending = "searchAscending"
-    static let searchCategory = "searchCategory"
-    static let searchFilter = "searchFilter"
-    static let recentSearches = "recentSearches"
+    static let recentSearches = "recentShowSearches"
+    /// Vertical resolution to prefer: 2160, 1080, 720 or 480.
+    static let preferredResolution = "preferredResolution"
+    /// English audio over Japanese.
+    static let preferDub = "preferDub"
     static let showArtwork = "showArtwork"
     /// Cache budget in gigabytes.
     static let cacheLimitGB = "cacheLimitGB"
@@ -103,7 +119,10 @@ struct ContinueEntry: Identifiable {
 @MainActor
 final class AppModel: ObservableObject {
     let client: TorrentClient
+    /// Titles the user added by link. Torrents started from show pages are kept out of sight.
     @Published private(set) var items: [LibraryItem] = []
+    /// Torrents found for catalog episodes. They never appear in My List and are removed when evicted.
+    private(set) var sourceHashes: Set<String> = []
     @Published var errorMessage: String?
     @Published var toast: Toast?
     @Published var navigationPath: [Route] = []
@@ -131,6 +150,7 @@ final class AppModel: ObservableObject {
         var wantedFiles: [Int]?
         var paused: Bool?
         var addedAt: Date?
+        var isSource: Bool?
     }
 
     var playerEngine: PlayerEngine {
@@ -146,6 +166,8 @@ final class AppModel: ObservableObject {
             SettingsKey.publicTrackers: true,
             SettingsKey.showArtwork: true,
             SettingsKey.cacheLimitGB: 5,
+            SettingsKey.preferredResolution: 1080,
+            SettingsKey.preferDub: false,
         ])
         baseURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("TorrentStream", isDirectory: true)
@@ -167,6 +189,7 @@ final class AppModel: ObservableObject {
 
     func refresh() {
         items = client.torrents
+            .filter { !sourceHashes.contains($0.infoHashHex) }
             .map { LibraryItem(torrent: $0, status: $0.status(), addedAt: addedAt[$0.infoHashHex] ?? .distantPast) }
             .sorted { $0.addedAt > $1.addedAt }
         requestCatalog(items.compactMap { catalogQuery(for: $0) })
@@ -206,6 +229,7 @@ final class AppModel: ObservableObject {
     func addTorrent(magnet: String, reportErrors: Bool = true) -> String? {
         do {
             let t = try client.add(magnet: magnet)
+            sourceHashes.remove(t.infoHashHex)
             didAdd(t)
             return t.infoHashHex
         } catch {
@@ -218,6 +242,7 @@ final class AppModel: ObservableObject {
         do {
             let t = try client.add(torrentData: data)
             try? data.write(to: torrentFileURL(t.infoHashHex))
+            sourceHashes.remove(t.infoHashHex)
             didAdd(t)
             return t.infoHashHex
         } catch {
@@ -247,6 +272,64 @@ final class AppModel: ObservableObject {
     private func reveal(_ hash: String) {
         selectedTab = .home
         navigationPath = [.title(hash)]
+    }
+
+    // MARK: episode sources
+
+    /// Adds a release found for a catalog episode, or returns it when already added. The .torrent file is used
+    /// when it can be fetched, since it carries the file list; otherwise the magnet link.
+    func addSource(torrentURL: URL?, magnet: String?, infoHash: String?) async -> Torrent? {
+        if let h = infoHash?.lowercased(), let t = client.torrent(infoHashHex: h) {
+            if t.isPaused { t.resume() }
+            return t
+        }
+        if let url = torrentURL, let data = try? await Self.fetch(url) {
+            if let existing = (try? TorrentDescriptor.parse(torrentData: data)).flatMap({ client.torrent(infoHashHex: $0.infoHashHex) }) {
+                if existing.isPaused { existing.resume() }
+                return existing
+            }
+            if let t = try? client.add(torrentData: data) {
+                try? data.write(to: torrentFileURL(t.infoHashHex))
+                didAddSource(t)
+                return t
+            }
+        }
+        if let magnet, let t = try? client.add(magnet: magnet) {
+            didAddSource(t)
+            return t
+        }
+        return nil
+    }
+
+    private func didAddSource(_ t: Torrent) {
+        sourceHashes.insert(t.infoHashHex)
+        addedAt[t.infoHashHex] = Date()
+        persist()
+    }
+
+    /// Drops a source that turned out not to play the episode, unless something is using it.
+    func discardSource(_ t: Torrent) {
+        let hash = t.infoHashHex
+        guard sourceHashes.contains(hash), playing[hash] == nil else { return }
+        removeSource(hash)
+        persist()
+    }
+
+    private func removeSource(_ hash: String) {
+        if let t = client.torrent(infoHashHex: hash) { client.remove(t, deleteData: true) }
+        try? FileManager.default.removeItem(at: torrentFileURL(hash))
+        sourceHashes.remove(hash)
+        addedAt[hash] = nil
+        defaults.removeObject(forKey: lastPlayedKey(hash))
+        defaults.removeObject(forKey: watchedAtKey(hash))
+    }
+
+    private static func fetch(_ url: URL) async throws -> Data {
+        var request = URLRequest(url: url, timeoutInterval: 15)
+        request.setValue("TorrentStream/4 (iOS)", forHTTPHeaderField: "User-Agent")
+        let (data, response) = try await URLSession.shared.data(for: request)
+        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) { throw URLError(.badServerResponse) }
+        return data
     }
 
     // MARK: titles and artwork
@@ -441,9 +524,16 @@ final class AppModel: ObservableObject {
     /// one last. Titles stay in My List with their episodes and positions; they stream again when played.
     func trimCache() {
         guard playing.isEmpty, !BackgroundKeeper.shared.isActive else { return }
-        let byLastUse = items.filter { $0.status.phase == .ready }
+        // Sources that were found but never played, beyond the most recent few, only take up slots.
+        let sources = client.torrents.filter { sourceHashes.contains($0.infoHashHex) }
+            .sorted { lastUse($0.infoHashHex) > lastUse($1.infoHashHex) }
+        if sources.count > AppModel.maxSources {
+            for t in sources[AppModel.maxSources...] { removeSource(t.infoHashHex) }
+            persist()
+        }
+        let byLastUse = client.torrents.filter { $0.torrentInfo != nil }
+            .map(\.infoHashHex)
             .sorted { lastUse($0) < lastUse($1) }
-            .map(\.id)
         guard !byLastUse.isEmpty else { return }
         let dir = client.downloadDirectory
         let limit = cacheLimit
@@ -469,16 +559,23 @@ final class AppModel: ObservableObject {
 
     /// Clears every title's cached video. My List and watch history are kept.
     func clearCache() {
-        evict(items.map(\.id))
+        evict(client.torrents.map(\.infoHashHex))
     }
 
-    private func lastUse(_ item: LibraryItem) -> Date {
-        (defaults.object(forKey: watchedAtKey(item.id)) as? Date) ?? item.addedAt
+    private func lastUse(_ hash: String) -> Date {
+        (defaults.object(forKey: watchedAtKey(hash)) as? Date) ?? addedAt[hash] ?? .distantPast
     }
+
+    func watchedAt(_ hash: String) -> Date? { defaults.object(forKey: watchedAtKey(hash)) as? Date }
 
     /// Deletes a title's data and adds it back with its file list, so nothing changes for the user.
+    /// Episode sources are removed outright; they are found again when played.
     private func evict(_ hashes: [String]) {
         for hash in hashes where playing[hash] == nil {
+            if sourceHashes.contains(hash) {
+                removeSource(hash)
+                continue
+            }
             guard let t = client.torrent(infoHashHex: hash), let info = t.torrentInfo else { continue }
             var descriptor = t.descriptor
             descriptor.info = info
@@ -524,6 +621,12 @@ final class AppModel: ObservableObject {
     func playbackStarted(_ request: PlaybackRequest) {
         let torrent = request.torrent
         playing[torrent.infoHashHex, default: 0] += 1
+        // Other episode sources go quiet; the next episode's is woken by its prefetch.
+        for t in client.torrents where sourceHashes.contains(t.infoHashHex) && t !== torrent && playing[t.infoHashHex] == nil {
+            if !t.isPaused { t.pause() }
+        }
+        // Show pages find the next episode themselves; it may be in another release.
+        guard request.show == nil else { return }
         if let d = knownDuration(torrent: torrent, file: request.file) {
             durationKnown(request, seconds: d)
         } else if let next = nextPlayable(after: request.file, in: torrent) {
@@ -538,12 +641,20 @@ final class AppModel: ObservableObject {
         func clamp(_ v: Double, _ lo: Int64, _ hi: Int64) -> Int64 { min(hi, max(lo, Int64(v))) }
         let torrent = request.torrent
         torrent.setReadahead(clamp(bytesPerSecond * 600, 64 << 20, 1 << 30), fileIndex: request.file.index)
-        if let next = nextPlayable(after: request.file, in: torrent) {
+        if request.show == nil, let next = nextPlayable(after: request.file, in: torrent) {
             torrent.prefetch(fileIndex: next.index, bytes: clamp(bytesPerSecond * 180, 32 << 20, 200 << 20))
         }
     }
 
-    nonisolated private static let defaultPrefetch: Int64 = 100 << 20
+    nonisolated static let defaultPrefetch: Int64 = 100 << 20
+    /// Episode sources kept around for quick replays.
+    private static let maxSources = 24
+
+    /// Bytes of the next episode to load ahead, sized to about three minutes of the current one.
+    static func prefetchBytes(fileLength: Int64, seconds: Double) -> Int64 {
+        guard seconds.isFinite, seconds > 60 else { return defaultPrefetch }
+        return min(200 << 20, max(32 << 20, Int64(Double(fileLength) / seconds * 180)))
+    }
     nonisolated private static let minimumCache: Int64 = 1_000_000_000
 
     private var cacheLimit: Int64 { Int64(max(1, defaults.integer(forKey: SettingsKey.cacheLimitGB))) * 1_000_000_000 }
@@ -724,7 +835,7 @@ final class AppModel: ObservableObject {
     }
 
     func removeAll() {
-        for t in client.torrents { remove(t) }
+        for t in client.torrents where !sourceHashes.contains(t.infoHashHex) { remove(t) }
     }
 
     // MARK: persistence
@@ -738,7 +849,8 @@ final class AppModel: ObservableObject {
             let wanted = status.files.filter { $0.wanted }.map { $0.file.index }
             return SavedEntry(infoHash: t.infoHashHex, magnet: t.descriptor.magnetURI,
                               hasTorrentFile: t.descriptor.torrentData != nil, wantedFiles: wanted,
-                              paused: status.isPaused, addedAt: addedAt[t.infoHashHex])
+                              paused: status.isPaused, addedAt: addedAt[t.infoHashHex],
+                              isSource: sourceHashes.contains(t.infoHashHex) ? true : nil)
         }
         if let data = try? JSONEncoder().encode(entries) { try? data.write(to: libraryURL, options: .atomic) }
     }
@@ -754,6 +866,7 @@ final class AppModel: ObservableObject {
                 torrent = try? client.add(magnet: m)
             }
             guard let t = torrent else { continue }
+            if e.isSource == true { sourceHashes.insert(t.infoHashHex) }
             addedAt[t.infoHashHex] = e.addedAt ?? Date(timeIntervalSince1970: TimeInterval(entries.count - i))
             // Idle titles stay off the network until played. Files wanted by older versions aren't fetched in full.
             if t.torrentInfo != nil { t.pause() }

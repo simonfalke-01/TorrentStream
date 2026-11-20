@@ -4,10 +4,14 @@ import TorrentKit
 
 @main
 struct TorrentStreamApp: App {
-    @StateObject private var model = AppModel()
+    @StateObject private var model: AppModel
+    @StateObject private var shows: ShowsModel
     @Environment(\.scenePhase) private var scenePhase
 
     init() {
+        let m = AppModel()
+        _model = StateObject(wrappedValue: m)
+        _shows = StateObject(wrappedValue: ShowsModel(app: m))
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
         // Posters and backdrops are fetched often; keep them around between launches.
         URLCache.shared = URLCache(memoryCapacity: 50_000_000, diskCapacity: 300_000_000)
@@ -17,6 +21,7 @@ struct TorrentStreamApp: App {
         WindowGroup {
             RootView()
                 .environmentObject(model)
+                .environmentObject(shows)
                 .onOpenURL { url in model.handleOpen(url: url) }
         }
         .onChange(of: scenePhase) { _, phase in

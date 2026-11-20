@@ -1,6 +1,8 @@
 import SwiftUI
 import AVKit
 import TorrentKit
+import CatalogKit
+import SourceKit
 #if canImport(MobileVLCKit)
 import MobileVLCKit
 #endif
@@ -420,6 +422,7 @@ private struct PlayerContainer: View {
     let request: PlaybackRequest
     let onNext: (PlaybackRequest) -> Void
     @EnvironmentObject private var model: AppModel
+    @EnvironmentObject private var shows: ShowsModel
     @StateObject private var stats = StreamStatsModel()
     @State private var backend: PlayerBackend?
     @State private var engine: PlayerEngine = .apple
@@ -437,6 +440,7 @@ private struct PlayerContainer: View {
             stats.start(torrent: request.torrent, fileIndex: request.file.index)
             guard backend == nil else { return }
             model.playbackStarted(request)
+            shows.playbackStarted(request)
             engine = model.playerEngine
             let b = makeBackend(engine)
             backend = b
@@ -448,6 +452,7 @@ private struct PlayerContainer: View {
                 let position = b.didFinish ? b.duration : b.currentTime
                 model.playbackEnded(torrent: request.torrent, file: request.file,
                                     positionSeconds: position, durationSeconds: b.duration)
+                shows.playbackEnded(request, position: position, duration: b.duration)
                 b.shutdown()
             }
         }
@@ -493,6 +498,7 @@ private struct PlayerChrome: View {
     let onSwitchEngine: (PlayerEngine) -> Void
 
     @EnvironmentObject private var model: AppModel
+    @EnvironmentObject private var shows: ShowsModel
     @Environment(\.dismiss) private var dismiss
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var showControls = true
@@ -501,7 +507,9 @@ private struct PlayerChrome: View {
     @State private var hideTask: Task<Void, Never>?
     @State private var seekFlash: SeekFlash?
     @State private var showResumed = false
-    @State private var nextFile: TorrentFile?
+    @State private var upNext: UpNextItem?
+    @State private var resolvingNext = false
+    @State private var versions: EpisodeTarget?
     @State private var countdown: Int?
     @State private var countdownTask: Task<Void, Never>?
     @State private var upNextDismissed = false
@@ -542,17 +550,25 @@ private struct PlayerChrome: View {
         }
         .onDisappear { countdownTask?.cancel(); hideTask?.cancel() }
         .onChange(of: backend.didFinish) { _, done in
-            if done { handleFinish() } else { cancelCountdown(); nextFile = nil; upNextDismissed = false }
+            if done { handleFinish() } else { cancelCountdown(); upNext = nil; upNextDismissed = false }
         }
         .onChange(of: backend.isPlaying) { _, playing in
             if playing { scheduleHide() } else { reveal(autoHide: false) }
         }
         .onChange(of: backend.duration > 0, initial: true) { _, known in
-            if known { model.durationKnown(request, seconds: backend.duration) }
+            guard known else { return }
+            model.durationKnown(request, seconds: backend.duration)
+            shows.prefetchNext(after: request, duration: backend.duration)
         }
         .sheet(isPresented: $showTracks) {
             TracksSheet(backend: backend, request: request)
                 .presentationDetents([.medium, .large])
+        }
+        .sheet(item: $versions) { target in
+            VersionsView(target: target, current: request.torrent.infoHashHex) { source in
+                versions = nil
+                switchVersion(target, to: source)
+            }
         }
         .overlay(alignment: .top) {
             if let toast = model.toast {
@@ -679,6 +695,14 @@ private struct PlayerChrome: View {
 
     private var moreMenu: some View {
         Menu {
+            if let target = episodeTarget {
+                Section {
+                    Button {
+                        hideTask?.cancel()
+                        versions = target
+                    } label: { Label("Choose Version…", systemImage: "slider.horizontal.3") }
+                }
+            }
             Section {
                 Button {
                     backend.pause()
@@ -739,7 +763,7 @@ private struct PlayerChrome: View {
 
     private var bottomPanel: some View {
         VStack(spacing: Space.s) {
-            if let next = nextFile, backend.didFinish, !upNextDismissed {
+            if let next = upNext, backend.didFinish, !upNextDismissed {
                 upNextCard(next)
                     .frame(maxWidth: .infinity, alignment: .trailing)
                     .transition(.opacity)
@@ -822,17 +846,17 @@ private struct PlayerChrome: View {
 
     // MARK: end of playback
 
-    private func upNextCard(_ next: TorrentFile) -> some View {
+    private func upNextCard(_ next: UpNextItem) -> some View {
         VStack(alignment: .leading, spacing: Space.m) {
             VStack(alignment: .leading, spacing: Space.xxs) {
                 Text("Up Next")
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(.white.opacity(0.8))
-                Text(model.episodeLabel(next) ?? next.title)
+                Text(next.title)
                     .font(.headline)
                     .lineLimit(2)
-                if model.episodeLabel(next) != nil, model.episodeTitle(next) != model.episodeLabel(next) {
-                    Text(model.episodeTitle(next))
+                if let subtitle = next.subtitle, !subtitle.isEmpty {
+                    Text(subtitle)
                         .font(.subheadline)
                         .foregroundStyle(.white.opacity(0.8))
                         .lineLimit(1)
@@ -840,15 +864,24 @@ private struct PlayerChrome: View {
             }
             HStack(spacing: Space.s) {
                 Button { playNext() } label: {
-                    Label(countdown.map { "Play in \($0)" } ?? "Play", systemImage: "play.fill")
-                        .monospacedDigit()
+                    if resolvingNext {
+                        HStack(spacing: Space.s) {
+                            ProgressView().tint(.white)
+                            Text("Starting")
+                        }
+                    } else {
+                        Label(countdown.map { "Play in \($0)" } ?? "Play", systemImage: "play.fill")
+                            .monospacedDigit()
+                    }
                 }
                 .buttonStyle(.glassProminent)
+                .disabled(resolvingNext)
                 Button("Cancel") {
                     cancelCountdown()
                     upNextDismissed = true
                 }
                 .buttonStyle(.glass)
+                .disabled(resolvingNext)
             }
         }
         .padding(Space.l)
@@ -858,7 +891,7 @@ private struct PlayerChrome: View {
 
     @ViewBuilder
     private var finishedOverlay: some View {
-        if nextFile == nil || upNextDismissed {
+        if upNext == nil || upNextDismissed {
             GlassEffectContainer(spacing: Space.l) {
                 HStack(spacing: Space.l) {
                     Button { backend.replay(); scheduleHide() } label: {
@@ -878,8 +911,8 @@ private struct PlayerChrome: View {
     private func handleFinish() {
         reveal(autoHide: false)
         upNextDismissed = false
-        nextFile = model.nextPlayable(after: request.file, in: request.torrent)
-        guard nextFile != nil, UserDefaults.standard.bool(forKey: SettingsKey.autoPlayNext) else { return }
+        upNext = nextItem()
+        guard upNext != nil, UserDefaults.standard.bool(forKey: SettingsKey.autoPlayNext) else { return }
         countdown = 8
         countdownTask?.cancel()
         countdownTask = Task { @MainActor in
@@ -898,10 +931,56 @@ private struct PlayerChrome: View {
         countdown = nil
     }
 
+    /// The catalog's next episode for shows; the next video in the torrent for titles added by link.
+    private func nextItem() -> UpNextItem? {
+        if request.show != nil { return shows.upNextItem(after: request) }
+        guard let file = model.nextPlayable(after: request.file, in: request.torrent) else { return nil }
+        let label = model.episodeLabel(file)
+        let name = model.episodeTitle(file)
+        return UpNextItem(title: label ?? file.title, subtitle: label != nil && name != label ? name : nil) { [model, request] in
+            model.playbackRequest(torrent: request.torrent, file: file)
+        }
+    }
+
     private func playNext() {
         cancelCountdown()
-        guard let next = nextFile else { return }
-        onNext(model.playbackRequest(torrent: request.torrent, file: next))
+        guard let next = upNext, !resolvingNext else { return }
+        resolvingNext = true
+        Task { @MainActor in
+            let req = await next.resolve()
+            resolvingNext = false
+            if let req {
+                onNext(req)
+            } else {
+                upNextDismissed = true
+                model.showToast("\(next.title) couldn’t be started", systemImage: "exclamationmark.triangle.fill")
+            }
+        }
+    }
+
+    /// The catalog episode playing, for choosing another version of it.
+    private var episodeTarget: EpisodeTarget? {
+        guard let ctx = request.show, let d = shows.details[ctx.show.id], let s = d.season(id: ctx.seasonID),
+              let e = s.episodes.first(where: { $0.number == ctx.episode }) else { return nil }
+        return EpisodeTarget(details: d, season: s, episode: e)
+    }
+
+    /// Restarts the episode from another release at the same moment.
+    private func switchVersion(_ target: EpisodeTarget, to source: EpisodeSource) {
+        guard source.result.infoHash?.lowercased() != request.torrent.infoHashHex else { return }
+        let at = backend.currentTime
+        backend.pause()
+        model.showToast("Switching to \(source.group ?? "another version")", systemImage: "arrow.triangle.2.circlepath")
+        Task { @MainActor in
+            do {
+                let req = try await shows.request(target.details, target.season, target.episode, source: source,
+                                                  resumeAt: at > 1 ? at : nil, status: { _ in })
+                onNext(req)
+            } catch {
+                backend.play()
+                model.showToast("That version couldn’t be started", systemImage: "exclamationmark.triangle.fill")
+            }
+        }
     }
 
     // MARK: errors
