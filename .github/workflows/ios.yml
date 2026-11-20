@@ -19,9 +19,6 @@ jobs:
   ios-app:
     name: Build TorrentStream.ipa
     runs-on: macos-26
-    permissions:
-      contents: read
-      actions: read
     steps:
       - uses: actions/checkout@v4
       - name: Show Xcode
@@ -67,6 +64,27 @@ jobs:
         with:
           name: TorrentStream-unsigned-ipa
           path: TorrentStream-unsigned.ipa
+
+  # Separate from the IPA job so the IPA is ready in a couple of minutes; this one boots several simulators.
+  simulator:
+    name: Simulator launch test
+    runs-on: macos-26
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate Xcode project
+        run: xcodegen generate
+      - name: Cache CocoaPods downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/CocoaPods
+          key: pods-${{ hashFiles('Podfile') }}
+      - name: Install VLCKit (CocoaPods)
+        run: pod install --repo-update
       - name: Build (simulator)
         run: |
           xcodebuild -workspace TorrentStream.xcworkspace -scheme TorrentStream -configuration Release \
