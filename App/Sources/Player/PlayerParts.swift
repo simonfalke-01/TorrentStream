@@ -245,7 +245,7 @@ struct NextEpisodeCard: View {
                         } else {
                             Label(countdown.map { "Playing in \($0)" } ?? "Play Next Episode", systemImage: "play.fill")
                                 .monospacedDigit()
-                                .contentTransition(.numericText(countdown: true))
+                                .contentTransition(.numericText(countsDown: true))
                         }
                     }
                     .font(.subheadline.weight(.semibold))
