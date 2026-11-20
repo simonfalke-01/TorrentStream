@@ -134,3 +134,21 @@ jobs:
             xcrun simctl install "$UDID" "$APP"
             check "update"
           fi
+          # Every other iOS version on the runner (phones may be on an older 26.x), and an iPad.
+          xcrun simctl shutdown "$UDID"
+          MAIN=$UDID
+          for PICK in $(xcrun simctl list devices available -j | python3 -c "
+          import json, sys
+          d = json.load(sys.stdin)['devices']
+          ios = sorted((k for k in d if 'iOS-' in k and int(k.split('iOS-')[1].split('-')[0]) >= 26), reverse=True)
+          picks = [next((x['udid'] + ',' + k.split('.')[-1] + '/' + x['name'].replace(' ', '_') for x in d[k] if x['name'].startswith('iPhone')), None) for k in ios]
+          picks.append(next((x['udid'] + ',' + ios[0].split('.')[-1] + '/' + x['name'].replace(' ', '_') for x in d[ios[0]] if x['name'].startswith('iPad')), None))
+          print(' '.join(dict.fromkeys(p for p in picks if p and not p.startswith('$MAIN'))))
+          "); do
+            UDID=${PICK%%,*}
+            xcrun simctl boot "$UDID"
+            xcrun simctl bootstatus "$UDID" -b > /dev/null
+            xcrun simctl install "$UDID" "$APP"
+            check "${PICK#*,}"
+            xcrun simctl shutdown "$UDID"
+          done
