@@ -35,12 +35,45 @@ final class ShowCatalogTests: XCTestCase {
         XCTAssertNil(ShowCatalog.show(["id": 3, "isAdult": true, "title": ["romaji": "X"]]))
     }
 
+    func testKitsuSearchParsing() {
+        let root: [String: Any] = [
+            "data": [
+                ["id": "1", "attributes": ["subtype": "TV", "status": "finished", "canonicalTitle": "Sousou no Frieren",
+                                          "titles": ["en": "Frieren: Beyond Journey’s End", "en_jp": "Sousou no Frieren"],
+                                          "abbreviatedTitles": ["Frieren at the Funeral"], "episodeCount": 28,
+                                          "startDate": "2023-09-29", "averageRating": "88.88",
+                                          "posterImage": ["large": "https://media.kitsu.app/p.jpg"]],
+                 "relationships": ["mappings": ["data": [["type": "mappings", "id": "10"], ["type": "mappings", "id": "11"]]]]],
+                // Music videos and entries AniList doesn't know are left out.
+                ["id": "2", "attributes": ["subtype": "music", "canonicalTitle": "Haru"],
+                 "relationships": ["mappings": ["data": [["type": "mappings", "id": "12"]]]]],
+                ["id": "3", "attributes": ["subtype": "TV", "canonicalTitle": "Unmapped"],
+                 "relationships": ["mappings": ["data": []]]],
+            ],
+            "included": [
+                ["type": "mappings", "id": "10", "attributes": ["externalSite": "anilist/anime", "externalId": "154587"]],
+                ["type": "mappings", "id": "11", "attributes": ["externalSite": "myanimelist/anime", "externalId": "52991"]],
+                ["type": "mappings", "id": "12", "attributes": ["externalSite": "anilist/anime", "externalId": "175691"]],
+            ],
+        ]
+        let shows = ShowCatalog.kitsuShows(root)
+        XCTAssertEqual(shows.map(\.id), [154587])
+        XCTAssertEqual(shows.first?.malID, 52991)
+        XCTAssertEqual(shows.first?.title, "Frieren: Beyond Journey’s End")
+        XCTAssertEqual(shows.first?.romaji, "Sousou no Frieren")
+        XCTAssertEqual(shows.first?.format, "TV")
+        XCTAssertEqual(shows.first?.status, "FINISHED")
+        XCTAssertEqual(shows.first?.year, 2023)
+        XCTAssertEqual(shows.first?.score, 89)
+        XCTAssertNotNil(shows.first?.posterURL)
+    }
+
     func testCurrentSeason() {
         let d = Date(timeIntervalSince1970: 1_763_600_000) // Nov 2025
         XCTAssertEqual(ShowCatalog.currentSeason(d).0, "FALL")
     }
 
-    /// Hits AniList and Jikan. Run with CATALOG_LIVE=1.
+    /// Hits AniList and Kitsu. Run with CATALOG_LIVE=1.
     func testLiveShows() async throws {
         try XCTSkipUnless(ProcessInfo.processInfo.environment["CATALOG_LIVE"] == "1")
         let catalog = ShowCatalog()
@@ -48,8 +81,9 @@ final class ShowCatalogTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(rows.count, 4)
         XCTAssertTrue(rows.allSatisfy { !$0.shows.isEmpty })
 
-        let found = try await catalog.search("Frieren")
+        let found = try await catalog.kitsuSearch("Frieren")
         let frieren = try XCTUnwrap(found.first { $0.romaji == "Sousou no Frieren" })
+        XCTAssertEqual(frieren.id, 154587)
 
         // Start from the first season; the sequel should follow.
         let started = Date()
@@ -78,5 +112,15 @@ final class ShowCatalogTests: XCTestCase {
         let movieDetails = try await catalog.details(id: kimi.id)
         XCTAssertEqual(movieDetails.seasons.count, 1)
         XCTAssertEqual(movieDetails.seasons[0].episodes.count, 1)
+
+        // A long show: every TV season in order, starting from the middle.
+        let aotStart = Date()
+        let aot = try await catalog.details(id: 20958) // Attack on Titan Season 2
+        print("AoT details took", Date().timeIntervalSince(aotStart), aot.seasons.map(\.media.title))
+        XCTAssertEqual(aot.show.id, 16498)
+        XCTAssertGreaterThanOrEqual(aot.seasons.count, 4)
+
+        let fallback = try await catalog.anilistSearch("Frieren")
+        XCTAssertTrue(fallback.contains { $0.id == 154587 })
     }
 }

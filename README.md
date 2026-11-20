@@ -4,7 +4,8 @@ An iOS app that plays shows and movies the moment you tap them, like a streaming
 straight out of BitTorrent, but you never manage downloads, progress or storage.
 
 * **A catalog, not a search box**: Home opens on shelves (Trending Now, New This Season, Popular, Top Rated, Movies)
-  from AniList, the same database that covers what Nyaa carries (anime). Search finds any show or movie by name.
+  from AniList, the same database that covers what Nyaa carries (anime). Search finds any show or movie by name; it
+  runs on Kitsu, which has no request limit, so typing never gets throttled (AniList is the fallback).
 * **Show pages**: poster, synopsis, genres, one **Play / Resume / Play S2 E5** button, My List, and every season with
   its episodes (names and stills from Kitsu). Tap an episode and it plays. Progress is saved per episode, and Continue
   Watching picks up where you stopped.
@@ -46,7 +47,7 @@ SwiftUI app ──► TorrentKit (pure Swift, no dependencies)
  │               │  then sequential; slow blocks near the playhead are re-requested from other peers
  │               ├─ SHA-1 verified, sparse on-disk storage with resume
  │               └─ Loopback HTTP server (Range/seek support) ──► VLC / AVPlayer / VLC app
- ├─────────────► CatalogKit: shows, seasons and episodes from AniList (+ Kitsu episode names); release-name parsing
+ ├─────────────► CatalogKit: search (Kitsu), rows, seasons and episodes (AniList + Kitsu episode names); name parsing
  ├─────────────► NyaaKit: nyaa.si search (HTML listing, server-side sort and pagination)
  └─────────────► SourceKit: episode → Nyaa queries, release matching and ranking, picking the file inside a pack
 ```

@@ -206,10 +206,81 @@ public final class ShowCatalog: @unchecked Sendable {
         }
     }
 
-    /// Shows and movies matching what the user typed, best match first.
+    /// Shows and movies matching what the user typed, best match first. Searches Kitsu, which has no request
+    /// limit, and falls back to AniList when Kitsu can't be reached.
     public func search(_ text: String) async throws -> [Show] {
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !t.isEmpty else { return [] }
+        if let found = try? await kitsuSearch(t) { return found }
+        return try await anilistSearch(t)
+    }
+
+    func kitsuSearch(_ text: String) async throws -> [Show] {
+        var c = URLComponents(string: "\(Self.kitsu)/anime")!
+        c.queryItems = [
+            URLQueryItem(name: "filter[text]", value: text),
+            URLQueryItem(name: "page[limit]", value: "20"),
+            URLQueryItem(name: "include", value: "mappings"),
+            URLQueryItem(name: "fields[mappings]", value: "externalSite,externalId"),
+        ]
+        guard let url = c.url else { throw CatalogError.unreadable }
+        return Self.kitsuShows(try await json(url))
+    }
+
+    /// Kitsu entries that map to AniList, which keys seasons, episodes and progress everywhere else.
+    static func kitsuShows(_ root: [String: Any]) -> [Show] {
+        var mappings: [String: (site: String, id: String)] = [:]
+        for i in (root["included"] as? [[String: Any]]) ?? [] where i["type"] as? String == "mappings" {
+            guard let id = i["id"] as? String, let a = i["attributes"] as? [String: Any],
+                  let site = a["externalSite"] as? String, let ext = a["externalId"] as? String else { continue }
+            mappings[id] = (site, ext)
+        }
+        var seen = Set<Int>()
+        return ((root["data"] as? [[String: Any]]) ?? []).compactMap { item -> Show? in
+            let refs = (((item["relationships"] as? [String: Any])?["mappings"] as? [String: Any])?["data"] as? [[String: Any]]) ?? []
+            let linked = refs.compactMap { ($0["id"] as? String).flatMap { mappings[$0] } }
+            guard let anilist = linked.first(where: { $0.site == "anilist/anime" }).flatMap({ Int($0.id) }),
+                  seen.insert(anilist).inserted,
+                  let a = item["attributes"] as? [String: Any] else { return nil }
+            let mal = linked.first(where: { $0.site == "myanimelist/anime" }).flatMap { Int($0.id) }
+            return kitsuShow(a, anilistID: anilist, malID: mal)
+        }
+    }
+
+    static func kitsuShow(_ a: [String: Any], anilistID: Int, malID: Int?) -> Show? {
+        let formats = ["TV": "TV", "ONA": "ONA", "OVA": "OVA", "movie": "MOVIE", "special": "SPECIAL"]
+        guard let format = formats[a["subtype"] as? String ?? ""], a["ageRating"] as? String != "R18",
+              a["nsfw"] as? Bool != true else { return nil }
+        let titles = a["titles"] as? [String: Any] ?? [:]
+        let english = (titles["en"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        let romaji = (titles["en_jp"] as? String) ?? (a["canonicalTitle"] as? String)
+        guard let title = english ?? romaji else { return nil }
+        let statuses = ["current": "RELEASING", "finished": "FINISHED", "upcoming": "NOT_YET_RELEASED",
+                        "unreleased": "NOT_YET_RELEASED", "tba": "NOT_YET_RELEASED"]
+        func image(_ key: String) -> URL? {
+            let i = a[key] as? [String: Any]
+            return ((i?["large"] as? String) ?? (i?["original"] as? String)).flatMap(URL.init(string:))
+        }
+        return Show(
+            id: anilistID,
+            title: title,
+            malID: malID,
+            romaji: romaji,
+            english: english,
+            synonyms: ((a["abbreviatedTitles"] as? [String]) ?? []).filter(isLatin),
+            format: format,
+            status: statuses[a["status"] as? String ?? ""],
+            episodes: a["episodeCount"] as? Int,
+            duration: a["episodeLength"] as? Int,
+            year: (a["startDate"] as? String).flatMap { Int($0.prefix(4)) },
+            score: (a["averageRating"] as? String).flatMap(Double.init).map { Int($0.rounded()) },
+            overview: (a["synopsis"] as? String).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) },
+            posterURL: image("posterImage"),
+            bannerURL: image("coverImage")
+        )
+    }
+
+    func anilistSearch(_ t: String) async throws -> [Show] {
         let query = """
         query ($q: String) {
           r: Page(perPage: 30) { media(search: $q, type: ANIME, sort: SEARCH_MATCH, isAdult: false, format_in: [TV, TV_SHORT, ONA, OVA, MOVIE]) { ...S } }
@@ -223,6 +294,14 @@ public final class ShowCatalog: @unchecked Sendable {
 
     /// The whole show an entry belongs to: earlier and later seasons in order, with episode titles where known.
     public func details(id: Int) async throws -> ShowDetails {
+        // Each request returns an entry and its neighbours, so walking the seasons takes about one request per two.
+        var known = try await nodes(id)
+        func node(_ id: Int) async throws -> Node {
+            if let n = known[id] { return n }
+            known.merge(try await nodes(id)) { old, _ in old }
+            guard let n = known[id] else { throw CatalogError.unreadable }
+            return n
+        }
         let start = try await node(id)
         guard Self.seasonFormats.contains(start.show.format ?? "") else {
             // Movies, OVAs and specials stand alone.
@@ -276,26 +355,38 @@ public final class ShowCatalog: @unchecked Sendable {
         var streaming: [Int: (title: String?, thumbnail: URL?)]
     }
 
-    private func node(_ id: Int) async throws -> Node {
+    /// An entry and, in full, every entry related to it.
+    private func nodes(_ id: Int) async throws -> [Int: Node] {
+        let relations = "relations { edges { relationType node { id format status nextAiringEpisode { airingAt } startDate { year month day } } } }"
         let query = """
         query ($id: Int) {
           m: Media(id: $id, type: ANIME) {
             \(Self.fields)
             streamingEpisodes { title thumbnail }
-            relations { edges { relationType node { id format status nextAiringEpisode { airingAt } startDate { year month day } } } }
+            relations { edges { relationType node { \(Self.fields) streamingEpisodes { title thumbnail } \(relations) } } }
           }
         }
         """
         let data = try await graphQL(query, variables: ["id": id])
-        guard let m = data["m"] as? [String: Any], let show = Self.show(m) else { throw CatalogError.unreadable }
+        guard let m = data["m"] as? [String: Any], let first = Self.node(m) else { throw CatalogError.unreadable }
+        var out = [first.show.id: first]
+        let edges = ((m["relations"] as? [String: Any])?["edges"] as? [[String: Any]]) ?? []
+        for e in edges {
+            if let n = (e["node"] as? [String: Any]).flatMap(Self.node) { out[n.show.id] = n }
+        }
+        return out
+    }
+
+    static func node(_ m: [String: Any]) -> Node? {
+        guard let show = show(m), m["relations"] != nil else { return nil }
         let edges = ((m["relations"] as? [String: Any])?["edges"] as? [[String: Any]]) ?? []
         func related(_ type: String) -> Int? {
             let nodes = edges.filter { $0["relationType"] as? String == type }.compactMap { $0["node"] as? [String: Any] }
-                .filter { Self.seasonFormats.contains($0["format"] as? String ?? "") }
-            let sorted = nodes.sorted { Self.startKey($0) < Self.startKey($1) }
+                .filter { seasonFormats.contains($0["format"] as? String ?? "") }
+            let sorted = nodes.sorted { startKey($0) < startKey($1) }
             return (type == "PREQUEL" ? sorted.last : sorted.first)?["id"] as? Int
         }
-        let streaming = Self.streamingEpisodes(m["streamingEpisodes"] as? [[String: Any]] ?? [], count: show.episodes)
+        let streaming = streamingEpisodes(m["streamingEpisodes"] as? [[String: Any]] ?? [], count: show.episodes)
         return Node(show: show, prequel: related("PREQUEL"), sequel: related("SEQUEL"), streaming: streaming)
     }
 
