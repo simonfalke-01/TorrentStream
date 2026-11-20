@@ -290,10 +290,12 @@ private struct PlayerChrome: View {
             VideoSurface(output: engine.output)
                 .scaleEffect(zoom)
                 .frame(width: size.width, height: size.height)
+                // Clip to the full screen here; clipping after ignoresSafeArea would cut the picture to the safe
+                // area and leave a black strip over the home indicator.
+                .clipped()
                 .animation(Motion.role(Motion.standard, reduce: reduceMotion), value: zoom)
         }
         .ignoresSafeArea()
-        .clipped()
         .accessibilityHidden(true)
     }
 
