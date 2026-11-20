@@ -12,6 +12,7 @@ struct SettingsView: View {
     @AppStorage(SettingsKey.useDHT) private var useDHT = true
     @AppStorage(SettingsKey.publicTrackers) private var publicTrackers = true
     @AppStorage(SettingsKey.nyaaAddress) private var nyaaAddress = ""
+    @AppStorage(SettingsKey.cacheLimitGB) private var cacheLimitGB = 5
     @State private var confirmClear = false
 
     private var selectedEngine: PlayerEngine { PlayerEngine(rawValue: engine) ?? .vlc }
@@ -68,7 +69,14 @@ struct SettingsView: View {
                 }
 
                 Section {
-                    LabeledContent("Cache", value: Format.bytes(model.storageUsed))
+                    Picker("Cache Size", selection: $cacheLimitGB) {
+                        Text("Small (2 GB)").tag(2)
+                        Text("Medium (5 GB)").tag(5)
+                        Text("Large (10 GB)").tag(10)
+                    }
+                    .pickerStyle(.menu)
+                    .onChange(of: cacheLimitGB) { model.trimCache() }
+                    LabeledContent("In Use", value: Format.bytes(model.storageUsed))
                         .monospacedDigit()
                     Button("Clear Cache") { model.clearCache() }
                         .disabled(model.items.isEmpty)
@@ -77,7 +85,7 @@ struct SettingsView: View {
                 } header: {
                     Text("Storage")
                 } footer: {
-                    Text("TorrentStream keeps recently watched titles ready to play and clears older ones on its own.")
+                    Text("TorrentStream loads up to ten minutes ahead of what you're watching and the start of the next episode. Older titles are cleared on their own; your progress is kept.")
                 }
 
                 Section {

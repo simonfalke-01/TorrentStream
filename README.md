@@ -18,10 +18,12 @@ straight out of BitTorrent, but you never manage downloads, progress or storage.
 * Optional Apple AVPlayer engine (MP4/MOV, AirPlay, Picture in Picture), switchable mid-playback.
 * **iOS 26 Liquid Glass** UI: glass tab bar and player controls, double-tap to skip ±10 s, resume where you left off,
   and Up Next autoplay.
-* **Automatic cache**: an episode you haven't finished stays cached so resuming is instant; when you finish one, the
-  next episode is fetched ahead of time. Least-recently-watched titles are cleared automatically to stay within a
-  budget of a quarter of free space (2–20 GB). Titles stay in My List with their progress. Settings shows the cache
-  size and a Clear Cache button; nothing else about storage is exposed.
+* **Automatic cache, sized like a streaming service**: playback loads up to about ten minutes ahead (from the video's
+  bitrate, capped at 1 GB), and the first few minutes of the next episode are loaded as soon as an episode starts, so
+  Up Next is instant. Nothing else is fetched in the background. What was
+  loaded stays cached, so resuming is instant; the titles watched longest ago are cleared to stay within the cache
+  size from Settings (2, 5 or 10 GB, default 5 GB, never more than a quarter of free space). Titles stay in My List
+  with their progress.
 * A fully cached episode can still be saved to Files or Photos from its long-press menu.
 
 Requires **iOS 26** or later. Artwork lookups can be turned off in Settings (Show Artwork and Details).

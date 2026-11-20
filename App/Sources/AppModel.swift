@@ -82,6 +82,8 @@ enum SettingsKey {
     static let searchFilter = "searchFilter"
     static let recentSearches = "recentSearches"
     static let showArtwork = "showArtwork"
+    /// Cache budget in gigabytes.
+    static let cacheLimitGB = "cacheLimitGB"
 }
 
 /// What the header's Play button starts.
@@ -143,6 +145,7 @@ final class AppModel: ObservableObject {
             SettingsKey.useDHT: true,
             SettingsKey.publicTrackers: true,
             SettingsKey.showArtwork: true,
+            SettingsKey.cacheLimitGB: 5,
         ])
         baseURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("TorrentStream", isDirectory: true)
@@ -433,31 +436,27 @@ final class AppModel: ObservableObject {
 
     /// Open players per title; those titles are never evicted.
     private var playing: [String: Int] = [:]
-    /// The cache may use this share of the space left on the device, within the bounds below.
-    private let cacheShare: Int64 = 4
-    private let cacheFloor: Int64 = 2_000_000_000
-    private let cacheCeiling: Int64 = 20_000_000_000
 
-    /// Keeps cached video within budget by dropping the data of the titles watched longest ago.
-    /// Titles stay in My List with their episodes and positions; they stream again when played.
+    /// Keeps cached video within budget by dropping the data of the titles watched longest ago, the most recent
+    /// one last. Titles stay in My List with their episodes and positions; they stream again when played.
     func trimCache() {
         guard playing.isEmpty, !BackgroundKeeper.shared.isActive else { return }
         let byLastUse = items.filter { $0.status.phase == .ready }
             .sorted { lastUse($0) < lastUse($1) }
             .map(\.id)
-        guard byLastUse.count > 1 else { return }
+        guard !byLastUse.isEmpty else { return }
         let dir = client.downloadDirectory
-        let (share, floor, ceiling) = (cacheShare, cacheFloor, cacheCeiling)
+        let limit = cacheLimit
         Task.detached(priority: .utility) {
             let total = AppModel.allocatedSize(of: dir)
             let free = (try? dir.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?
                 .volumeAvailableCapacityForImportantUsage ?? 0
-            let budget = min(ceiling, max(floor, (free + total) / share))
+            // Never more than a quarter of the space the phone has left.
+            let budget = min(limit, max(AppModel.minimumCache, (free + total) / 4))
             guard total > budget else { return }
             var excess = total - budget
             var victims: [String] = []
-            // The most recently watched title keeps its cache even when it alone is over budget.
-            for hash in byLastUse.dropLast() where excess > 0 {
+            for hash in byLastUse where excess > 0 {
                 let size = AppModel.allocatedSize(of: dir.appendingPathComponent(hash, isDirectory: true))
                 guard size > 0 else { continue }
                 victims.append(hash)
@@ -521,21 +520,40 @@ final class AppModel: ObservableObject {
     private func lastPlayedKey(_ hash: String) -> String { "last.\(hash)" }
     private func watchedAtKey(_ hash: String) -> String { "watchedAt.\(hash)" }
 
-    /// Called when the player appears.
-    func playbackStarted(_ torrent: Torrent) {
+    /// Called when the player appears. Loads about ten minutes past the playhead and the start of the next episode.
+    func playbackStarted(_ request: PlaybackRequest) {
+        let torrent = request.torrent
         playing[torrent.infoHashHex, default: 0] += 1
+        if let d = knownDuration(torrent: torrent, file: request.file) {
+            durationKnown(request, seconds: d)
+        } else if let next = nextPlayable(after: request.file, in: torrent) {
+            torrent.prefetch(fileIndex: next.index, bytes: AppModel.defaultPrefetch)
+        }
     }
 
-    /// Called when the player closes. A finished episode stops loading and the next one starts, so it plays
-    /// instantly; an unfinished one keeps loading so resuming is instant.
+    /// Sizes the readahead and the next episode's prefetch from the video's bitrate.
+    func durationKnown(_ request: PlaybackRequest, seconds: Double) {
+        guard seconds.isFinite, seconds > 60 else { return }
+        let bytesPerSecond = Double(request.file.length) / seconds
+        func clamp(_ v: Double, _ lo: Int64, _ hi: Int64) -> Int64 { min(hi, max(lo, Int64(v))) }
+        let torrent = request.torrent
+        torrent.setReadahead(clamp(bytesPerSecond * 600, 64 << 20, 1 << 30), fileIndex: request.file.index)
+        if let next = nextPlayable(after: request.file, in: torrent) {
+            torrent.prefetch(fileIndex: next.index, bytes: clamp(bytesPerSecond * 180, 32 << 20, 200 << 20))
+        }
+    }
+
+    nonisolated private static let defaultPrefetch: Int64 = 100 << 20
+    nonisolated private static let minimumCache: Int64 = 1_000_000_000
+
+    private var cacheLimit: Int64 { Int64(max(1, defaults.integer(forKey: SettingsKey.cacheLimitGB))) * 1_000_000_000 }
+
+    /// Called when the player closes. What was loaded stays cached, so resuming is instant; nothing more is fetched
+    /// except the start of the next episode.
     func playbackEnded(torrent: Torrent, file: TorrentFile, positionSeconds: Double, durationSeconds: Double) {
         savePosition(torrent: torrent, file: file, seconds: positionSeconds, duration: durationSeconds)
         defaults.set(file.index, forKey: lastPlayedKey(torrent.infoHashHex))
         defaults.set(Date(), forKey: watchedAtKey(torrent.infoHashHex))
-        if isWatched(torrent: torrent, file: file) {
-            torrent.setWanted(false, fileIndex: file.index)
-            if let next = nextPlayable(after: file, in: torrent) { torrent.setWanted(true, fileIndex: next.index) }
-        }
         let hash = torrent.infoHashHex
         if let n = playing[hash] { playing[hash] = n > 1 ? n - 1 : nil }
         persist()
@@ -737,7 +755,8 @@ final class AppModel: ObservableObject {
             }
             guard let t = torrent else { continue }
             addedAt[t.infoHashHex] = e.addedAt ?? Date(timeIntervalSince1970: TimeInterval(entries.count - i))
-            for idx in e.wantedFiles ?? [] { t.setWanted(true, fileIndex: idx) }
+            // Idle titles stay off the network until played. Files wanted by older versions aren't fetched in full.
+            if t.torrentInfo != nil { t.pause() }
         }
     }
 }

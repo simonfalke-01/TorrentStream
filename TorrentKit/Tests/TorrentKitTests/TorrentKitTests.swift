@@ -149,6 +149,54 @@ final class TorrentKitTests: XCTestCase {
         XCTAssertTrue(torrent.magnetLink.hasPrefix("magnet:?xt=urn:btih:\(desc.infoHashHex)"))
     }
 
+    func testStreamingFetchesOnlyReadaheadAndPrefetch() throws {
+        // 256 pieces: the urgent window covers 64, the container-index tail the last 128.
+        let pieceLength = 16384
+        let (data, content) = makeTorrent(files: [("ep1.mkv", 256 * pieceLength), ("ep2.mkv", 256 * pieceLength)],
+                                          pieceLength: pieceLength)
+        let desc = try TorrentDescriptor.parse(torrentData: data)
+        let seeder = try FakeSeeder(info: desc.info!, content: content)
+        defer { seeder.stop() }
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let client = TorrentClient(downloadDirectory: dir, useDHT: false, extraTrackers: [])
+        defer { client.shutdown() }
+        let torrent = try client.add(torrentData: data)
+        torrent.addPeers([PeerAddress(ip: 0x7f00_0001, port: seeder.port)], source: "test")
+
+        func downloaded(_ i: Int) -> Int64 { torrent.status().files[i].downloadedBytes }
+        func waitUntil(_ cond: () -> Bool) {
+            let deadline = Date().addingTimeInterval(20)
+            while !cond() && Date() < deadline { Thread.sleep(forTimeInterval: 0.05) }
+        }
+
+        // No readahead: the urgent window and the tail, nothing in between.
+        torrent.setReadahead(0, fileIndex: 0)
+        let reader = UUID()
+        XCTAssertTrue(try torrent.waitForData(fileIndex: 0, offset: 0, length: 1000, readerID: reader, timeout: 20))
+        let expected = Int64(192 * pieceLength)
+        waitUntil { downloaded(0) >= expected }
+        Thread.sleep(forTimeInterval: 1)
+        XCTAssertEqual(downloaded(0), expected)
+        XCTAssertEqual(downloaded(1), 0, "streaming one file must not fetch others")
+
+        // Default readahead covers the rest of this small file.
+        torrent.setReadahead(nil, fileIndex: 0)
+        waitUntil { torrent.status().files[0].isComplete }
+        XCTAssertTrue(torrent.status().files[0].isComplete)
+        torrent.removeReader(reader)
+
+        // Prefetch loads the next file's start and tail only.
+        let head = Int64(10 * pieceLength)
+        XCTAssertFalse(torrent.hasPrefix(fileIndex: 1, bytes: head))
+        torrent.prefetch(fileIndex: 1, bytes: head)
+        waitUntil { torrent.hasPrefix(fileIndex: 1, bytes: head) }
+        XCTAssertTrue(torrent.hasPrefix(fileIndex: 1, bytes: head))
+        Thread.sleep(forTimeInterval: 1)
+        XCTAssertEqual(downloaded(1), Int64(138 * pieceLength))
+        XCTAssertFalse(torrent.status().files[1].isComplete)
+    }
+
     func testMetadataExchangeFromMagnet() throws {
         let (data, content) = makeTorrent(files: [("a.mkv", 70_000)], pieceLength: 16384)
         let desc = try TorrentDescriptor.parse(torrentData: data)

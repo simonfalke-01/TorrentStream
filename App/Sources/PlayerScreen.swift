@@ -436,7 +436,7 @@ private struct PlayerContainer: View {
         .onAppear {
             stats.start(torrent: request.torrent, fileIndex: request.file.index)
             guard backend == nil else { return }
-            model.playbackStarted(request.torrent)
+            model.playbackStarted(request)
             engine = model.playerEngine
             let b = makeBackend(engine)
             backend = b
@@ -546,6 +546,9 @@ private struct PlayerChrome: View {
         }
         .onChange(of: backend.isPlaying) { _, playing in
             if playing { scheduleHide() } else { reveal(autoHide: false) }
+        }
+        .onChange(of: backend.duration > 0, initial: true) { _, known in
+            if known { model.durationKnown(request, seconds: backend.duration) }
         }
         .sheet(isPresented: $showTracks) {
             TracksSheet(backend: backend, request: request)

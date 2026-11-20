@@ -95,6 +95,10 @@ public final class Torrent {
     private var verifying = Set<Int>()
     private var wantedFiles = Set<Int>()
     private var streamingFiles = Set<Int>()
+    /// Bytes fetched past each reader of a file, beyond the urgent window. Missing = `defaultReadahead`.
+    private var readahead: [Int: Int64] = [:]
+    /// File whose start (and container index at the end) is loaded ahead of playback, and how many bytes of it.
+    private var prefetchTarget: (fileIndex: Int, bytes: Int64)?
 
     private struct Reader { var fileIndex: Int; var offset: Int64; var piece: Int; var updated: Date }
     private var readers: [UUID: Reader] = [:]
@@ -508,6 +512,23 @@ public final class Torrent {
             let tailStart = max(f.offset, f.offset + f.length - 2 * 1024 * 1024)
             for p in info.pieces(from: tailStart, to: f.offset + f.length) { add(p, urgent: true) }
         }
+        // Then a bounded readahead past each reader, so playback survives slow patches without fetching the whole file.
+        for r in activeReaders {
+            let file = info.files[r.fileIndex]
+            let ahead = readahead[r.fileIndex] ?? Torrent.defaultReadahead
+            let end = min(file.offset + file.length, file.offset + r.offset + ahead)
+            guard end > file.offset + r.offset else { continue }
+            for p in info.pieces(from: file.offset + r.offset, to: end) { add(p, urgent: false) }
+        }
+        // Then the start of the file expected to play next, so it starts instantly.
+        if let target = prefetchTarget, target.fileIndex < info.files.count {
+            let f = info.files[target.fileIndex]
+            if f.length > 0 {
+                for p in info.pieces(from: f.offset, to: f.offset + min(f.length, max(1, target.bytes))) { add(p, urgent: false) }
+                let tailStart = max(f.offset, f.offset + f.length - 2 * 1024 * 1024)
+                for p in info.pieces(from: tailStart, to: f.offset + f.length) { add(p, urgent: false) }
+            }
+        }
         // Then the rest of each wanted file, sequentially from the reader position.
         let files = wantedFiles.sorted { a, b in
             let sa = streamingFiles.contains(a), sb = streamingFiles.contains(b)
@@ -605,7 +626,46 @@ public final class Torrent {
 
     // MARK: public API
 
-    /// Marks a file for (background) download, or stops downloading it.
+    /// Readahead past a reader when none was set for its file: about 10 minutes of 1080p video.
+    public static let defaultReadahead: Int64 = 256 * 1024 * 1024
+
+    /// How far past the playback position a file is loaded in the background (`nil` restores the default).
+    /// Only applies while the file is being read; nothing beyond it is fetched.
+    public func setReadahead(_ bytes: Int64?, fileIndex: Int) {
+        lock.lock(); defer { lock.unlock() }
+        readahead[fileIndex] = bytes.map { max(0, $0) }
+        orderDirty = true
+    }
+
+    /// Loads the first `bytes` of a file (plus its container index at the end) at low priority, replacing any
+    /// earlier prefetch. Resumes a paused torrent.
+    public func prefetch(fileIndex: Int, bytes: Int64) {
+        lock.lock()
+        prefetchTarget = (fileIndex, bytes)
+        orderDirty = true
+        lock.unlock()
+        resume()
+    }
+
+    public func cancelPrefetch() {
+        lock.lock(); defer { lock.unlock() }
+        prefetchTarget = nil
+        orderDirty = true
+    }
+
+    /// Every piece of the first `bytes` of a file (and of its last 2 MB) is on disk.
+    public func hasPrefix(fileIndex: Int, bytes: Int64) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard let info = info, fileIndex >= 0, fileIndex < info.files.count else { return false }
+        let f = info.files[fileIndex]
+        guard f.length > 0 else { return true }
+        let head = info.pieces(from: f.offset, to: f.offset + min(f.length, max(1, bytes)))
+        let tail = info.pieces(from: max(f.offset, f.offset + f.length - 2 * 1024 * 1024), to: f.offset + f.length)
+        return head.allSatisfy { have[$0] } && tail.allSatisfy { have[$0] }
+    }
+
+    /// Marks a whole file for background download, or stops downloading it. Streaming doesn't need this:
+    /// readers fetch what they read plus the readahead.
     public func setWanted(_ wanted: Bool, fileIndex: Int) {
         lock.lock(); defer { lock.unlock() }
         if wanted { wantedFiles.insert(fileIndex) } else { wantedFiles.remove(fileIndex); streamingFiles.remove(fileIndex) }
@@ -653,7 +713,6 @@ public final class Torrent {
         }
         readers[readerID] = Reader(fileIndex: fileIndex, offset: offset, piece: range.lowerBound, updated: Date())
         if streamingFiles.insert(fileIndex).inserted { orderDirty = true }
-        if wantedFiles.insert(fileIndex).inserted { orderDirty = true }
         while true {
             if stopped { throw TorrentError.stopped }
             if let f = failure { throw TorrentError.io(f) }
