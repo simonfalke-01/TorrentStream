@@ -9,6 +9,8 @@ struct TorrentStreamApp: App {
 
     init() {
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
+        // Posters and backdrops are fetched often; keep them around between launches.
+        URLCache.shared = URLCache(memoryCapacity: 50_000_000, diskCapacity: 300_000_000)
     }
 
     var body: some Scene {
@@ -21,6 +23,7 @@ struct TorrentStreamApp: App {
             if phase == .active {
                 model.client.ensureStreamingServer()
                 model.refreshStorage()
+                model.trimCache()
             }
         }
     }
@@ -31,21 +34,15 @@ struct RootView: View {
 
     var body: some View {
         TabView(selection: $model.selectedTab) {
-            Tab("Library", systemImage: "play.square.stack", value: AppTab.library) {
-                LibraryView()
-            }
-            Tab("Downloads", systemImage: "arrow.down.circle", value: AppTab.downloads) {
-                DownloadsView()
-            }
-            .badge(model.activeDownloadCount)
-            Tab("Settings", systemImage: "gear", value: AppTab.settings) {
-                SettingsView()
+            Tab("Home", systemImage: "house", value: AppTab.home) {
+                HomeView()
             }
             Tab(value: AppTab.search, role: .search) {
                 SearchView()
             }
         }
         .tabBarMinimizeBehavior(.onScrollDown)
+        .preferredColorScheme(.dark)
         .overlay(alignment: .top) {
             if let toast = model.toast {
                 ToastView(toast: toast)

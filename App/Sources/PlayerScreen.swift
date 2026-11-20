@@ -436,6 +436,7 @@ private struct PlayerContainer: View {
         .onAppear {
             stats.start(torrent: request.torrent, fileIndex: request.file.index)
             guard backend == nil else { return }
+            model.playbackStarted(request.torrent)
             engine = model.playerEngine
             let b = makeBackend(engine)
             backend = b
@@ -504,7 +505,6 @@ private struct PlayerChrome: View {
     @State private var countdown: Int?
     @State private var countdownTask: Task<Void, Never>?
     @State private var upNextDismissed = false
-    @State private var export: ExportItem?
 
     private struct SeekFlash: Equatable {
         let id = UUID()
@@ -551,7 +551,6 @@ private struct PlayerChrome: View {
             TracksSheet(backend: backend, request: request)
                 .presentationDetents([.medium, .large])
         }
-        .exportSheet($export)
         .overlay(alignment: .top) {
             if let toast = model.toast {
                 ToastView(toast: toast).padding(.top, Space.s)
@@ -639,12 +638,12 @@ private struct PlayerChrome: View {
                 GlassIconButton(systemImage: "xmark", label: "Close") { dismiss() }
 
                 VStack(alignment: .leading, spacing: Space.xxs) {
-                    Text(request.file.title)
+                    Text(request.title)
                         .font(.subheadline.weight(.semibold))
                         .lineLimit(1)
-                    if let text = streamText {
-                        Text(text)
-                            .font(.caption.monospacedDigit())
+                    if let episode = request.episode {
+                        Text(episode)
+                            .font(.caption)
                             .foregroundStyle(.white.opacity(0.8))
                             .lineLimit(1)
                     }
@@ -675,14 +674,6 @@ private struct PlayerChrome: View {
         }
     }
 
-    /// Live state of the stream: where the bytes come from and how far ahead they are.
-    private var streamText: String? {
-        if stats.isComplete { return "Downloaded" }
-        guard let s = stats.stream else { return nil }
-        if s.connectedPeers == 0 { return "Waiting for peers" }
-        return "\(Format.rate(s.downloadRate)) from \(Format.peers(s.connectedPeers)), \(Format.bytes(s.bufferedAhead)) buffered"
-    }
-
     private var moreMenu: some View {
         Menu {
             Section {
@@ -697,9 +688,6 @@ private struct PlayerChrome: View {
                     Label(engine == .vlc ? "Use Apple Player" : "Use VLC Player", systemImage: "arrow.triangle.2.circlepath")
                 }
                 #endif
-            }
-            if let fs = stats.file {
-                FileActionsMenu(torrent: request.torrent, status: fs, export: $export, inPlayer: true)
             }
         } label: {
             Image(systemName: "ellipsis")
@@ -754,7 +742,7 @@ private struct PlayerChrome: View {
                     .transition(.opacity)
             }
             VStack(spacing: Space.xs) {
-                TorrentScrubber(progress: backend.duration > 0 ? backend.currentTime / backend.duration : 0,
+                StreamScrubber(progress: backend.duration > 0 ? backend.currentTime / backend.duration : 0,
                                 availability: stats.availability,
                                 duration: backend.duration,
                                 scrub: $scrub) { fraction in
@@ -820,27 +808,13 @@ private struct PlayerChrome: View {
     }
 
     private var bufferingPill: some View {
-        HStack(spacing: Space.m) {
-            ProgressView().tint(.white)
-            VStack(alignment: .leading, spacing: Space.xxs) {
-                Text("Buffering").font(.subheadline.weight(.semibold))
-                if let s = stats.stream, s.connectedPeers > 0 {
-                    Text("\(Format.rate(s.downloadRate)) from \(Format.peers(s.connectedPeers))")
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.white.opacity(0.8))
-                } else {
-                    Text("Waiting for peers")
-                        .font(.caption)
-                        .foregroundStyle(.white.opacity(0.8))
-                }
-            }
-        }
-        .foregroundStyle(.white)
-        .padding(.horizontal, Space.l)
-        .padding(.vertical, Space.m)
-        .glassEffect(.clear, in: .capsule)
-        .allowsHitTesting(false)
-        .accessibilityElement(children: .combine)
+        ProgressView()
+            .controlSize(.large)
+            .tint(.white)
+            .frame(width: PlayerMetrics.play, height: PlayerMetrics.play)
+            .glassEffect(.clear, in: .circle)
+            .allowsHitTesting(false)
+            .accessibilityLabel("Loading")
     }
 
     // MARK: end of playback
@@ -851,9 +825,15 @@ private struct PlayerChrome: View {
                 Text("Up Next")
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(.white.opacity(0.8))
-                Text(next.title)
+                Text(model.episodeLabel(next) ?? next.title)
                     .font(.headline)
                     .lineLimit(2)
+                if model.episodeLabel(next) != nil, model.episodeTitle(next) != model.episodeLabel(next) {
+                    Text(model.episodeTitle(next))
+                        .font(.subheadline)
+                        .foregroundStyle(.white.opacity(0.8))
+                        .lineLimit(1)
+                }
             }
             HStack(spacing: Space.s) {
                 Button { playNext() } label: {
@@ -1017,9 +997,9 @@ private struct GlassIconButton: View {
     }
 }
 
-/// Seek bar that also shows which parts of the file are already downloaded,
+/// Seek bar that also shows which parts of the video are already loaded,
 /// so it's clear where seeking will play instantly.
-struct TorrentScrubber: View {
+struct StreamScrubber: View {
     let progress: Double
     let availability: [Double]
     let duration: Double
@@ -1132,7 +1112,7 @@ struct TracksSheet: View {
                                     Button(s.name) { backend.addSubtitleFile(s.url) }
                                 }
                             } label: {
-                                Label("Subtitle Files in Torrent (\(request.subtitles.count))", systemImage: "captions.bubble")
+                                Label("Subtitle Files (\(request.subtitles.count))", systemImage: "captions.bubble")
                             }
                         }
                     }

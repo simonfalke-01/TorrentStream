@@ -3,7 +3,7 @@ import UIKit
 import Photos
 import TorrentKit
 
-/// "Save to Files": exports copies of downloaded files through the system document picker.
+/// "Save to Files": exports copies of finished files through the system document picker.
 struct DocumentExporter: UIViewControllerRepresentable {
     let urls: [URL]
     var onComplete: (Bool) -> Void = { _ in }
@@ -53,55 +53,35 @@ private struct ExportSheet: ViewModifier {
     }
 }
 
-/// Per-file actions shared by the torrent screen, Downloads, and the player.
-/// Finished files offer save and share; unfinished ones offer download or stop.
-struct FileActionsMenu: View {
+/// Long-press actions for one episode or movie file.
+struct EpisodeMenu: View {
     @EnvironmentObject var model: AppModel
-    let torrent: Torrent
-    let status: FileStatus
+    let item: LibraryItem
+    let file: TorrentFile
     @Binding var export: ExportItem?
-    /// Shows Play and Open in VLC when set.
-    var onPlay: (() -> Void)?
-    /// Inside the player the file is always being fetched, so only an explicit download can be stopped.
-    var inPlayer = false
-
-    private var file: TorrentFile { status.file }
+    let onPlay: () -> Void
 
     var body: some View {
-        if let onPlay {
-            Section {
-                Button(action: onPlay) { Label("Play", systemImage: "play") }
-                Button { openInVLC() } label: { Label("Open in VLC", systemImage: "arrow.up.forward.app") }
-            }
+        let isComplete = item.status.files.first { $0.file.index == file.index }?.isComplete ?? false
+
+        Section {
+            Button(action: onPlay) { Label("Play", systemImage: "play") }
+            Button { openInVLC() } label: { Label("Open in VLC", systemImage: "arrow.up.forward.app") }
         }
-        if status.isComplete, let url = model.localURL(torrent, file) {
+        // A fully loaded video can be kept outside the app.
+        if isComplete, let url = model.localURL(item.torrent, file) {
             Section {
                 Button { export = ExportItem(urls: [url]) } label: { Label("Save to Files", systemImage: "folder") }
                 if PhotoSaver.canSave(file) {
-                    Button { model.saveToPhotos(torrent, file) } label: { Label("Save to Photos", systemImage: "photo") }
-                }
-                ShareLink(item: url) { Label("Share", systemImage: "square.and.arrow.up") }
-            }
-        } else {
-            Section {
-                if inPlayer ? model.isOfflineDownload(torrent, fileIndex: file.index) : status.isDownloading {
-                    Button { model.stopDownloading(torrent, fileIndex: file.index) } label: {
-                        Label("Stop Download", systemImage: "stop.circle")
-                    }
-                } else {
-                    Button { model.download(torrent, fileIndex: file.index) } label: {
-                        Label("Download", systemImage: "arrow.down.circle")
-                    }
+                    Button { model.saveToPhotos(item.torrent, file) } label: { Label("Save to Photos", systemImage: "photo") }
                 }
             }
         }
-        if file.kind.isPlayable {
-            Button { model.copyStreamLink(torrent, file) } label: { Label("Copy Stream Link", systemImage: "link") }
-        }
+        Button { model.copyStreamLink(item.torrent, file) } label: { Label("Copy Stream Link", systemImage: "link") }
     }
 
     private func openInVLC() {
-        let request = model.playbackRequest(torrent: torrent, file: file)
+        let request = model.playbackRequest(torrent: item.torrent, file: file)
         ExternalPlayer.openInVLC(request) { model.errorMessage = $0 }
     }
 }

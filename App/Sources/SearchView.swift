@@ -1,26 +1,29 @@
 import SwiftUI
 import NyaaKit
 import TorrentKit
+import CatalogKit
 
 // MARK: - Vocabulary
 
 extension NyaaSort {
+    /// Sorts offered in the menu. Leechers and comments say nothing about watching, so they're left out.
+    static let visible: [NyaaSort] = [.date, .seeders, .downloads, .size]
+
     var title: String {
         switch self {
-        case .date: return "Date"
-        case .seeders: return "Seeders"
-        case .leechers: return "Leechers"
-        case .downloads: return "Downloads"
+        case .date: return "Upload Date"
+        case .seeders, .leechers: return "Availability"
+        case .downloads, .comments: return "Popularity"
         case .size: return "Size"
-        case .comments: return "Comments"
         }
     }
 
     func orderTitle(ascending: Bool) -> String {
         switch self {
         case .date: return ascending ? "Oldest First" : "Newest First"
+        case .seeders, .leechers: return ascending ? "Slowest First" : "Fastest First"
+        case .downloads, .comments: return ascending ? "Least Popular First" : "Most Popular First"
         case .size: return ascending ? "Smallest First" : "Largest First"
-        default: return ascending ? "Fewest First" : "Most First"
         }
     }
 }
@@ -186,8 +189,12 @@ struct SearchView: View {
             list
                 .overlay { overlay }
                 .navigationTitle("Search")
-                .searchable(text: $text, prompt: "Search Nyaa")
+                .searchable(text: $text, prompt: "Shows and Movies")
                 .onSubmit(of: .search) { submit() }
+                .onAppear {
+                    if !NyaaSort.visible.contains(sort) { sort = .seeders }
+                }
+                .onChange(of: search.results.count) { requestCatalog() }
                 .onChange(of: text) { _, new in
                     if new.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { search.reset() }
                 }
@@ -234,9 +241,9 @@ struct SearchView: View {
         switch search.phase {
         case .idle where search.recents.isEmpty:
             ContentUnavailableView {
-                Label("Search Nyaa", systemImage: "magnifyingglass")
+                Label("Search for shows and movies", systemImage: "magnifyingglass")
             } description: {
-                Text("Find a torrent, then tap it to see its videos and start watching.")
+                Text("Tap a result to start watching.")
             }
         case .loading:
             ProgressView()
@@ -299,8 +306,11 @@ struct SearchView: View {
     private func resultRow(_ r: NyaaResult) -> some View {
         NavigationLink(value: Route.nyaa(r)) {
             SearchResultRow(result: r,
-                            showsCategory: category.isBroad,
-                            inLibrary: r.infoHash.map { model.item($0) != nil } ?? false)
+                            release: model.release(r.title),
+                            title: model.displayTitle(name: r.title),
+                            posterURL: model.entry(name: r.title)?.posterURL,
+                            sort: search.query?.sort ?? sort,
+                            inMyList: r.infoHash.map { model.item($0) != nil } ?? false)
         }
         .contextMenu {
             if let magnet = r.magnet {
@@ -334,7 +344,7 @@ struct SearchView: View {
     private var sortMenu: some View {
         Menu {
             Picker("Sort By", selection: $sort) {
-                ForEach(NyaaSort.allCases) { s in Text(s.title).tag(s) }
+                ForEach(NyaaSort.visible) { s in Text(s.title).tag(s) }
             }
             .pickerStyle(.inline)
             Picker("Order", selection: $ascending) {
@@ -402,104 +412,135 @@ struct SearchView: View {
         guard search.query != nil else { return }
         submit()
     }
+
+    private func requestCatalog() {
+        model.requestCatalog(search.results.compactMap { r in
+            model.catalogQuery(name: r.title,
+                               prefersAnime: r.category.id.hasPrefix("1_") || model.release(r.title).isAnimeStyle)
+        })
+    }
 }
 
 // MARK: - Result row
 
+/// A result reads like a title: artwork, the show's name, which episode and quality, then how well it will stream.
 struct SearchResultRow: View {
     let result: NyaaResult
-    let showsCategory: Bool
-    let inLibrary: Bool
+    let release: ReleaseInfo
+    let title: String
+    let posterURL: URL?
+    let sort: NyaaSort
+    let inMyList: Bool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: Space.xs) {
-            if showsCategory || inLibrary {
-                HStack(spacing: Space.s) {
-                    if showsCategory {
-                        Text(result.category.displayName)
-                            .foregroundStyle(.secondary)
-                    }
-                    if inLibrary {
-                        Label("In Library", systemImage: "checkmark")
-                            .labelStyle(CompactLabelStyle())
-                            .foregroundStyle(.tint)
-                    }
-                }
-                .font(.caption)
-                .lineLimit(1)
-            }
+        HStack(alignment: .top, spacing: Space.m) {
+            PosterImage(url: posterURL, title: title, showsTitle: false)
+                .frame(width: Metrics.rowPoster.width, height: Metrics.rowPoster.height)
 
-            Text(result.title)
-                .foregroundStyle(.primary)
-                .lineLimit(3)
+            VStack(alignment: .leading, spacing: Space.xs) {
+                Text(title)
+                    .font(.headline)
+                    .foregroundStyle(.primary)
+                    .lineLimit(2)
 
-            ViewThatFits(in: .horizontal) {
-                HStack(spacing: Space.m) {
-                    stats
-                    Spacer(minLength: Space.s)
-                    Text(Format.age(result.date))
+                if episodeText != nil || release.resolution != nil {
+                    HStack(spacing: Space.s) {
+                        if let episodeText { Text(episodeText) }
+                        if let res = release.resolution { QualityBadge(resolution: res) }
+                    }
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
                 }
-                VStack(alignment: .leading, spacing: Space.xxs) {
-                    HStack(spacing: Space.m) { stats }
-                    Text(Format.age(result.date))
+
+                if release.group != nil || result.trust != .normal {
+                    source
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+
+                details
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+
+                if inMyList {
+                    Label("In My List", systemImage: "checkmark")
+                        .labelStyle(CompactLabelStyle())
+                        .font(.footnote.weight(.medium))
+                        .foregroundStyle(.tint)
                 }
             }
-            .font(.subheadline)
-            .foregroundStyle(.secondary)
-            .monospacedDigit()
             .lineLimit(1)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .padding(.vertical, Space.xxs)
+        .padding(.vertical, Space.xs)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(result.title)
+        .accessibilityLabel(title)
         .accessibilityValue(accessibilityValue)
     }
 
+    /// "Episode 5", "Episodes 1–12", "Season 2". Nil for a movie or an unparsed name.
+    private var episodeText: String? {
+        let seasonPrefix = release.season.map { $0 > 1 ? "S\($0) " : "" } ?? ""
+        if let first = release.episode, let last = release.lastEpisode, last > first {
+            return seasonPrefix.isEmpty ? "Episodes \(first)–\(last)" : "\(seasonPrefix)E\(first)–\(last)"
+        }
+        if let e = release.episode {
+            return seasonPrefix.isEmpty ? "Episode \(e)" : "\(seasonPrefix)E\(e)"
+        }
+        if let s = release.season { return "Season \(s)" }
+        if release.isBatch { return "Multiple Episodes" }
+        if let y = release.year { return String(y) }
+        return nil
+    }
+
     @ViewBuilder
-    private var stats: some View {
-        Label(Format.count(result.seeders), systemImage: "arrow.up")
-            .labelStyle(CompactLabelStyle())
-            .foregroundStyle(result.seeders > 0 ? AnyShapeStyle(.green) : AnyShapeStyle(.secondary))
-        Label(Format.count(result.leechers), systemImage: "arrow.down")
-            .labelStyle(CompactLabelStyle())
-        Text(Format.bytes(result.size))
-        switch result.trust {
-        case .trusted:
-            Image(systemName: "checkmark.seal.fill")
-                .foregroundStyle(.green)
-        case .remake:
-            Text("Remake")
-                .foregroundStyle(.orange)
-        case .normal:
-            EmptyView()
+    private var source: some View {
+        HStack(spacing: Space.xs) {
+            if let group = release.group { Text(group) }
+            switch result.trust {
+            case .trusted:
+                Image(systemName: "checkmark.seal.fill")
+                    .imageScale(.small)
+                    .foregroundStyle(.green)
+            case .remake:
+                Text("Remake").foregroundStyle(.orange)
+            case .normal:
+                EmptyView()
+            }
+        }
+    }
+
+    private var details: some View {
+        HStack(spacing: Space.m) {
+            AvailabilityLabel(seeders: result.seeders)
+            Text(Format.age(result.date))
+            if sort == .size { Text(Format.bytes(result.size)) }
+            if sort == .downloads {
+                Label(Format.count(result.downloads), systemImage: "person.2")
+                    .labelStyle(CompactLabelStyle())
+            }
         }
     }
 
     private var accessibilityValue: String {
-        var parts = ["\(Format.count(result.seeders)) seeders", "\(Format.count(result.leechers)) leechers",
-                     Format.bytes(result.size), Format.age(result.date)]
+        var parts: [String] = []
+        if let episodeText { parts.append(episodeText) }
+        if let res = release.resolution { parts.append(res == "2160p" ? "4K" : res) }
+        if let group = release.group { parts.append("from \(group)") }
         if result.trust == .trusted { parts.append("Trusted uploader") }
         if result.trust == .remake { parts.append("Remake") }
-        if inLibrary { parts.append("In Library") }
-        if showsCategory { parts.insert(result.category.displayName, at: 0) }
+        parts.append(Format.age(result.date))
+        if sort == .size { parts.append(Format.bytes(result.size)) }
+        if sort == .downloads { parts.append("Popularity \(Format.count(result.downloads))") }
+        if inMyList { parts.append("In My List") }
         return parts.joined(separator: ", ")
-    }
-}
-
-/// Icon and number set tight together, for stats like seeders.
-struct CompactLabelStyle: LabelStyle {
-    func makeBody(configuration: Configuration) -> some View {
-        HStack(spacing: Space.xxs) {
-            configuration.icon.imageScale(.small)
-            configuration.title
-        }
     }
 }
 
 // MARK: - Opening a result
 
-/// Pushed when a result is tapped: downloads the .torrent file, adds it to the library, then shows the
-/// torrent screen in place.
+/// Pushed when a result is tapped: fetches the title's file list, adds it to My List, then shows the title page in place.
 struct NyaaResultView: View {
     let result: NyaaResult
     @EnvironmentObject var model: AppModel
@@ -514,10 +555,10 @@ struct NyaaResultView: View {
     var body: some View {
         Group {
             if let h = hash ?? existing {
-                TorrentDetailView(infoHash: h)
+                TitleView(infoHash: h)
             } else if let failure {
                 ContentUnavailableView {
-                    Label("Couldn’t Open Torrent", systemImage: "exclamationmark.triangle")
+                    Label("Couldn’t Open", systemImage: "exclamationmark.triangle")
                 } description: {
                     Text(failure)
                 } actions: {
@@ -527,12 +568,28 @@ struct NyaaResultView: View {
                 }
                 .navigationBarTitleDisplayMode(.inline)
             } else {
-                ProgressView("Loading file list")
-                    .controlSize(.large)
-                    .navigationBarTitleDisplayMode(.inline)
+                loading
             }
         }
         .task { await load() }
+    }
+
+    private var loading: some View {
+        let title = model.displayTitle(name: result.title)
+        return VStack(spacing: Space.l) {
+            PosterImage(url: model.entry(name: result.title)?.posterURL, title: title,
+                        cornerRadius: Radius.medium, titleFont: .headline)
+                .frame(width: Metrics.shelfPoster.width, height: Metrics.shelfPoster.height)
+            Text(title)
+                .font(.title3.weight(.semibold))
+                .multilineTextAlignment(.center)
+                .lineLimit(2)
+            ProgressView()
+                .accessibilityLabel("Loading")
+        }
+        .padding(Space.xl)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .navigationBarTitleDisplayMode(.inline)
     }
 
     private func load() async {
@@ -548,6 +605,6 @@ struct NyaaResultView: View {
             hash = h
             return
         }
-        failure = "The torrent file couldn’t be downloaded from Nyaa. Check your connection and try again."
+        failure = "This title couldn’t be loaded. Check your connection and try again."
     }
 }
