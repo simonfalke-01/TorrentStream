@@ -44,6 +44,9 @@ targets:
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         UILaunchScreen: {}
+        # Scene-based, so a TV (AirPlay mirroring or a cable) arrives as its own scene the player can draw into.
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
         UIRequiresFullScreen: false
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
