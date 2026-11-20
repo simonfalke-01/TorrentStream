@@ -6,13 +6,14 @@ enum PlayerMetrics {
     static let skipGlyph: CGFloat = 64
     static let playGlyph: CGFloat = 84
     static let titleMaxWidth: CGFloat = 520
-    static let barMaxWidth: CGFloat = 960
     static let cardWidth: CGFloat = 340
     static let thumbWidth: CGFloat = 128
     static let panelSideWidth: CGFloat = 400
     static let panelWideWidth: CGFloat = 720
-    static let seekFlash: CGFloat = 96
-    static let seekFlashInset: CGFloat = 56
+    /// Below this width Chapters and Episodes move into More, so the title beside the toolbar keeps its room.
+    static let compactWidth: CGFloat = 560
+    /// Side margins for the chrome on a wide screen, where the default margin would crowd the edges.
+    static let wideMargin: CGFloat = 40
     /// Text over video keeps a soft shadow so it reads on white frames too.
     static let glyphShadow: CGFloat = 6
 }
@@ -23,7 +24,17 @@ enum PlaybackSpeed {
     static func label(_ r: Float) -> String { String(format: "%g×", r) }
 }
 
-/// A round glass control in the player's top bar.
+/// Contact feedback for controls drawn over video: dims the instant a finger lands, eases back on release.
+/// Geometry never changes, so nothing shifts under the finger.
+struct PlayerPressStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .opacity(configuration.isPressed ? 0.45 : 1)
+            .animation(configuration.isPressed ? nil : .easeOut(duration: 0.1), value: configuration.isPressed)
+    }
+}
+
+/// A round glass control on its own, like Close.
 struct PlayerIconButton: View {
     let systemImage: String
     let label: String
@@ -31,40 +42,37 @@ struct PlayerIconButton: View {
 
     var body: some View {
         Button(action: action) {
-            Image(systemName: systemImage)
-                .font(.body.weight(.semibold))
-                .contentTransition(.symbolEffect(.replace))
-                .frame(width: PlayerMetrics.control, height: PlayerMetrics.control)
-                .contentShape(.circle)
+            PlayerGlyph(systemImage: systemImage)
         }
-        .buttonStyle(.plain)
-        .glassEffect(.clear.interactive(), in: .circle)
+        .buttonStyle(PlayerPressStyle())
+        .glassEffect(.clear, in: .circle)
         .accessibilityLabel(label)
     }
 }
 
-/// A labelled action in the row under the timeline: icon over a short name, like a toolbar.
-struct PlayerActionLabel: View {
-    let title: String
+/// An icon in a player toolbar, at full touch size.
+struct PlayerGlyph: View {
     let systemImage: String
-    var compact = false
 
     var body: some View {
-        Group {
-            if compact {
-                Image(systemName: systemImage)
-                    .font(.body.weight(.semibold))
-                    .frame(width: PlayerMetrics.control, height: PlayerMetrics.control)
-            } else {
-                Label(title, systemImage: systemImage)
-                    .font(.footnote.weight(.semibold))
-                    .labelStyle(.titleAndIcon)
-                    .padding(.horizontal, Space.s)
-                    .frame(minHeight: PlayerMetrics.control)
-            }
-        }
-        .contentShape(.rect)
-        .accessibilityLabel(title)
+        Image(systemName: systemImage)
+            .font(.body.weight(.semibold))
+            .contentTransition(.symbolEffect(.replace))
+            .frame(width: PlayerMetrics.control, height: PlayerMetrics.control)
+            .contentShape(.rect)
+    }
+}
+
+/// Related controls sharing one glass capsule, as in a system toolbar.
+struct PlayerToolbar<Content: View>: View {
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        HStack(spacing: 0) { content }
+            .buttonStyle(PlayerPressStyle())
+            .foregroundStyle(.white)
+            .glassEffect(.clear, in: .capsule)
+            .fixedSize()
     }
 }
 
@@ -181,26 +189,31 @@ struct StreamScrubber: View {
     }
 }
 
-/// "Skip Intro", shown while the intro plays.
+/// "Skip Intro" and the like: the one action that matters while that part plays.
 struct SkipButton: View {
     let title: String
     let action: () -> Void
 
     var body: some View {
         Button(action: action) {
-            Label(title, systemImage: "forward.fill")
-                .font(.subheadline.weight(.semibold))
-                .labelStyle(.titleAndIcon)
-                .padding(.horizontal, Space.l)
-                .frame(minHeight: PlayerMetrics.control)
-                .contentShape(.capsule)
+            HStack(spacing: Space.s) {
+                Text(title)
+                Image(systemName: "forward.end.fill")
+                    .font(.footnote)
+            }
+            .font(.subheadline.weight(.semibold))
+            .padding(.leading, Space.l)
+            .padding(.trailing, Space.m)
+            .frame(minHeight: PlayerMetrics.control)
+            .contentShape(.capsule)
         }
-        .buttonStyle(.plain)
-        .glassEffect(.regular.interactive(), in: .capsule)
+        .buttonStyle(PlayerPressStyle())
+        .glassEffect(.regular, in: .capsule)
     }
 }
 
-/// At the end credits: the next episode's still and name, and a button that plays it.
+/// At the end credits: the next episode's still and name, and a button that plays it. While counting down, the
+/// button fills from left to right until it starts.
 struct NextEpisodeCard: View {
     let item: UpNextItem
     let countdown: Int?
@@ -208,9 +221,11 @@ struct NextEpisodeCard: View {
     let onPlay: () -> Void
     let onDismiss: () -> Void
 
+    static let countdownSeconds = 5
+
     var body: some View {
         VStack(alignment: .leading, spacing: Space.m) {
-            HStack(alignment: .top, spacing: Space.m) {
+            HStack(alignment: .center, spacing: Space.m) {
                 PosterImage(url: item.imageURL, title: "", showsTitle: false, cornerRadius: Radius.small)
                     .frame(width: PlayerMetrics.thumbWidth, height: PlayerMetrics.thumbWidth * 9 / 16)
                     .overlay {
@@ -221,21 +236,19 @@ struct NextEpisodeCard: View {
                         }
                     }
                 VStack(alignment: .leading, spacing: Space.xxs) {
-                    Text("Next Episode")
+                    Text(item.title)
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(.white.opacity(0.7))
-                    Text(item.subtitle?.isEmpty == false ? item.subtitle! : item.title)
-                        .font(.subheadline.weight(.semibold))
-                        .lineLimit(2)
-                    if item.subtitle?.isEmpty == false {
-                        Text(item.title)
-                            .font(.caption)
-                            .foregroundStyle(.white.opacity(0.7))
+                    if let name = item.subtitle, !name.isEmpty {
+                        Text(name)
+                            .font(.subheadline.weight(.semibold))
+                            .lineLimit(2)
                     }
                 }
                 Spacer(minLength: 0)
             }
             .accessibilityElement(children: .combine)
+            .accessibilityLabel("Next: \(item.title)\(item.subtitle.map { ", \($0)" } ?? "")")
 
             HStack(spacing: Space.s) {
                 Button(action: onPlay) {
@@ -251,20 +264,18 @@ struct NextEpisodeCard: View {
                     .font(.subheadline.weight(.semibold))
                     .frame(maxWidth: .infinity, minHeight: PlayerMetrics.control)
                     .foregroundStyle(.black)
-                    .background(.white, in: .capsule)
+                    .background { countdownFill }
+                    .clipShape(.capsule)
                     .contentShape(.capsule)
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(PlayerPressStyle())
                 .disabled(isStarting)
 
                 Button(action: onDismiss) {
-                    Image(systemName: "xmark")
-                        .font(.subheadline.weight(.semibold))
-                        .frame(width: PlayerMetrics.control, height: PlayerMetrics.control)
-                        .contentShape(.circle)
+                    PlayerGlyph(systemImage: "xmark")
                 }
-                .buttonStyle(.plain)
-                .glassEffect(.clear.interactive(), in: .circle)
+                .buttonStyle(PlayerPressStyle())
+                .glassEffect(.clear, in: .circle)
                 .accessibilityLabel(countdown != nil ? "Cancel" : "Hide")
             }
         }
@@ -272,35 +283,116 @@ struct NextEpisodeCard: View {
         .frame(width: PlayerMetrics.cardWidth)
         .glassEffect(.regular.tint(.black.opacity(0.3)), in: .rect(cornerRadius: Radius.large))
     }
+
+    /// Solid white, or while counting down, white filling a paler track as the seconds run out.
+    private var countdownFill: some View {
+        GeometryReader { geo in
+            let done = countdown.map { 1 - Double($0) / Double(Self.countdownSeconds) } ?? 1
+            ZStack(alignment: .leading) {
+                Rectangle().fill(.white.opacity(0.6))
+                Rectangle().fill(.white).frame(width: geo.size.width * done)
+            }
+            .animation(.linear(duration: 1), value: countdown)
+        }
+    }
 }
 
-/// The ripple after a double tap: which way, and how far in total.
+// MARK: - Double-tap seek
+
+/// A run of double-tap seeks on one side: how far in total, and where each tap landed.
 struct SeekFlash: Equatable {
-    var id = UUID()
     let forward: Bool
-    var seconds: Int
+    var seconds = 0
+    /// Counts taps, so the chevrons run again on each one.
+    var taps = 0
+    var ripples: [Ripple] = []
+
+    struct Ripple: Equatable, Identifiable {
+        let id = UUID()
+        let point: CGPoint
+    }
 }
 
-struct SeekFlashView: View {
+/// The side of the screen that was double-tapped lights up as an arc; each tap sends a ripple out from the finger,
+/// the chevrons run in the direction of travel, and the total counts up.
+struct SeekFeedbackView: View {
     let flash: SeekFlash
 
     var body: some View {
-        HStack {
-            if flash.forward { Spacer() }
-            VStack(spacing: Space.xs) {
-                Image(systemName: flash.forward ? "forward.fill" : "backward.fill")
-                    .font(.title3)
-                Text("\(flash.seconds) s")
-                    .font(.subheadline.weight(.semibold).monospacedDigit())
-                    .contentTransition(.numericText(value: Double(flash.seconds)))
+        GeometryReader { geo in
+            let size = geo.size
+            let arc = SeekArc(forward: flash.forward)
+            ZStack {
+                arc.fill(.white.opacity(0.1))
+                ZStack {
+                    ForEach(flash.ripples) { r in
+                        SeekRipple(point: r.point, radius: max(size.width, size.height) * 0.5)
+                    }
+                }
+                .clipShape(arc)
+                VStack(spacing: Space.s) {
+                    SeekChevrons(forward: flash.forward, trigger: flash.taps)
+                    Text("\(flash.forward ? "+" : "−")\(flash.seconds) s")
+                        .font(.subheadline.weight(.semibold).monospacedDigit())
+                        .contentTransition(.numericText(value: Double(flash.seconds)))
+                }
+                .shadow(color: .black.opacity(0.35), radius: PlayerMetrics.glyphShadow)
+                .position(x: size.width * (flash.forward ? SeekArc.labelCenter : 1 - SeekArc.labelCenter), y: size.height / 2)
             }
             .foregroundStyle(.white)
-            .frame(width: PlayerMetrics.seekFlash, height: PlayerMetrics.seekFlash)
-            .glassEffect(.clear, in: .circle)
-            .padding(.horizontal, PlayerMetrics.seekFlashInset)
-            if !flash.forward { Spacer() }
         }
+        .ignoresSafeArea()
         .allowsHitTesting(false)
         .accessibilityHidden(true)
+    }
+}
+
+/// The lit side for a double-tap seek: the outer part of the screen, bounded by a shallow curve.
+struct SeekArc: Shape {
+    let forward: Bool
+    /// Where the curve meets the vertical middle, as a fraction of the width from the near edge.
+    static let depth: CGFloat = 0.38
+    /// Middle of the lit area, from the leading edge for a forward seek.
+    static let labelCenter: CGFloat = 1 - depth / 2
+
+    func path(in rect: CGRect) -> Path {
+        let a = rect.width * 0.5
+        let b = rect.height * 0.85
+        let innerX = forward ? rect.maxX - rect.width * Self.depth : rect.minX + rect.width * Self.depth
+        let centerX = forward ? innerX + a : innerX - a
+        return Path(ellipseIn: CGRect(x: centerX - a, y: rect.midY - b, width: a * 2, height: b * 2))
+    }
+}
+
+private struct SeekRipple: View {
+    let point: CGPoint
+    let radius: CGFloat
+    @State private var grown = false
+
+    var body: some View {
+        Circle()
+            .fill(.white.opacity(grown ? 0 : 0.25))
+            .frame(width: radius * 2, height: radius * 2)
+            .scaleEffect(grown ? 1 : 0.1)
+            .position(point)
+            .onAppear { withAnimation(.easeOut(duration: 0.55)) { grown = true } }
+    }
+}
+
+/// Three chevrons that light one after another in the direction of the seek.
+private struct SeekChevrons: View {
+    let forward: Bool
+    let trigger: Int
+
+    var body: some View {
+        PhaseAnimator([-1, 0, 1, 2], trigger: trigger) { lit in
+            HStack(spacing: 0) {
+                ForEach(0..<3, id: \.self) { i in
+                    Image(systemName: forward ? "arrowtriangle.forward.fill" : "arrowtriangle.backward.fill")
+                        .opacity(lit == (forward ? i : 2 - i) ? 1 : 0.4)
+                }
+            }
+            .font(.footnote)
+        } animation: { _ in .easeOut(duration: 0.09) }
     }
 }

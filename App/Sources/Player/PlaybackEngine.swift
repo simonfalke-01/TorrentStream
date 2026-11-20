@@ -150,8 +150,9 @@ final class PlaybackEngine: ObservableObject {
             errorText = "This video couldn’t be opened."
             return
         }
-        // Generous network cache: the torrent may deliver in bursts.
-        media.addOption(":network-caching=4000")
+        // VLC buffers this much media at start and after every seek before showing a frame; the torrent engine
+        // already reads ahead, so VLC's default for network streams is enough.
+        media.addOption(":network-caching=1000")
         media.addOption(":http-reconnect")
         media.addOption(preferDub ? ":audio-language=eng,en,jpn,ja" : ":audio-language=jpn,ja,eng,en")
         if !preferDub { media.addOption(":sub-language=eng,en,English") }

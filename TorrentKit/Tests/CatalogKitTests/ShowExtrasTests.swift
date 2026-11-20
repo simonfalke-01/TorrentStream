@@ -287,6 +287,45 @@ final class ShowExtrasTests: XCTestCase {
         XCTAssertEqual(ChapterSkips.segments([("Recap", 0, 0)], duration: 60), [SkipSegment(kind: .recap, start: 0, end: 60)])
     }
 
+    func testMergedSkipsPreferChaptersAndSnapCatalogTimes() {
+        let chapters: [(name: String, start: Double, end: Double?)] = [
+            ("Prologue", 0, nil),
+            ("Opening", 112, nil),
+            ("Part A", 202, nil),
+            ("Part B", 800, nil),
+            ("Ending", 1330, nil),
+            ("Preview", 1420, nil),
+        ]
+        let catalog = [
+            // Timed against a release without the cold open: wrong for this file, and the chapter wins.
+            SkipSegment(kind: .intro, start: 0, end: 90),
+            // A recap the chapters don't name, a second off their boundaries.
+            SkipSegment(kind: .recap, start: 1, end: 111),
+        ]
+        XCTAssertEqual(ChapterSkips.merged(catalog: catalog, chapters: chapters, duration: 1440), [
+            SkipSegment(kind: .recap, start: 0, end: 112),
+            SkipSegment(kind: .intro, start: 112, end: 202),
+            SkipSegment(kind: .credits, start: 1330, end: 1420),
+            SkipSegment(kind: .preview, start: 1420, end: 1440),
+        ])
+    }
+
+    func testMergedSkipsCheckInferredTimesAgainstChapters() {
+        let unnamed: [(name: String, start: Double, end: Double?)] = [
+            ("Chapter 1", 0, nil), ("Chapter 2", 95, nil), ("Chapter 3", 185, nil), ("Chapter 4", 1310, nil),
+        ]
+        let lined = SkipSegment(kind: .intro, start: 93, end: 186, isInferred: true)
+        let off = SkipSegment(kind: .credits, start: 1250, end: 1340, isInferred: true)
+        XCTAssertEqual(ChapterSkips.merged(catalog: [lined, off], chapters: unnamed, duration: 1420),
+                       [SkipSegment(kind: .intro, start: 95, end: 185, isInferred: true)])
+
+        // With too few chapters to judge by, catalog times stand as they are.
+        XCTAssertEqual(ChapterSkips.merged(catalog: [off], chapters: [], duration: 1420), [off])
+        // Submitted for this episode rather than inferred, a time stays even when it lines up with nothing.
+        let submitted = SkipSegment(kind: .credits, start: 1250, end: 1340)
+        XCTAssertEqual(ChapterSkips.merged(catalog: [submitted], chapters: unnamed, duration: 1420), [submitted])
+    }
+
     // MARK: Schedule and recommendations
 
     func testScheduleParsing() throws {

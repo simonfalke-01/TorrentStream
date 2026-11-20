@@ -100,11 +100,14 @@ public final class Torrent {
     /// File whose start (and container index at the end) is loaded ahead of playback, and how many bytes of it.
     private var prefetchTarget: (fileIndex: Int, bytes: Int64)?
 
+    /// `updated` is when the reader started or last moved to another piece, so the latest seek ranks first.
     private struct Reader { var fileIndex: Int; var offset: Int64; var piece: Int; var updated: Date }
     private var readers: [UUID: Reader] = [:]
 
     private var priorityOrder: [Int] = []
     private var urgentPieces = Set<Int>()
+    /// The pieces right at each reader: what the player is blocked on.
+    private var criticalPieces = Set<Int>()
     private var orderDirty = true
 
     private var peers: [PeerAddress: PeerConnection] = [:]
@@ -131,7 +134,13 @@ public final class Torrent {
     private var trackers: [TrackerAnnouncer] = []
 
     let maxPeers = 60
-    let maxConnecting = 20
+    /// Tracker lists are mostly unreachable peers, so many connection attempts run at once.
+    let maxConnecting = 40
+    /// Bytes past a reader (capped by its urgent window) that are fetched before anything else, and raced between
+    /// peers early.
+    static let criticalBytes: Int64 = 2 * 1024 * 1024
+    /// A block of a critical piece is re-requested from another peer when it hasn't arrived after this long.
+    static let criticalRaceAfter: TimeInterval = 0.5
 
     init(descriptor: TorrentDescriptor, client: TorrentClient, directory: URL, peerID: Data) {
         self.descriptor = descriptor
@@ -213,7 +222,6 @@ public final class Torrent {
 
     /// Periodic maintenance. Returns false once stopped.
     private func tick() -> Bool {
-        var toStart: [PeerConnection] = []
         lock.lock()
         if stopped { lock.unlock(); return false }
         rateMeter.add(bytesSinceTick)
@@ -226,20 +234,12 @@ public final class Torrent {
         }
 
         let now = Date()
-        let connecting = peers.values.filter { !handshaked.contains(ObjectIdentifier($0)) }.count
-        var budget = min(maxPeers - peers.count, maxConnecting - connecting)
-        var scanned = 0
-        let queueCount = peerQueue.count
-        while budget > 0 && !peerQueue.isEmpty && scanned < queueCount {
-            let addr = peerQueue.removeFirst()
-            scanned += 1
-            if let r = retryAfter[addr], r > now { peerQueue.append(addr); continue }
-            if peers[addr] != nil { continue }
-            let conn = PeerConnection(address: addr, torrent: self)
-            peers[addr] = conn
-            connectedAt[ObjectIdentifier(conn)] = now
-            toStart.append(conn)
-            budget -= 1
+        let toStart = dequeuePeersLocked(now: now)
+        for p in peers.values {
+            // An idle peer gives no evidence about its speed, so its estimate only decays while it has work.
+            let delta = Double(p.downloadedBytes - p.bytesAtLastTick)
+            if delta > 0 || !p.pending.isEmpty { p.capacity = max(p.capacity * 0.95, delta) }
+            p.bytesAtLastTick = p.downloadedBytes
         }
 
         if resumeDirty && now.timeIntervalSince(lastResumeSave) > 5 { saveResumeLocked() }
@@ -257,16 +257,58 @@ public final class Torrent {
         return true
     }
 
+    /// Connection slots free right now.
+    private func freeSlotsLocked() -> Int {
+        guard !stopped, !paused else { return 0 }
+        let connecting = peers.values.filter { !handshaked.contains(ObjectIdentifier($0)) }.count
+        return max(0, min(maxPeers - peers.count, maxConnecting - connecting))
+    }
+
+    private func connectLocked(_ addr: PeerAddress, now: Date) -> PeerConnection {
+        let conn = PeerConnection(address: addr, torrent: self)
+        peers[addr] = conn
+        connectedAt[ObjectIdentifier(conn)] = now
+        return conn
+    }
+
+    /// Creates connections for queued peers while there are free slots. The caller starts them after unlocking.
+    private func dequeuePeersLocked(now: Date) -> [PeerConnection] {
+        var toStart: [PeerConnection] = []
+        var budget = freeSlotsLocked()
+        var scanned = 0
+        let queueCount = peerQueue.count
+        while budget > 0 && !peerQueue.isEmpty && scanned < queueCount {
+            let addr = peerQueue.removeFirst()
+            scanned += 1
+            if let r = retryAfter[addr], r > now { peerQueue.append(addr); continue }
+            if peers[addr] != nil { continue }
+            toStart.append(connectLocked(addr, now: now))
+            budget -= 1
+        }
+        return toStart
+    }
+
     // MARK: peers
 
+    /// Queues peers and connects to a few of them right away. Each list only gets a share of the free slots and the
+    /// rest is shuffled into the queue, since one stale tracker list (common) would otherwise hold every slot until
+    /// its connections time out. Peers learned from other peers are live, so they go first.
     public func addPeers(_ list: [PeerAddress], source: String) {
         lock.lock()
-        var added = 0
+        var fresh: [PeerAddress] = []
         for p in list where !p.isPrivateOrInvalid && knownPeers.count < 3000 {
-            if knownPeers.insert(p).inserted { peerQueue.append(p); added += 1 }
+            if knownPeers.insert(p).inserted { fresh.append(p) }
+        }
+        fresh.shuffle()
+        let now = Date()
+        let immediate = min(fresh.count, freeSlotsLocked(), maxConnecting / 4)
+        let toStart = fresh.prefix(immediate).map { connectLocked($0, now: now) }
+        for p in fresh.dropFirst(immediate) {
+            peerQueue.insert(p, at: source == "pex" ? 0 : Int.random(in: 0...peerQueue.count))
         }
         lock.unlock()
-        if added > 0 { log("\(infoHashHex.prefix(8)): +\(added) peers from \(source)") }
+        toStart.forEach { $0.start() }
+        if !fresh.isEmpty { log("\(infoHashHex.prefix(8)): +\(fresh.count) peers from \(source)") }
     }
 
     func peerConnected(_ peer: PeerConnection) -> Bool {
@@ -279,7 +321,14 @@ public final class Torrent {
     }
 
     func peerDisconnected(_ peer: PeerConnection) {
-        lock.lock(); defer { lock.unlock() }
+        lock.lock()
+        peerDisconnectedLocked(peer)
+        let toStart = dequeuePeersLocked(now: Date())
+        lock.unlock()
+        toStart.forEach { $0.start() }
+    }
+
+    private func peerDisconnectedLocked(_ peer: PeerConnection) {
         let id = ObjectIdentifier(peer)
         peer.closed = true
         releaseRequestsLocked(peer)
@@ -476,12 +525,44 @@ public final class Torrent {
             return actions
         }
 
-        if !peer.peerChoking && peer.pending.count < pipelineDepth / 2 {
-            let wasIdle = peer.pending.isEmpty
-            actions.requests = pickBlocks(for: peer, count: pipelineDepth - peer.pending.count, info: info, now: now)
-            if wasIdle && !actions.requests.isEmpty { peer.lastBlockAt = now }
+        if !peer.peerChoking {
+            if needsCriticalBlocks(from: peer, info: info, now: now) {
+                // The player waits on blocks this peer could fetch (right after a seek, or a straggler worth racing):
+                // drop its other requests so they are served next instead of after its whole queue.
+                let me = ObjectIdentifier(peer)
+                let stale = peer.pending.filter { !criticalPieces.contains($0.piece) }
+                for r in stale {
+                    peer.pending.remove(r)
+                    inProgress[r.piece]?.release(r.offset / blockSize, peer: me)
+                }
+                actions.cancels = Array(stale)
+            }
+            if peer.pending.count < pipelineDepth / 2 {
+                let wasIdle = peer.pending.isEmpty
+                actions.requests = pickBlocks(for: peer, count: pipelineDepth - peer.pending.count, info: info, now: now)
+                if wasIdle && !actions.requests.isEmpty { peer.lastBlockAt = now }
+            }
         }
         return actions
+    }
+
+    /// Whether the peer has a block of a critical piece that nobody has been asked for, or that is overdue and
+    /// may be raced by this peer, and the peer is below its share of critical blocks.
+    private func needsCriticalBlocks(from peer: PeerConnection, info: TorrentInfo, now: Date) -> Bool {
+        if orderDirty { rebuildOrder(info) }
+        guard !criticalPieces.isEmpty,
+              peer.pending.filter({ criticalPieces.contains($0.piece) }).count < criticalShareLocked(peer: peer) else { return false }
+        let me = ObjectIdentifier(peer)
+        let nowT = now.timeIntervalSinceReferenceDate
+        for piece in criticalPieces where !have[piece] && !verifying.contains(piece) && piece < peer.bitfield.count && peer.bitfield[piece] {
+            guard let pp = inProgress[piece] else { return true }
+            for b in 0..<pp.blockCount where !pp.received[b] {
+                let reqs = pp.requesters[b]
+                if reqs.isEmpty { return true }
+                if reqs.count < 3 && !reqs.contains(me) && nowT - pp.requestedAt[b] > Torrent.criticalRaceAfter { return true }
+            }
+        }
+        return false
     }
 
     private func rebuildOrder(_ info: TorrentInfo) {
@@ -489,20 +570,24 @@ public final class Torrent {
         var order: [Int] = []
         var seen = Set<Int>()
         urgentPieces.removeAll()
+        criticalPieces.removeAll()
         let window = max(4, min(64, (16 * 1024 * 1024) / info.pieceLength))
 
-        func add(_ p: Int, urgent: Bool) {
+        func add(_ p: Int, urgent: Bool, critical: Bool = false) {
             guard p >= 0 && p < info.pieceCount, !have[p] else { return }
             if urgent { urgentPieces.insert(p) }
+            if critical { criticalPieces.insert(p) }
             if seen.insert(p).inserted { order.append(p) }
         }
 
         let activeReaders = readers.values.sorted { $0.updated > $1.updated }
+        // First what the player is blocked on, the latest seek first.
         for r in activeReaders {
             let file = info.files[r.fileIndex]
-            let last = info.pieces(for: file).upperBound
-            var p = r.piece
-            while p <= min(last, r.piece + window - 1) { add(p, urgent: true); p += 1 }
+            let start = file.offset + r.offset
+            let end = min(file.offset + file.length, start + Torrent.criticalBytes)
+            guard end > start else { continue }
+            for p in info.pieces(from: start, to: end) where p < r.piece + window { add(p, urgent: true, critical: true) }
         }
         // Container indexes live at the start/end of media files (MP4 moov, MKV cues): fetch them early.
         for fi in streamingFiles {
@@ -511,6 +596,12 @@ public final class Torrent {
             add(range.lowerBound, urgent: true)
             let tailStart = max(f.offset, f.offset + f.length - 2 * 1024 * 1024)
             for p in info.pieces(from: tailStart, to: f.offset + f.length) { add(p, urgent: true) }
+        }
+        for r in activeReaders {
+            let file = info.files[r.fileIndex]
+            let last = info.pieces(for: file).upperBound
+            var p = r.piece
+            while p <= min(last, r.piece + window - 1) { add(p, urgent: true); p += 1 }
         }
         // Then a bounded readahead past each reader, so playback survives slow patches without fetching the whole file.
         for r in activeReaders {
@@ -543,16 +634,32 @@ public final class Torrent {
         priorityOrder = order
     }
 
+    /// Most blocks of critical pieces this peer may have outstanding: what it can deliver in half a second at its
+    /// recent peak rate (a few while that's unknown). Fast peers take most of what the player waits on, slow or
+    /// stalled ones can't hold much of it, and every peer comes back for more as it delivers.
+    private func criticalShareLocked(peer: PeerConnection) -> Int {
+        peer.capacity > 0 ? max(1, Int(peer.capacity / 2) / blockSize) : 4
+    }
+
     private func pickBlocks(for peer: PeerConnection, count: Int, info: TorrentInfo, now: Date) -> [BlockRequest] {
         if orderDirty { rebuildOrder(info) }
         let me = ObjectIdentifier(peer)
         let nowT = now.timeIntervalSinceReferenceDate
         let maxInProgress = max(6, min(handshaked.count + 6, (128 * 1024 * 1024) / info.pieceLength))
+        var criticalHeld = 0
+        var criticalShare = Int.max
+        if !criticalPieces.isEmpty {
+            criticalHeld = peer.pending.filter { criticalPieces.contains($0.piece) }.count
+            criticalShare = criticalShareLocked(peer: peer)
+        }
         var out: [BlockRequest] = []
         for piece in priorityOrder {
             if out.count >= count { break }
             if have[piece] || verifying.contains(piece) || !peer.bitfield[piece] { continue }
             let urgent = urgentPieces.contains(piece)
+            let critical = criticalPieces.contains(piece)
+            // Blocks the player waits on are raced against a second peer sooner.
+            let raceAfter: TimeInterval = critical ? Torrent.criticalRaceAfter : 3
             let pp: PieceProgress
             if let existing = inProgress[piece] {
                 pp = existing
@@ -562,18 +669,24 @@ public final class Torrent {
                 inProgress[piece] = pp
             }
             for b in 0..<pp.blockCount where out.count < count && !pp.received[b] {
+                if critical && criticalHeld >= criticalShare { break }
                 let reqs = pp.requesters[b]
                 if reqs.contains(me) { continue }
                 if !reqs.isEmpty {
                     // Near the playhead, race a slow block against another peer.
-                    guard urgent, reqs.count < 3, nowT - pp.requestedAt[b] > 3 else { continue }
+                    guard urgent, reqs.count < 3, nowT - pp.requestedAt[b] > raceAfter else { continue }
                 }
                 pp.requesters[b].append(me)
                 pp.requestedAt[b] = nowT
                 let r = BlockRequest(piece: piece, offset: b * blockSize, length: pp.blockLength(b))
                 peer.pending.insert(r)
                 out.append(r)
+                if critical { criticalHeld += 1 }
             }
+            // Peers serve requests in order: while critical blocks are unassigned, keep this peer's queue short so
+            // it takes more of them as soon as it has room.
+            if critical && criticalHeld >= criticalShare,
+               (0..<pp.blockCount).contains(where: { !pp.received[$0] && pp.requesters[$0].isEmpty }) { break }
         }
         return out
     }
@@ -708,10 +821,10 @@ public final class Torrent {
             let ts = trackers
             DispatchQueue.global().async { ts.forEach { $0.poke() } }
         }
-        if readers[readerID]?.piece != range.lowerBound || readers[readerID]?.fileIndex != fileIndex {
-            orderDirty = true
-        }
-        readers[readerID] = Reader(fileIndex: fileIndex, offset: offset, piece: range.lowerBound, updated: Date())
+        let moved = readers[readerID].map { $0.piece != range.lowerBound || $0.fileIndex != fileIndex } ?? true
+        if moved { orderDirty = true }
+        readers[readerID] = Reader(fileIndex: fileIndex, offset: offset, piece: range.lowerBound,
+                                   updated: moved ? Date() : readers[readerID]!.updated)
         if streamingFiles.insert(fileIndex).inserted { orderDirty = true }
         while true {
             if stopped { throw TorrentError.stopped }

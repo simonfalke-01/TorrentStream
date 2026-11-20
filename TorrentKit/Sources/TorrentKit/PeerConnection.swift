@@ -25,6 +25,9 @@ final class PeerConnection {
     var pending = Set<BlockRequest>()
     var lastBlockAt = Date()
     var downloadedBytes: Int64 = 0
+    /// Recent peak download rate from this peer in bytes/s, decaying while it is slow (updated by the torrent's tick).
+    var capacity: Double = 0
+    var bytesAtLastTick: Int64 = 0
     var supportsExtensions = false
     var utMetadataID: Int?
     var utPexID: Int?
@@ -60,12 +63,14 @@ final class PeerConnection {
         }
         guard let torrent = torrent else { return }
         do {
-            let sock = try TCPSocket.connect(to: address, timeout: 8)
+            // Reachable peers answer within a second or two; most tracker entries never do.
+            let sock = try TCPSocket.connect(to: address, timeout: 4)
             socket = sock
             sock.setSendTimeout(30)
-            sock.setReceiveTimeout(10)
+            sock.setReceiveTimeout(4)
             try handshake(torrent: torrent)
-            sock.setReceiveTimeout(0.5)
+            // Short, so new priorities (a seek) reach idle peers quickly.
+            sock.setReceiveTimeout(0.2)
             guard torrent.peerConnected(self) else { return }
             if supportsExtensions { try sendExtendedHandshake(torrent: torrent) }
             if let bf = torrent.ourBitfieldMessage() { try send(bf) }
@@ -92,7 +97,7 @@ final class PeerConnection {
         hs.append(torrent.infoHash)
         hs.append(torrent.peerID)
         try socket!.send(hs)
-        let resp = try socket!.receiveExactly(68, deadline: Date().addingTimeInterval(15))
+        let resp = try socket!.receiveExactly(68, deadline: Date().addingTimeInterval(8))
         guard resp[resp.startIndex] == 19,
               resp.subdata(in: resp.startIndex + 1 ..< resp.startIndex + 20) == Data("BitTorrent protocol".utf8) else {
             throw TorrentError.io("bad handshake")
@@ -205,6 +210,10 @@ final class PeerConnection {
         if actions.sendInterested {
             out.appendBE(UInt32(1)); out.append(2)
         }
+        for r in actions.cancels {
+            out.appendBE(UInt32(13)); out.append(8)
+            out.appendBE(UInt32(r.piece)); out.appendBE(UInt32(r.offset)); out.appendBE(UInt32(r.length))
+        }
         for r in actions.requests {
             out.appendBE(UInt32(13)); out.append(6)
             out.appendBE(UInt32(r.piece)); out.appendBE(UInt32(r.offset)); out.appendBE(UInt32(r.length))
@@ -238,6 +247,7 @@ final class PeerConnection {
 struct PeerActions {
     var sendInterested = false
     var requests: [BlockRequest] = []
+    var cancels: [BlockRequest] = []
     var metadataRequests: [(Int, Int)] = []
     var disconnectReason: String?
 }

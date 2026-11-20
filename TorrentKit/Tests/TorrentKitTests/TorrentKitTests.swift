@@ -246,6 +246,119 @@ final class TorrentKitTests: XCTestCase {
         XCTAssertNil(torrent.streamStatus(fileIndex: 1).readerOffset)
         XCTAssertNil(torrent.streamStatus(fileIndex: 0).readerOffset)
     }
+
+    func testAddedPeersConnectWithoutWaitingForTick() throws {
+        let (data, content) = makeTorrent(files: [("a.mkv", 70_000)], pieceLength: 16384)
+        let desc = try TorrentDescriptor.parse(torrentData: data)
+        let seeder = try FakeSeeder(info: desc.info!, content: content)
+        defer { seeder.stop() }
+        let (client, torrent, dir) = try makeIdleTorrent(data)
+        defer { client.shutdown(); try? FileManager.default.removeItem(at: dir) }
+        Thread.sleep(forTimeInterval: 0.1)
+        torrent.addPeers([PeerAddress(ip: 0x7f00_0001, port: seeder.port)], source: "test")
+        let deadline = Date().addingTimeInterval(0.5)
+        while torrent.status().connectedPeers == 0 && Date() < deadline { Thread.sleep(forTimeInterval: 0.01) }
+        XCTAssertEqual(torrent.status().connectedPeers, 1)
+    }
+
+    /// A torrent without trackers or peers, so a test can drive the piece picker directly.
+    private func makeIdleTorrent(_ data: Data) throws -> (TorrentClient, Torrent, URL) {
+        let desc = try TorrentDescriptor.parse(torrentData: data)
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let client = TorrentClient(downloadDirectory: dir, useDHT: false, extraTrackers: [])
+        let torrent = try client.add(descriptor: TorrentDescriptor(infoHash: desc.infoHash, displayName: nil, trackers: [],
+                                                                   info: desc.info, magnetURI: nil, torrentData: nil))
+        return (client, torrent, dir)
+    }
+
+    private func unchokedPeer(_ torrent: Torrent, port: UInt16, capacity: Double = 1e9) -> PeerConnection {
+        let peer = PeerConnection(address: PeerAddress(ip: 0x7f00_0001, port: port), torrent: torrent)
+        peer.bitfield = Array(repeating: true, count: torrent.torrentInfo!.pieceCount)
+        peer.peerChoking = false
+        peer.capacity = capacity
+        return peer
+    }
+
+    private func registerReader(_ torrent: Torrent, _ id: UUID, piece: Int, extra: Int64 = 0) throws {
+        _ = try torrent.waitForData(fileIndex: 0, offset: Int64(piece) * 262_144 + extra, length: 1, readerID: id, timeout: 0.01)
+    }
+
+    /// After a seek, the new position is requested before what the previous (still waiting) reader needs.
+    /// Pieces are 256 KB (16 blocks), so the 2 MB past a reader spans 8 or 9 of them.
+    func testSeekRequestsNewPositionFirst() throws {
+        let (data, _) = makeTorrent(files: [("a.mkv", 32 * 262_144)], pieceLength: 262_144)
+        let (client, torrent, dir) = try makeIdleTorrent(data)
+        defer { client.shutdown(); try? FileManager.default.removeItem(at: dir) }
+        let old = UUID(), new = UUID()
+        try registerReader(torrent, old, piece: 20)
+        let a = torrent.nextActions(for: unchokedPeer(torrent, port: 1), pipelineDepth: 48)
+        XCTAssertEqual(Set(a.requests.map(\.piece)), [20, 21, 22])
+
+        try registerReader(torrent, new, piece: 8, extra: 1000)
+        try registerReader(torrent, old, piece: 20)
+        let b = torrent.nextActions(for: unchokedPeer(torrent, port: 2), pipelineDepth: 48)
+        XCTAssertEqual(b.requests.first, BlockRequest(piece: 8, offset: 0, length: 16384))
+        XCTAssertEqual(Set(b.requests.map(\.piece)), [8, 9, 10])
+    }
+
+    /// A peer whose pipeline is full of background requests cancels them when the player waits on new blocks.
+    func testSeekCancelsQueuedBackgroundRequests() throws {
+        let (data, _) = makeTorrent(files: [("a.mkv", 32 * 262_144)], pieceLength: 262_144)
+        let (client, torrent, dir) = try makeIdleTorrent(data)
+        defer { client.shutdown(); try? FileManager.default.removeItem(at: dir) }
+        try registerReader(torrent, UUID(), piece: 31)
+        let peer = unchokedPeer(torrent, port: 1)
+        // The reader's last piece, then the file head and the container index at the end.
+        let a = torrent.nextActions(for: peer, pipelineDepth: 48)
+        XCTAssertEqual(a.requests.count, 48)
+        XCTAssertEqual(a.requests.first?.piece, 31)
+        XCTAssertEqual(Set(a.requests.map(\.piece)), [31, 0, 24])
+
+        try registerReader(torrent, UUID(), piece: 8)
+        let b = torrent.nextActions(for: peer, pipelineDepth: 48)
+        XCTAssertEqual(Set(b.cancels.map(\.piece)), [0, 24])
+        XCTAssertEqual(b.cancels.count, 32)
+        XCTAssertEqual(b.requests.first, BlockRequest(piece: 8, offset: 0, length: 16384))
+        XCTAssertEqual(Set(b.requests.map(\.piece)), [8, 9])
+        XCTAssertEqual(peer.pending.count, 48)
+    }
+
+    /// Blocks the player waits on that a peer is slow to send are requested again from another peer, ahead of that
+    /// peer's queued work.
+    func testOverdueCriticalBlocksAreRaced() throws {
+        let (data, _) = makeTorrent(files: [("a.mkv", 32 * 262_144)], pieceLength: 262_144)
+        let (client, torrent, dir) = try makeIdleTorrent(data)
+        defer { client.shutdown(); try? FileManager.default.removeItem(at: dir) }
+        try registerReader(torrent, UUID(), piece: 31)
+        let slow = unchokedPeer(torrent, port: 1), other = unchokedPeer(torrent, port: 2)
+        XCTAssertEqual(torrent.nextActions(for: slow, pipelineDepth: 48).requests.first?.piece, 31)
+        let early = torrent.nextActions(for: other, pipelineDepth: 48)
+        XCTAssertFalse(early.requests.contains { $0.piece == 31 })
+        XCTAssertTrue(early.cancels.isEmpty)
+
+        Thread.sleep(forTimeInterval: Torrent.criticalRaceAfter + 0.1)
+        let late = torrent.nextActions(for: other, pipelineDepth: 48)
+        XCTAssertEqual(late.cancels.count, 48)
+        XCTAssertEqual(Array(late.requests.prefix(16)), (0..<16).map { BlockRequest(piece: 31, offset: $0 * 16384, length: 16384) })
+    }
+
+    /// A peer gets as many of the blocks the player waits on as it can deliver in about half a second (a few when its
+    /// speed is unknown), and nothing behind them while some are still unassigned, so a slow peer can't delay
+    /// playback much and fast peers take most of the work.
+    func testCriticalBlocksAreSharedByPeerSpeed() throws {
+        let (data, _) = makeTorrent(files: [("a.mkv", 32 * 262_144)], pieceLength: 262_144)
+        let (client, torrent, dir) = try makeIdleTorrent(data)
+        defer { client.shutdown(); try? FileManager.default.removeItem(at: dir) }
+        try registerReader(torrent, UUID(), piece: 8)
+        let unknown = torrent.nextActions(for: unchokedPeer(torrent, port: 1, capacity: 0), pipelineDepth: 48)
+        XCTAssertEqual(unknown.requests, (0..<4).map { BlockRequest(piece: 8, offset: $0 * 16384, length: 16384) })
+        let slow = torrent.nextActions(for: unchokedPeer(torrent, port: 2, capacity: 20_000), pipelineDepth: 48)
+        XCTAssertEqual(slow.requests, [BlockRequest(piece: 8, offset: 4 * 16384, length: 16384)])
+        let fast = torrent.nextActions(for: unchokedPeer(torrent, port: 3, capacity: 4_000_000), pipelineDepth: 48)
+        XCTAssertEqual(fast.requests.count, 48)
+        XCTAssertEqual(fast.requests.first, BlockRequest(piece: 8, offset: 5 * 16384, length: 16384))
+        XCTAssertTrue(fast.requests.allSatisfy { (8...11).contains($0.piece) })
+    }
 }
 
 /// Minimal BitTorrent seeder on 127.0.0.1 used by the tests (supports ut_metadata).

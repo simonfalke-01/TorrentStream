@@ -123,6 +123,10 @@ private struct PlayerChrome: View {
     @State private var scrub: Double?
     @State private var seekFlash: SeekFlash?
     @State private var flashTask: Task<Void, Never>?
+    /// Seconds of double-tap seeking not yet sent to the player; a run of taps becomes one seek.
+    @State private var pendingSeek: Double = 0
+    @State private var lastTap: (time: Date, forward: Bool)?
+    @State private var singleTapTask: Task<Void, Never>?
     @State private var showResumed = false
     @State private var fill = false
     @State private var locked = false
@@ -149,13 +153,14 @@ private struct PlayerChrome: View {
     var body: some View {
         GeometryReader { geo in
             let landscape = geo.size.width > geo.size.height
+            let compact = geo.size.width < PlayerMetrics.compactWidth
             ZStack {
                 video
                 if let place = elsewhere, !controlsVisible { elsewhereNote(place).transition(.opacity) }
                 gestureLayer
 
                 if let flash = seekFlash {
-                    SeekFlashView(flash: flash).transition(.opacity)
+                    SeekFeedbackView(flash: flash).transition(.opacity)
                 }
 
                 if engine.isBuffering && !showControls && engine.errorText == nil && !engine.didFinish {
@@ -172,27 +177,24 @@ private struct PlayerChrome: View {
                     if !engine.didFinish { centerControls.transition(.opacity) }
                 }
 
+                // Top: leave and where the picture goes. Bottom, read from the bottom up: time, the timeline, what
+                // is playing beside what can be done to it, and above all of it, the one thing that matters at
+                // this moment. Hidden controls give their space back, so the moment settles into the corner.
                 VStack(spacing: 0) {
                     if controlsVisible {
                         topBar.transition(.opacity)
-                        if showResumed, let at = request.resumeAt {
-                            resumedPill(at)
-                                .padding(.top, Space.m)
-                                .transition(.opacity)
-                        }
                     }
                     secondSubtitle
                     Spacer(minLength: 0)
-                    moment
-                        .frame(maxWidth: .infinity, alignment: .trailing)
-                        .padding(.bottom, Space.m)
+                    momentRow
                     if controlsVisible {
-                        bottomBar.transition(.opacity)
+                        bottomBar(compact: compact)
+                            .padding(.top, Space.l)
+                            .transition(.opacity)
                     }
                 }
-                .padding(.horizontal, Space.l)
+                .padding(.horizontal, compact ? Space.l : PlayerMetrics.wideMargin)
                 .padding(.vertical, Space.s)
-                .frame(maxWidth: PlayerMetrics.barMaxWidth + Space.l * 2)
 
                 if engine.didFinish && (upNext == nil || nextDismissed) && engine.errorText == nil && panel == nil {
                     finishedOverlay.transition(.opacity)
@@ -214,6 +216,7 @@ private struct PlayerChrome: View {
         .animation(Motion.role(Motion.standard, reduce: reduceMotion), value: panel)
         .animation(Motion.role(Motion.standard, reduce: reduceMotion), value: engine.didFinish)
         .animation(Motion.role(Motion.standard, reduce: reduceMotion), value: momentID)
+        .animation(Motion.role(Motion.standard, reduce: reduceMotion), value: showResumed)
         .animation(Motion.role(Motion.fast, reduce: reduceMotion), value: engine.isBuffering)
         .statusBarHidden(!controlsVisible)
         .persistentSystemOverlays(.hidden)
@@ -226,6 +229,8 @@ private struct PlayerChrome: View {
             countdownTask?.cancel()
             hideTask?.cancel()
             sleepTask?.cancel()
+            singleTapTask?.cancel()
+            flashTask?.cancel()
         }
         .onChange(of: engine.didFinish) { _, done in
             if done { handleFinish() } else { cancelCountdown() }
@@ -308,8 +313,8 @@ private struct PlayerChrome: View {
     }
 
     private var scrim: some View {
-        LinearGradient(stops: [.init(color: .black.opacity(0.55), location: 0),
-                               .init(color: .black.opacity(0.15), location: 0.3),
+        LinearGradient(stops: [.init(color: .black.opacity(0.45), location: 0),
+                               .init(color: .black.opacity(0.15), location: 0.25),
                                .init(color: .black.opacity(0.15), location: 0.6),
                                .init(color: .black.opacity(0.7), location: 1)],
                        startPoint: .top, endPoint: .bottom)
@@ -327,23 +332,13 @@ private struct PlayerChrome: View {
         .accessibilityHidden(true)
     }
 
+    /// One tap recognizer, timed by hand: a single tap waits a beat in case a second follows, and while a seek run
+    /// is showing, every tap on that side adds to it at once.
     private func gestures(width: CGFloat) -> some View {
         Color.clear
             .contentShape(.rect)
-            .onTapGesture(count: 2) { location in
-                guard !engine.didFinish, !locked else { return }
-                doubleTapSeek(forward: location.x > width / 2)
-            }
-            .onTapGesture {
-                if locked {
-                    flashUnlock()
-                } else if panel != nil {
-                    panel = nil
-                } else if showControls {
-                    showControls = false
-                } else {
-                    reveal()
-                }
+            .onTapGesture(coordinateSpace: .local) { location in
+                handleTap(at: location, width: width)
             }
             .gesture(
                 MagnifyGesture().onEnded { v in
@@ -353,117 +348,89 @@ private struct PlayerChrome: View {
             )
     }
 
-    /// Each double tap on the same side within a moment adds ten more seconds.
-    private func doubleTapSeek(forward: Bool) {
-        engine.skip(by: forward ? 10 : -10)
-        withAnimation(Motion.role(Motion.fast, reduce: reduceMotion)) {
-            if var f = seekFlash, f.forward == forward {
-                f.seconds += 10
-                seekFlash = f
-            } else {
-                seekFlash = SeekFlash(forward: forward, seconds: 10)
-            }
+    private static let doubleTapWindow: TimeInterval = 0.3
+
+    private func handleTap(at location: CGPoint, width: CGFloat) {
+        if locked { flashUnlock(); return }
+        if panel != nil { panel = nil; return }
+
+        let forward = location.x > width / 2
+        let canSeek = !engine.didFinish && engine.duration > 0
+        let continuesRun = seekFlash?.forward == forward
+        let isDouble = lastTap.map { $0.forward == forward && Date().timeIntervalSince($0.time) < Self.doubleTapWindow } ?? false
+
+        if canSeek && (continuesRun || isDouble) {
+            singleTapTask?.cancel()
+            lastTap = nil
+            addSeek(forward: forward, at: location)
+            return
         }
+
+        lastTap = (Date(), forward)
+        singleTapTask?.cancel()
+        singleTapTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(Self.doubleTapWindow))
+            guard !Task.isCancelled else { return }
+            lastTap = nil
+            if showControls { showControls = false } else { reveal() }
+        }
+    }
+
+    /// Each tap adds ten seconds on its side. The picture answers at once; the player is asked once the taps stop,
+    /// so a run of five taps is one seek rather than five.
+    private func addSeek(forward: Bool, at point: CGPoint) {
+        if let f = seekFlash, f.forward != forward {
+            commitSeek()
+            seekFlash = nil
+        }
+        showControls = false
+
+        var flash = seekFlash ?? SeekFlash(forward: forward)
+        flash.seconds += 10
+        flash.taps += 1
+        if !reduceMotion {
+            flash.ripples.append(SeekFlash.Ripple(point: point))
+            flash.ripples = Array(flash.ripples.suffix(4))
+        }
+        withAnimation(Motion.role(Motion.fast, reduce: reduceMotion)) { seekFlash = flash }
+        pendingSeek += forward ? 10 : -10
+
         flashTask?.cancel()
         flashTask = Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(700))
+            try? await Task.sleep(for: .milliseconds(350))
+            guard !Task.isCancelled else { return }
+            commitSeek()
+            try? await Task.sleep(for: .milliseconds(500))
             guard !Task.isCancelled else { return }
             withAnimation(Motion.role(Motion.exit, reduce: reduceMotion)) { seekFlash = nil }
         }
     }
 
+    private func commitSeek() {
+        guard pendingSeek != 0 else { return }
+        engine.skip(by: pendingSeek)
+        pendingSeek = 0
+    }
+
     // MARK: top
 
+    /// Leave on the leading side; where the picture goes on the trailing side.
     private var topBar: some View {
         HStack(alignment: .center, spacing: Space.m) {
             PlayerIconButton(systemImage: "xmark", label: "Close") { dismiss() }
-            if engine.canPictureInPicture && !engine.isOnTV {
-                PlayerIconButton(systemImage: "pip.enter", label: "Picture in Picture") {
-                    engine.togglePictureInPicture()
-                }
-            }
-
-            VStack(alignment: .leading, spacing: Space.xxs) {
-                Text(request.title)
-                    .font(.headline)
-                    .lineLimit(1)
-                if let episode = request.episode {
-                    Text(episode)
-                        .font(.subheadline)
-                        .foregroundStyle(.white.opacity(0.75))
-                        .lineLimit(1)
-                }
-            }
-            .frame(maxWidth: PlayerMetrics.titleMaxWidth, alignment: .leading)
-            .shadow(color: .black.opacity(0.4), radius: PlayerMetrics.glyphShadow)
-            .accessibilityElement(children: .combine)
-
             Spacer(minLength: 0)
-
-            AirPlayButton()
-                .frame(width: PlayerMetrics.control, height: PlayerMetrics.control)
-                .glassEffect(.clear.interactive(), in: .circle)
-                .accessibilityLabel("AirPlay")
-            moreMenu
-        }
-    }
-
-    private var moreMenu: some View {
-        Menu {
-            if let target = episodeTarget {
-                Button {
-                    versions = target
-                } label: { Label("Choose Version…", systemImage: "slider.horizontal.3") }
-            }
-            if engine.videoSize.width > 0 && !engine.isOnTV {
-                Button {
-                    fill.toggle()
-                } label: {
-                    Label(fill ? "Fit to Screen" : "Fill Screen",
-                          systemImage: fill ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
+            PlayerToolbar {
+                if engine.canPictureInPicture && !engine.isOnTV {
+                    Button { engine.togglePictureInPicture() } label: {
+                        PlayerGlyph(systemImage: "pip.enter")
+                    }
+                    .accessibilityLabel("Picture in Picture")
                 }
+                AirPlayButton()
+                    .frame(width: PlayerMetrics.control, height: PlayerMetrics.control)
+                    .accessibilityLabel("AirPlay")
             }
-            Picker(selection: Binding(get: { sleep }, set: { setSleep($0) })) {
-                Text("Off").tag(SleepTimer.off)
-                ForEach([15, 30, 45, 60], id: \.self) { m in
-                    Text(m == 60 ? "1 Hour" : "\(m) Minutes").tag(SleepTimer.minutes(m))
-                }
-                Text("End of Episode").tag(SleepTimer.endOfEpisode)
-            } label: {
-                Label("Sleep Timer", systemImage: "moon")
-            }
-            .pickerStyle(.menu)
-            Button {
-                locked = true
-                flashUnlock()
-            } label: { Label("Lock Controls", systemImage: "lock") }
-        } label: {
-            Image(systemName: "ellipsis")
-                .font(.body.weight(.semibold))
-                .frame(width: PlayerMetrics.control, height: PlayerMetrics.control)
-                .contentShape(.circle)
         }
-        .foregroundStyle(.white)
-        .glassEffect(.clear.interactive(), in: .circle)
-        .accessibilityLabel("More")
-    }
-
-    private func resumedPill(_ at: Double) -> some View {
-        HStack(spacing: Space.m) {
-            Text("Resumed at \(Format.seconds(at))")
-                .font(.subheadline.weight(.medium))
-                .monospacedDigit()
-            Button("Start Over") {
-                engine.seek(to: 0)
-                showResumed = false
-            }
-            .font(.subheadline.weight(.semibold))
-            .buttonStyle(.glass)
-        }
-        .padding(.leading, Space.l)
-        .padding(.trailing, Space.xs)
-        .padding(.vertical, Space.xs)
-        .glassEffect(.regular, in: .capsule)
     }
 
     // MARK: center
@@ -502,84 +469,160 @@ private struct PlayerChrome: View {
             }
             .accessibilityLabel("Forward 10 Seconds")
         }
-        .buttonStyle(.plain)
+        .buttonStyle(PlayerPressStyle())
         .shadow(color: .black.opacity(0.35), radius: PlayerMetrics.glyphShadow)
     }
 
     // MARK: bottom
 
-    private var bottomBar: some View {
-        VStack(spacing: Space.xs) {
-            StreamScrubber(progress: engine.duration > 0 ? engine.currentTime / engine.duration : 0,
-                           availability: stats.availability,
-                           duration: engine.duration,
-                           marks: engine.duration > 0 ? engine.chapters.map { $0.start / engine.duration } : [],
-                           chapterName: { f in chapter(at: f * engine.duration)?.name },
-                           scrub: $scrub) { fraction in
-                engine.seek(to: fraction * engine.duration)
-                scheduleHide()
+    /// What's playing and what can be done to it share a row; the timeline and times sit beneath, edge to edge.
+    private func bottomBar(compact: Bool) -> some View {
+        VStack(spacing: Space.s) {
+            HStack(alignment: .center, spacing: Space.l) {
+                titleBlock
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                actionToolbar(compact: compact)
             }
-            .onChange(of: scrub != nil) { _, dragging in if dragging { hideTask?.cancel() } }
 
-            HStack {
-                Text(Format.seconds(displayedTime))
-                Spacer()
-                Text("-" + Format.seconds(max(0, engine.duration - displayedTime)))
+            VStack(spacing: 0) {
+                StreamScrubber(progress: engine.duration > 0 ? engine.currentTime / engine.duration : 0,
+                               availability: stats.availability,
+                               duration: engine.duration,
+                               marks: engine.duration > 0 ? engine.chapters.map { $0.start / engine.duration } : [],
+                               chapterName: { f in chapter(at: f * engine.duration)?.name },
+                               scrub: $scrub) { fraction in
+                    engine.seek(to: fraction * engine.duration)
+                    scheduleHide()
+                }
+                .onChange(of: scrub != nil) { _, dragging in if dragging { hideTask?.cancel() } }
+
+                HStack {
+                    Text(Format.seconds(displayedTime))
+                    Spacer()
+                    Text("-" + Format.seconds(max(0, engine.duration - displayedTime)))
+                }
+                .font(.caption.weight(.medium).monospacedDigit())
+                .foregroundStyle(.white.opacity(0.7))
             }
-            .font(.caption.weight(.medium).monospacedDigit())
-            .foregroundStyle(.white.opacity(0.8))
-
-            actionRow
-                .padding(.top, Space.xs)
         }
-        .shadow(color: .black.opacity(0.3), radius: PlayerMetrics.glyphShadow)
     }
 
     private var displayedTime: Double { scrub.map { $0 * engine.duration } ?? engine.currentTime }
 
-    /// Labelled where there's room; icons alone on a narrow screen.
-    private var actionRow: some View {
-        ViewThatFits(in: .horizontal) {
-            actions(compact: false)
-            actions(compact: true)
+    /// The show over the episode, so the eye lands on what's specific to this moment; a film is just its title.
+    private var titleBlock: some View {
+        VStack(alignment: .leading, spacing: Space.xxs) {
+            if let episode = request.episode {
+                Text(request.title)
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(.white.opacity(0.7))
+                Text(episode)
+                    .font(.headline)
+            } else {
+                Text(request.title)
+                    .font(.headline)
+            }
         }
-        .frame(maxWidth: .infinity)
+        .lineLimit(1)
+        .shadow(color: .black.opacity(0.4), radius: PlayerMetrics.glyphShadow)
+        .accessibilityElement(children: .combine)
     }
 
-    private func actions(compact: Bool) -> some View {
-        HStack(spacing: compact ? Space.l : Space.xl) {
-            Menu {
-                Picker("Speed", selection: Binding(get: { engine.rate }, set: { engine.setRate($0); scheduleHide() })) {
-                    ForEach(PlaybackSpeed.all, id: \.self) { r in Text(PlaybackSpeed.label(r)).tag(r) }
+    /// Navigation first, then the two used most (Audio & Subtitles, Next Episode), then More for everything rarer.
+    /// A changed speed shows as its value, so it's never forgotten. On a narrow screen Chapters and Episodes move
+    /// into More so the title keeps its room.
+    private func actionToolbar(compact: Bool) -> some View {
+        PlayerToolbar {
+            if engine.rate != 1 {
+                speedMenu {
+                    Text(PlaybackSpeed.label(engine.rate))
+                        .font(.subheadline.weight(.semibold).monospacedDigit())
+                        .padding(.horizontal, Space.s)
+                        .frame(minWidth: PlayerMetrics.control, minHeight: PlayerMetrics.control)
+                        .contentShape(.rect)
                 }
-            } label: {
-                PlayerActionLabel(title: engine.rate == 1 ? "Speed" : "Speed (\(PlaybackSpeed.label(engine.rate)))",
-                                  systemImage: "gauge.with.dots.needle.67percent", compact: compact)
+                .accessibilityLabel("Playback Speed, \(PlaybackSpeed.label(engine.rate))")
             }
-
-            if engine.chapters.count > 1 {
-                Button { panel = .chapters } label: {
-                    PlayerActionLabel(title: "Chapters", systemImage: "list.bullet", compact: compact)
-                }
+            if !compact && engine.chapters.count > 1 {
+                Button { panel = .chapters } label: { PlayerGlyph(systemImage: "list.bullet") }
+                    .accessibilityLabel("Chapters")
             }
-            if episodesAvailable {
-                Button { panel = .episodes } label: {
-                    PlayerActionLabel(title: "Episodes", systemImage: "rectangle.stack", compact: compact)
-                }
+            if !compact && episodesAvailable {
+                Button { panel = .episodes } label: { PlayerGlyph(systemImage: "rectangle.stack") }
+                    .accessibilityLabel("Episodes")
             }
-            Button { panel = .tracks } label: {
-                PlayerActionLabel(title: "Audio & Subtitles", systemImage: "captions.bubble", compact: compact)
-            }
+            Button { panel = .tracks } label: { PlayerGlyph(systemImage: "captions.bubble") }
+                .accessibilityLabel("Audio & Subtitles")
             if upNext != nil {
-                Button { playNext() } label: {
-                    PlayerActionLabel(title: "Next Episode", systemImage: "forward.end", compact: compact)
-                }
-                .disabled(resolvingNext)
+                Button { playNext() } label: { PlayerGlyph(systemImage: "forward.end.fill") }
+                    .disabled(resolvingNext)
+                    .accessibilityLabel("Next Episode")
             }
+            moreMenu(compact: compact)
         }
-        .buttonStyle(.plain)
-        .foregroundStyle(.white)
-        .fixedSize()
+    }
+
+    private func speedMenu<MenuLabel: View>(@ViewBuilder label: () -> MenuLabel) -> some View {
+        Menu {
+            Picker("Speed", selection: Binding(get: { engine.rate }, set: { engine.setRate($0); scheduleHide() })) {
+                ForEach(PlaybackSpeed.all, id: \.self) { r in Text(PlaybackSpeed.label(r)).tag(r) }
+            }
+        } label: { label() }
+    }
+
+    private func moreMenu(compact: Bool) -> some View {
+        Menu {
+            if compact {
+                Section {
+                    if engine.chapters.count > 1 {
+                        Button { panel = .chapters } label: { Label("Chapters", systemImage: "list.bullet") }
+                    }
+                    if episodesAvailable {
+                        Button { panel = .episodes } label: { Label("Episodes", systemImage: "rectangle.stack") }
+                    }
+                }
+            }
+            Section {
+                Picker(selection: Binding(get: { engine.rate }, set: { engine.setRate($0); scheduleHide() })) {
+                    ForEach(PlaybackSpeed.all, id: \.self) { r in Text(PlaybackSpeed.label(r)).tag(r) }
+                } label: {
+                    Label("Playback Speed", systemImage: "gauge.with.dots.needle.67percent")
+                }
+                .pickerStyle(.menu)
+                if engine.videoSize.width > 0 && !engine.isOnTV {
+                    Button {
+                        fill.toggle()
+                    } label: {
+                        Label(fill ? "Fit to Screen" : "Fill Screen",
+                              systemImage: fill ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
+                    }
+                }
+                if let target = episodeTarget {
+                    Button {
+                        versions = target
+                    } label: { Label("Choose Version…", systemImage: "slider.horizontal.3") }
+                }
+            }
+            Section {
+                Picker(selection: Binding(get: { sleep }, set: { setSleep($0) })) {
+                    Text("Off").tag(SleepTimer.off)
+                    ForEach([15, 30, 45, 60], id: \.self) { m in
+                        Text(m == 60 ? "1 Hour" : "\(m) Minutes").tag(SleepTimer.minutes(m))
+                    }
+                    Text("End of Episode").tag(SleepTimer.endOfEpisode)
+                } label: {
+                    Label("Sleep Timer", systemImage: sleep == .off ? "moon" : "moon.fill")
+                }
+                .pickerStyle(.menu)
+                Button {
+                    locked = true
+                    flashUnlock()
+                } label: { Label("Lock Controls", systemImage: "lock") }
+            }
+        } label: {
+            PlayerGlyph(systemImage: "ellipsis")
+        }
+        .accessibilityLabel("More")
     }
 
     // MARK: second subtitle
@@ -600,7 +643,42 @@ private struct PlayerChrome: View {
         }
     }
 
-    // MARK: the moment: skip intro, next episode
+    // MARK: the moment: resumed, skip intro, next episode
+
+    /// The row directly above the controls, which settles into the bottom corners when they hide. The resume note
+    /// sits on the leading side under the title; Skip and the next episode on the trailing side, in line with the
+    /// toolbar and under the thumb.
+    private var momentRow: some View {
+        HStack(alignment: .bottom, spacing: Space.l) {
+            if showResumed, let at = request.resumeAt, !locked, panel == nil, engine.errorText == nil {
+                resumedPill(at)
+                    .transition(.opacity.combined(with: .offset(y: Space.s)))
+            }
+            Spacer(minLength: 0)
+            moment
+        }
+    }
+
+    private func resumedPill(_ at: Double) -> some View {
+        HStack(spacing: Space.m) {
+            Text("Resumed at \(Format.seconds(at))")
+                .foregroundStyle(.white.opacity(0.75))
+                .monospacedDigit()
+            Button {
+                engine.seek(to: 0)
+                showResumed = false
+            } label: {
+                Text("Start Over")
+                    .fontWeight(.semibold)
+                    .frame(minHeight: PlayerMetrics.control)
+                    .contentShape(.rect)
+            }
+            .buttonStyle(PlayerPressStyle())
+        }
+        .font(.subheadline)
+        .padding(.horizontal, Space.l)
+        .glassEffect(.regular, in: .capsule)
+    }
 
     private var activeSkip: SkipSegment? {
         let t = engine.currentTime
@@ -619,16 +697,24 @@ private struct PlayerChrome: View {
         return engine.duration - 40
     }
 
+    /// While the controls are up, the toolbar's Next button stands in for the card, which would otherwise crowd
+    /// the play controls; once the episode has ended they're gone and the card returns.
     private var showsNextCard: Bool {
-        guard upNext != nil, !nextDismissed, panel == nil, !locked else { return false }
+        guard upNext != nil, !nextDismissed, panel == nil, !locked, engine.errorText == nil else { return false }
         if engine.didFinish { return true }
-        guard let start = creditsStart, scrub == nil else { return false }
+        guard !showControls, let start = creditsStart, scrub == nil else { return false }
         return engine.currentTime >= start
+    }
+
+    /// Skip shows with the controls, and on its own for the first few seconds of the part it skips.
+    private var showsSkip: Bool {
+        guard let s = activeSkip, !locked, panel == nil, engine.errorText == nil else { return false }
+        return showControls || engine.currentTime - s.start < 8
     }
 
     private var momentID: String {
         if showsNextCard { return "next" }
-        if let s = activeSkip, showControls || engine.currentTime - s.start < 8 { return "skip.\(s.start)" }
+        if showsSkip, let s = activeSkip { return "skip.\(s.start)" }
         return ""
     }
 
@@ -641,13 +727,13 @@ private struct PlayerChrome: View {
                                 cancelCountdown()
                                 nextDismissed = true
                             })
-            .transition(.move(edge: .trailing).combined(with: .opacity))
-        } else if let s = activeSkip, !locked, panel == nil, showControls || engine.currentTime - s.start < 8 {
+            .transition(.opacity.combined(with: .offset(y: Space.s)))
+        } else if showsSkip, let s = activeSkip {
             SkipButton(title: skipTitle(s.kind)) {
                 engine.seek(to: s.end)
                 scheduleHide()
             }
-            .transition(.opacity)
+            .transition(.opacity.combined(with: .offset(y: Space.s)))
         }
     }
 
@@ -669,16 +755,11 @@ private struct PlayerChrome: View {
         }
     }
 
-    /// Times marked by viewers come first; the file's chapter names fill in whatever kinds they don't cover.
+    /// The file's own chapter names first, then the catalog's times, lined up with the chapters where they're close.
     private func updateSkips() {
-        var out = catalogSkips
-        if engine.duration > 0, !engine.chapters.isEmpty {
-            let fromChapters = ChapterSkips.segments(engine.chapters.map { (name: $0.name, start: $0.start, end: $0.end) },
-                                                     duration: engine.duration)
-            let covered = Set(out.map(\.kind))
-            out += fromChapters.filter { !covered.contains($0.kind) }
-        }
-        skips = out.sorted { $0.start < $1.start }
+        let chapters = engine.duration > 0
+            ? engine.chapters.map { (name: $0.name, start: $0.start, end: $0.end) } : []
+        skips = ChapterSkips.merged(catalog: catalogSkips, chapters: chapters, duration: engine.duration)
     }
 
     // MARK: chapters
@@ -790,7 +871,7 @@ private struct PlayerChrome: View {
             return
         }
         guard upNext != nil, !nextDismissed, UserDefaults.standard.bool(forKey: SettingsKey.autoPlayNext) else { return }
-        countdown = 5
+        countdown = NextEpisodeCard.countdownSeconds
         countdownTask?.cancel()
         countdownTask = Task { @MainActor in
             while let c = countdown, c > 0 {

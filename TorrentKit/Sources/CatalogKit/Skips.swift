@@ -184,6 +184,44 @@ public enum ChapterSkips {
         return out
     }
 
+    /// Catalog times this close to a chapter boundary are taken to mean that boundary.
+    static let snapDistance: Double = 4
+
+    /// The segments to offer for a file. Chapter names come first: they were cut for this very file, whereas a
+    /// catalog time may have been submitted for another release whose cold open or logos run a different length.
+    /// The catalog fills in the kinds the chapters don't name, with any time within `snapDistance` of a chapter
+    /// boundary moved onto it. When the file has three or more chapters, a time inferred from neighbouring
+    /// episodes is kept only if its start or end lines up with one of them; otherwise it's likely off for this
+    /// episode and would show the button over the wrong scene.
+    public static func merged(catalog: [SkipSegment], chapters: [(name: String, start: Double, end: Double?)],
+                              duration: Double) -> [SkipSegment] {
+        let named = segments(chapters, duration: duration)
+        let covered = Set(named.map(\.kind))
+        var bounds = chapters.map(\.start) + chapters.compactMap(\.end)
+        if duration > 0 { bounds.append(duration) }
+        let checkable = chapters.count >= 3
+
+        func snapped(_ t: Double) -> Double? {
+            guard let b = bounds.min(by: { abs($0 - t) < abs($1 - t) }), abs(b - t) <= snapDistance else { return nil }
+            return b
+        }
+
+        var out = named
+        for s in catalog where !covered.contains(s.kind) {
+            let start = snapped(s.start)
+            let end = snapped(s.end)
+            if s.isInferred && checkable && start == nil && end == nil { continue }
+            var segment = s
+            segment.start = start ?? s.start
+            segment.end = end ?? s.end
+            if duration > 0 { segment.end = min(segment.end, duration) }
+            guard segment.end - segment.start >= 5,
+                  !named.contains(where: { $0.start < segment.end && segment.start < $0.end }) else { continue }
+            out.append(segment)
+        }
+        return out.sorted { $0.start < $1.start }
+    }
+
     private static let patterns: [(SkipSegment.Kind, String)] = [
         (.preview, #"\b(preview|next\s+ep(isode)?|yokoku)\b"#),
         (.recap, #"\b(recap|previously)\b"#),

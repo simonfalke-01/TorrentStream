@@ -165,10 +165,14 @@ final class StreamServer {
         defer { torrent.removeReader(readerID) }
         var pos = start
         let chunk: Int64 = 256 * 1024
+        let pieceLength = Int64(info.pieceLength)
         while pos <= end {
-            let n = Int(min(chunk, end - pos + 1))
-            // Wait for the bytes, checking regularly whether the player gave up on this request.
-            while try !torrent.waitForData(fileIndex: fileIndex, offset: pos, length: n, readerID: readerID, timeout: 1) {
+            // Send each piece as soon as it is verified rather than waiting for a whole chunk.
+            let pieceEnd = ((file.offset + pos) / pieceLength + 1) * pieceLength - file.offset
+            let n = Int(min(chunk, end - pos + 1, pieceEnd - pos))
+            // Wait for the bytes, checking often whether the player gave up on this request (it does on every
+            // seek), so a stale reader doesn't keep its priority.
+            while try !torrent.waitForData(fileIndex: fileIndex, offset: pos, length: n, readerID: readerID, timeout: 0.25) {
                 if sock.isPeerClosed() { return false }
             }
             let data = try torrent.readData(fileIndex: fileIndex, offset: pos, length: n)
