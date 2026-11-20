@@ -527,7 +527,7 @@ struct NyaaResultView: View {
                 }
                 .navigationBarTitleDisplayMode(.inline)
             } else {
-                ProgressView()
+                ProgressView("Loading file list")
                     .controlSize(.large)
                     .navigationBarTitleDisplayMode(.inline)
             }
