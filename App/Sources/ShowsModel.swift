@@ -56,7 +56,6 @@ struct EpisodeLaunch: Identifiable {
     var episode: Int? = nil
     /// A version the viewer chose.
     var source: EpisodeSource? = nil
-    var openInVLC = false
 }
 
 /// An episode resolved to a file in a release.
@@ -101,6 +100,13 @@ final class ShowsModel: ObservableObject {
     @Published private(set) var history: [WatchEntry] = []
     @Published private(set) var progress: [String: EpisodeProgress] = [:]
     @Published private(set) var details: [Int: ShowDetails] = [:]
+    /// Shows like each show, by root id.
+    @Published private(set) var recommendations: [Int: [Show]] = [:]
+    /// Episodes airing from two days ago to a week ahead, by time.
+    @Published private(set) var schedule: [AiringEpisode] = []
+    @Published private(set) var scheduleFailed = false
+    /// When each show was added to My List, by root id.
+    @Published private(set) var addedAt: [Int: Date] = [:]
 
     private unowned let app: AppModel
     private let catalog = ShowCatalog()
@@ -115,6 +121,8 @@ final class ShowsModel: ObservableObject {
     /// Next episodes already found and partly loaded.
     private var prepared: [String: ResolvedEpisode] = [:]
     private var rowsFetchedAt: Date?
+    private var scheduleFetchedAt: Date?
+    private var skipCache: [String: [SkipSegment]] = [:]
     private var detailsTasks: [Int: Task<ShowDetails, Error>] = [:]
     private var prefetchTask: Task<Void, Never>?
 
@@ -125,6 +133,7 @@ final class ShowsModel: ObservableObject {
         var sources: [String: SavedSource] = [:]
         var groups: [String: String] = [:]
         var roots: [String: Int] = [:]
+        var addedAt: [String: Date]? = nil
     }
 
     private struct SavedRows: Codable {
@@ -164,6 +173,39 @@ final class ShowsModel: ObservableObject {
 
     func search(_ text: String) async throws -> [Show] {
         try await catalog.search(text)
+    }
+
+    /// Loads shows like this one for the bottom of its page.
+    func loadRecommendations(_ show: Show) async {
+        let root = rootID(show)
+        guard recommendations[root] == nil else { return }
+        let list = (try? await catalog.recommendations(id: root)) ?? []
+        recommendations[root] = list.filter { $0.id != root && !$0.isUpcoming }
+    }
+
+    /// What airs from two days ago to six days ahead. Refreshed every half hour.
+    func loadSchedule(force: Bool = false) async {
+        if !force, let at = scheduleFetchedAt, Date().timeIntervalSince(at) < 1800, !schedule.isEmpty { return }
+        let today = Calendar.current.startOfDay(for: Date())
+        guard let from = Calendar.current.date(byAdding: .day, value: -2, to: today),
+              let to = Calendar.current.date(byAdding: .day, value: 7, to: today) else { return }
+        do {
+            schedule = try await catalog.schedule(from: from, to: to).sorted { $0.airingAt < $1.airingAt }
+            scheduleFailed = false
+            scheduleFetchedAt = Date()
+        } catch {
+            scheduleFailed = schedule.isEmpty
+        }
+    }
+
+    /// Intro, recap, credits and preview times for an episode, when the community has marked them.
+    func skipSegments(_ ctx: ShowPlayback, duration: Double) async -> [SkipSegment] {
+        guard let d = details[ctx.show.id], let s = d.season(id: ctx.seasonID), let mal = s.media.malID else { return [] }
+        let key = "\(mal).\(ctx.episode).\(Int(duration))"
+        if let hit = skipCache[key] { return hit }
+        guard let list = try? await catalog.skipSegments(malID: mal, episode: ctx.episode, duration: duration) else { return [] }
+        skipCache[key] = list
+        return list
     }
 
     /// Seasons and episodes, from memory or disk when fresh enough, else from the catalog. A stale copy is
@@ -226,10 +268,22 @@ final class ShowsModel: ObservableObject {
         let root = rootID(show)
         if isInMyList(show) {
             myList.removeAll { $0.id == root || $0.id == show.id }
+            addedAt[root] = nil
         } else {
             myList.insert(details[root]?.show ?? show, at: 0)
+            addedAt[root] = Date()
         }
         save()
+    }
+
+    /// An aired episode the viewer hasn't seen follows the last one they finished.
+    func hasNewEpisode(_ show: Show) -> Bool {
+        let root = rootID(show)
+        guard let d = details[root], d.seasons.last?.media.isAiring == true,
+              let h = history.first(where: { $0.show.id == root }),
+              let s = d.season(id: h.seasonID), let e = s.episodes.first(where: { $0.number == h.episode }),
+              progress[Self.key(root, s.id, e.number)]?.isWatched == true else { return false }
+        return d.episode(after: s, e) != nil
     }
 
     // MARK: progress
@@ -338,7 +392,7 @@ final class ShowsModel: ObservableObject {
               let e = s.episodes.first(where: { $0.number == ctx.episode }),
               let next = d.episode(after: s, e) else { return nil }
         let (ns, ne) = next
-        return UpNextItem(title: Self.episodeLabel(d, ns, ne), subtitle: ne.title) { [weak self] in
+        return UpNextItem(title: Self.episodeLabel(d, ns, ne), subtitle: ne.title, imageURL: ne.thumbnailURL) { [weak self] in
             guard let self else { return nil }
             return try? await self.request(d, ns, ne, source: nil, resumeAt: nil, status: { _ in })
         }
@@ -459,6 +513,92 @@ final class ShowsModel: ObservableObject {
         return files.first { $0.index == index }
     }
 
+    // MARK: titles added by link
+
+    private enum Adoption { case adopted, noMatch, retry }
+
+    /// Titles added by link before 4.0 move into their show in the catalog: each becomes the saved version of
+    /// the episodes it holds, with their progress, and the show takes its place in My List and Continue
+    /// Watching. Runs once per title; titles added by link later stay as they are.
+    func adoptLinkedTitles() async {
+        var pending: [String]
+        if let saved = defaults.stringArray(forKey: SettingsKey.linkAdoption) {
+            pending = saved
+        } else {
+            pending = app.items.map(\.id)
+            defaults.set(pending, forKey: SettingsKey.linkAdoption)
+        }
+        for hash in pending {
+            let result: Adoption
+            if let item = app.item(hash) {
+                result = await adopt(item)
+            } else {
+                result = .noMatch
+            }
+            if result != .retry {
+                pending.removeAll { $0 == hash }
+                defaults.set(pending, forKey: SettingsKey.linkAdoption)
+            }
+        }
+    }
+
+    private func adopt(_ item: LibraryItem) async -> Adoption {
+        if case .failed = item.status.phase { return .noMatch }
+        guard let info = item.torrent.torrentInfo else { return .retry }
+        let name = item.status.name
+        let query = ShowNames.seasonless(app.release(name).title)
+        guard !query.isEmpty else { return .noMatch }
+        let found: [Show]
+        do { found = try await search(query) } catch { return .retry }
+
+        for show in found.prefix(3) {
+            guard let d = try? await loadDetails(show) else { continue }
+            var matches: [(season: ShowSeason, episode: ShowEpisode, file: TorrentFile)] = []
+            for s in d.seasons {
+                let isMovie = d.show.isMovie || s.media.isMovie
+                for e in s.episodes where SourceMatcher.match(name, details: d, season: s, episode: e) != nil {
+                    if let f = Self.pickFile(info, s, e, isMovie: isMovie),
+                       !matches.contains(where: { $0.file.index == f.index }) {
+                        matches.append((s, e, f))
+                    }
+                }
+            }
+            guard !matches.isEmpty else { continue }
+
+            let hash = item.id
+            let group = app.release(name).group
+            for m in matches {
+                let key = Self.key(d.show.id, m.season.id, m.episode.number)
+                if savedSources[key] == nil {
+                    savedSources[key] = SavedSource(infoHash: hash, fileIndex: m.file.index, magnet: item.torrent.magnetLink,
+                                                    torrentURL: nil, group: group, isBatch: matches.count > 1)
+                }
+                if progress[key] == nil, let p = app.storedProgress(torrent: item.torrent, file: m.file) {
+                    progress[key] = EpisodeProgress(position: p.position, duration: p.duration)
+                }
+            }
+            if let group, groups[String(d.show.id)] == nil { groups[String(d.show.id)] = group }
+
+            // Where the viewer was in this title becomes where they are in the show.
+            if let at = app.watchedAt(hash) {
+                let last = app.lastPlayedIndex(hash)
+                let m = matches.first { $0.file.index == last } ?? matches[0]
+                let existing = history.first { $0.show.id == d.show.id }
+                if existing.map({ $0.watchedAt < at }) ?? true {
+                    history.removeAll { $0.show.id == d.show.id }
+                    history.append(WatchEntry(show: d.show, seasonID: m.season.id, season: m.season.number,
+                                              episode: m.episode.number, watchedAt: at))
+                    history.sort { $0.watchedAt > $1.watchedAt }
+                }
+            }
+            if !isInMyList(d.show) { myList.append(d.show) }
+            save()
+            app.makeSource(hash)
+            return .adopted
+        }
+        return .noMatch
+    }
+
     // MARK: labels
 
     /// "Episode 5" for single-season shows, "S2 E5" otherwise.
@@ -485,6 +625,7 @@ final class ShowsModel: ObservableObject {
         s.sources = savedSources
         s.groups = groups
         s.roots = Dictionary(uniqueKeysWithValues: roots.map { (String($0.key), $0.value) })
+        s.addedAt = Dictionary(uniqueKeysWithValues: addedAt.map { (String($0.key), $0.value) })
         if let data = try? JSONEncoder().encode(s) { try? data.write(to: stateURL, options: .atomic) }
     }
 
@@ -496,6 +637,7 @@ final class ShowsModel: ObservableObject {
             savedSources = s.sources
             groups = s.groups
             roots = Dictionary(uniqueKeysWithValues: s.roots.compactMap { k, v in Int(k).map { ($0, v) } })
+            addedAt = Dictionary(uniqueKeysWithValues: (s.addedAt ?? [:]).compactMap { k, v in Int(k).map { ($0, v) } })
         }
         if let data = try? Data(contentsOf: rowsURL), let r = try? JSONDecoder().decode(SavedRows.self, from: data) {
             rows = r.rows

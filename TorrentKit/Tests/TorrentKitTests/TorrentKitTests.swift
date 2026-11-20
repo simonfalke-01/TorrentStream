@@ -213,6 +213,39 @@ final class TorrentKitTests: XCTestCase {
         XCTAssertTrue(try torrent.waitForData(fileIndex: 0, offset: 60_000, length: 10_000, readerID: UUID(), timeout: 20))
         XCTAssertEqual(try torrent.readData(fileIndex: 0, offset: 60_000, length: 10_000), content.subdata(in: 60_000..<70_000))
     }
+
+    /// Pieces restored from a resume file are served by `availableData`; anything touching a missing or corrupt
+    /// piece is nil, and asking never registers a reader.
+    func testAvailableData() throws {
+        let (data, content) = makeTorrent(files: [("a.bin", 20_000), ("b.mkv", 30_000)], pieceLength: 16384)
+        let desc = try TorrentDescriptor.parse(torrentData: data)
+        let info = try XCTUnwrap(desc.info)
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let torrentDir = dir.appendingPathComponent(desc.infoHashHex, isDirectory: true)
+        let storage = Storage(root: torrentDir.appendingPathComponent("data", isDirectory: true), info: info)
+        for p in 0..<2 { try storage.writePiece(p, data: content.subdata(in: p * 16384..<(p + 1) * 16384)) }
+        try storage.writePiece(2, data: Data(repeating: 0xAA, count: 16384))
+        storage.closeAll()
+        try Data([1, 1, 1, 0]).write(to: torrentDir.appendingPathComponent("resume.bin"))
+
+        let client = TorrentClient(downloadDirectory: dir, useDHT: false, extraTrackers: [])
+        defer { client.shutdown() }
+        let torrent = try client.add(torrentData: data)
+        let deadline = Date().addingTimeInterval(10)
+        while torrent.availableData(fileIndex: 1, offset: 0, length: 1) == nil && Date() < deadline { Thread.sleep(forTimeInterval: 0.05) }
+
+        XCTAssertEqual(torrent.availableData(fileIndex: 0, offset: 100, length: 1_000), content.subdata(in: 100..<1_100))
+        XCTAssertEqual(torrent.availableData(fileIndex: 0, offset: 10_000, length: 1_000_000), content.subdata(in: 10_000..<20_000))
+        XCTAssertEqual(torrent.availableData(fileIndex: 1, offset: 0, length: 12_768), content.subdata(in: 20_000..<32_768))
+        XCTAssertNil(torrent.availableData(fileIndex: 1, offset: 0, length: 12_769), "piece 2 failed verification")
+        XCTAssertNil(torrent.availableData(fileIndex: 1, offset: 29_000, length: 100))
+        XCTAssertEqual(torrent.availableData(fileIndex: 1, offset: 30_000, length: 10), Data())
+        XCTAssertNil(torrent.availableData(fileIndex: 2, offset: 0, length: 10))
+        XCTAssertNil(torrent.availableData(fileIndex: 0, offset: -1, length: 10))
+        XCTAssertNil(torrent.streamStatus(fileIndex: 1).readerOffset)
+        XCTAssertNil(torrent.streamStatus(fileIndex: 0).readerOffset)
+    }
 }
 
 /// Minimal BitTorrent seeder on 127.0.0.1 used by the tests (supports ut_metadata).

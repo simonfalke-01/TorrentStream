@@ -85,15 +85,22 @@ public struct ShowEpisode: Codable, Hashable, Identifiable, Sendable {
     /// Air time of the next episode of an airing show.
     public var airsAt: Date?
     public var isAired: Bool
+    /// Synopsis of the episode.
+    public var overview: String?
+    /// Minutes.
+    public var runtime: Int?
     public var id: Int { number }
 
-    public init(number: Int, absolute: Int, title: String? = nil, thumbnailURL: URL? = nil, airsAt: Date? = nil, isAired: Bool = true) {
+    public init(number: Int, absolute: Int, title: String? = nil, thumbnailURL: URL? = nil, airsAt: Date? = nil, isAired: Bool = true,
+                overview: String? = nil, runtime: Int? = nil) {
         self.number = number
         self.absolute = absolute
         self.title = title
         self.thumbnailURL = thumbnailURL
         self.airsAt = airsAt
         self.isAired = isAired
+        self.overview = overview
+        self.runtime = runtime
     }
 }
 
@@ -145,6 +152,21 @@ public struct ShowDetails: Codable, Hashable, Identifiable, Sendable {
         guard let i = seasons.firstIndex(where: { $0.id == season.id }), i + 1 < seasons.count,
               let first = seasons[i + 1].episodes.first, first.isAired else { return nil }
         return (seasons[i + 1], first)
+    }
+}
+
+/// An episode of a season entry going out at a set time.
+public struct AiringEpisode: Codable, Hashable, Sendable, Identifiable {
+    /// The AniList entry that airs, a season rather than the whole show.
+    public var show: Show
+    public var episode: Int
+    public var airingAt: Date
+    public var id: String { "\(show.id).\(episode)" }
+
+    public init(show: Show, episode: Int, airingAt: Date) {
+        self.show = show
+        self.episode = episode
+        self.airingAt = airingAt
     }
 }
 
@@ -329,20 +351,86 @@ public final class ShowCatalog: @unchecked Sendable {
         return ShowDetails(show: chain[0].show, seasons: seasons)
     }
 
-    /// Fills in episode titles and stills AniList lacks, from Kitsu. Best effort: seasons that fail keep what they had.
+    /// Fills in episode titles, synopses, stills and runtimes AniList lacks, from ani.zip and then Kitsu.
+    /// Best effort: seasons that fail keep what they had.
     public func withEpisodeInfo(_ details: ShowDetails) async -> ShowDetails {
         var out = details
-        for i in out.seasons.indices.prefix(8) {
-            let eps = out.seasons[i].episodes
-            guard !eps.isEmpty, eps.contains(where: { $0.title == nil || $0.thumbnailURL == nil }),
-                  let info = try? await kitsuEpisodes(anilistID: out.seasons[i].media.id, count: eps.count) else { continue }
-            for j in eps.indices {
-                guard let k = info[eps[j].number] else { continue }
-                if out.seasons[i].episodes[j].title == nil { out.seasons[i].episodes[j].title = k.title }
-                if out.seasons[i].episodes[j].thumbnailURL == nil { out.seasons[i].episodes[j].thumbnailURL = k.thumbnail }
+        let targets = out.seasons.indices.prefix(8).filter {
+            out.seasons[$0].episodes.contains { $0.title == nil || $0.thumbnailURL == nil || $0.overview == nil }
+        }
+        let ids = targets.map { out.seasons[$0].media.id }
+        let found = await withTaskGroup(of: (Int, [Int: EpisodeInfo]?).self) { group -> [Int: [Int: EpisodeInfo]] in
+            for id in ids { group.addTask { (id, try? await self.aniZipEpisodes(anilistID: id)) } }
+            var all: [Int: [Int: EpisodeInfo]] = [:]
+            for await (id, info) in group { all[id] = info }
+            return all
+        }
+        for i in targets {
+            if let info = found[out.seasons[i].media.id] {
+                out.seasons[i].episodes = Self.merged(out.seasons[i].episodes, with: info)
             }
+            let eps = out.seasons[i].episodes
+            guard eps.contains(where: { $0.title == nil || $0.thumbnailURL == nil }),
+                  let info = try? await kitsuEpisodes(anilistID: out.seasons[i].media.id, count: eps.count) else { continue }
+            out.seasons[i].episodes = Self.merged(eps, with: info.mapValues { EpisodeInfo(title: $0.title, thumbnail: $0.thumbnail) })
         }
         return out
+    }
+
+    /// Shows AniList users recommend alongside this one, best rated first.
+    public func recommendations(id: Int) async throws -> [Show] {
+        let query = """
+        query ($id: Int) {
+          m: Media(id: $id, type: ANIME) { recommendations(sort: RATING_DESC, perPage: 15) { nodes { mediaRecommendation { \(Self.fields) } } } }
+        }
+        """
+        return Self.recommendations(try await graphQL(query, variables: ["id": id]), excluding: id)
+    }
+
+    static func recommendations(_ data: [String: Any], excluding id: Int) -> [Show] {
+        let nodes = (((data["m"] as? [String: Any])?["recommendations"] as? [String: Any])?["nodes"] as? [[String: Any]]) ?? []
+        var seen: Set<Int> = [id]
+        let shows = nodes.compactMap { ($0["mediaRecommendation"] as? [String: Any]).flatMap(show) }
+        return Array(shows.filter { seen.insert($0.id).inserted }.prefix(12))
+    }
+
+    /// Episodes airing from `from` up to but not including `to`, in airing order. One request per week of the range.
+    public func schedule(from: Date, to: Date) async throws -> [AiringEpisode] {
+        var out: [AiringEpisode] = []
+        var seen = Set<String>()
+        var start = from
+        while start < to {
+            let end = min(to, start.addingTimeInterval(7 * 86400))
+            let variables = ["from": Int(start.timeIntervalSince1970.rounded(.up)) - 1, "to": Int(end.timeIntervalSince1970.rounded(.up))]
+            let data = try await graphQL(Self.scheduleQuery, variables: variables)
+            for a in Self.airingEpisodes(data) where a.airingAt >= start && a.airingAt < end && seen.insert(a.id).inserted {
+                out.append(a)
+            }
+            start = end
+        }
+        return out.sorted { ($0.airingAt, $0.show.id, $0.episode) < ($1.airingAt, $1.show.id, $1.episode) }
+    }
+
+    static let schedulePages = 6
+    static let scheduleFormats: Set<String> = ["TV", "TV_SHORT", "ONA", "OVA", "SPECIAL", "MOVIE"]
+
+    /// Up to six pages of 50 in one request; AniList bounds are exclusive.
+    static let scheduleQuery: String = {
+        let pages = (1...schedulePages).map { p in
+            "p\(p): Page(page: \(p), perPage: 50) { airingSchedules(airingAt_greater: $from, airingAt_lesser: $to, sort: TIME) { episode airingAt media { ...S } } }"
+        }
+        return "query ($from: Int, $to: Int) {\n\(pages.joined(separator: "\n"))\n}\nfragment S on Media { \(fields) }"
+    }()
+
+    static func airingEpisodes(_ data: [String: Any]) -> [AiringEpisode] {
+        (1...schedulePages).flatMap { p -> [AiringEpisode] in
+            let list = ((data["p\(p)"] as? [String: Any])?["airingSchedules"] as? [[String: Any]]) ?? []
+            return list.compactMap { a in
+                guard let episode = a["episode"] as? Int, let at = a["airingAt"] as? Int, let m = a["media"] as? [String: Any],
+                      scheduleFormats.contains(m["format"] as? String ?? ""), let show = show(m) else { return nil }
+                return AiringEpisode(show: show, episode: episode, airingAt: Date(timeIntervalSince1970: TimeInterval(at)))
+            }
+        }
     }
 
     // MARK: details helpers
@@ -434,6 +522,76 @@ public final class ShowCatalog: @unchecked Sendable {
         return out
     }
 
+    struct EpisodeInfo: Equatable, Sendable {
+        var title: String?
+        var overview: String?
+        var thumbnail: URL?
+        var runtime: Int?
+    }
+
+    /// Episodes with gaps filled from `info`, keyed by number within the season. Values already there are kept.
+    static func merged(_ episodes: [ShowEpisode], with info: [Int: EpisodeInfo]) -> [ShowEpisode] {
+        episodes.map { e in
+            guard let i = info[e.number] else { return e }
+            var e = e
+            e.title = e.title ?? i.title
+            e.thumbnailURL = e.thumbnailURL ?? i.thumbnail
+            e.overview = e.overview ?? i.overview
+            e.runtime = e.runtime ?? i.runtime
+            return e
+        }
+    }
+
+    /// Episode names, synopses and stills from ani.zip, which collects them from TheTVDB and AniDB.
+    private func aniZipEpisodes(anilistID: Int) async throws -> [Int: EpisodeInfo] {
+        Self.aniZipEpisodes(try await json(URL(string: "https://api.ani.zip/mappings?anilist_id=\(anilistID)")!, accept: "application/json"))
+    }
+
+    /// Regular episodes keyed by number within the AniList entry. Specials ("S1") are left out.
+    static func aniZipEpisodes(_ root: [String: Any]) -> [Int: EpisodeInfo] {
+        var out: [Int: EpisodeInfo] = [:]
+        for (key, value) in (root["episodes"] as? [String: Any]) ?? [:] {
+            guard let n = Int(key), n > 0, let e = value as? [String: Any] else { continue }
+            let titles = e["title"] as? [String: Any] ?? [:]
+            let info = EpisodeInfo(
+                title: [titles["en"], titles["x-jat"]].compactMap { ($0 as? String).flatMap(episodeTitle) }.first,
+                overview: (e["overview"] as? String).flatMap(episodeOverview),
+                thumbnail: (e["image"] as? String).flatMap { $0.isEmpty ? nil : URL(string: $0) },
+                runtime: [e["runtime"], e["length"]].compactMap(integer).first { $0 > 0 }
+            )
+            if info != EpisodeInfo() { out[n] = info }
+        }
+        return out
+    }
+
+    /// A title worth showing: not empty, not "Episode 5", not in Japanese script.
+    static func episodeTitle(_ raw: String) -> String? {
+        let t = raw.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: "`", with: "'")
+        guard !t.isEmpty, t.range(of: #"^(?i)episode\s*\d+$"#, options: .regularExpression) == nil,
+              t.range(of: #"[\p{Han}\p{Hiragana}\p{Katakana}\p{Hangul}]"#, options: .regularExpression) == nil else { return nil }
+        return t
+    }
+
+    /// A synopsis worth showing: not empty and not a placeholder like "TBA".
+    static func episodeOverview(_ raw: String) -> String? {
+        let t = raw.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: "`", with: "'")
+        let placeholder = #"^(?i)(no (overview|description|synopsis|summary)( (available|yet))?|tba|tbd|to be (announced|determined)|n/?a|coming soon|-+)[.!]?$"#
+        guard !t.isEmpty, t.range(of: placeholder, options: .regularExpression) == nil else { return nil }
+        return t
+    }
+
+    static func integer(_ v: Any?) -> Int? {
+        if let i = v as? Int { return i }
+        if let d = v as? Double, d.isFinite { return Int(d.rounded()) }
+        return (v as? String).flatMap { Int($0) }
+    }
+
+    static func number(_ v: Any?) -> Double? {
+        if let d = v as? Double { return d }
+        if let i = v as? Int { return Double(i) }
+        return (v as? String).flatMap { Double($0) }
+    }
+
     private static let kitsu = "https://kitsu.app/api/edge"
 
     /// Episode titles and stills from Kitsu, which maps AniList ids to its own. First 200 episodes.
@@ -471,9 +629,9 @@ public final class ShowCatalog: @unchecked Sendable {
         return (title, thumb)
     }
 
-    private func json(_ url: URL) async throws -> [String: Any] {
+    func json(_ url: URL, accept: String = "application/vnd.api+json") async throws -> [String: Any] {
         var request = URLRequest(url: url, timeoutInterval: 10)
-        request.setValue("application/vnd.api+json", forHTTPHeaderField: "Accept")
+        request.setValue(accept, forHTTPHeaderField: "Accept")
         let data = try await send(request)
         guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw CatalogError.unreadable }
         return root

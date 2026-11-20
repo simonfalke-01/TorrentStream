@@ -62,6 +62,9 @@ struct ShowView: View {
                 .padding(.horizontal, Space.l)
                 .padding(.top, Space.l)
                 .padding(.bottom, Space.xxl)
+
+                moreLikeThis
+                    .padding(.bottom, Space.xxl)
             }
             .frame(maxWidth: Metrics.contentMaxWidth)
             .frame(maxWidth: .infinity)
@@ -73,6 +76,7 @@ struct ShowView: View {
             }
         }
         .task { await load() }
+        .task { await shows.loadRecommendations(show) }
         .refreshable { await load(force: true) }
         .fullScreenCover(item: $launch) { PlaybackLauncher(launch: $0) }
         .sheet(item: $versions) { target in
@@ -139,62 +143,63 @@ struct ShowView: View {
 
     // MARK: play
 
+    /// Play fills the row; My List sits beside it as a circle, so the one action that matters reads first.
     @ViewBuilder
     private var playArea: some View {
         let next = details.flatMap(shows.upNext)
-        VStack(alignment: .leading, spacing: Space.s) {
-            if details != nil && next == nil {
-                Text(comingText)
-                    .font(.headline)
-                    .frame(maxWidth: .infinity, minHeight: Metrics.playButtonHeight)
-                    .background(.fill.tertiary, in: .capsule)
-            } else {
-                Button { play(next) } label: {
-                    Label(playTitle(next), systemImage: "play.fill")
-                }
-                .buttonStyle(PrimaryPlayButtonStyle())
-            }
-
+        let inList = shows.isInMyList(show)
+        VStack(spacing: Space.s) {
             HStack(spacing: Space.s) {
+                if details != nil && next == nil {
+                    Text(comingText)
+                        .font(.headline)
+                        .frame(maxWidth: .infinity, minHeight: Metrics.playButtonHeight)
+                        .background(.fill.tertiary, in: .capsule)
+                } else {
+                    Button { play(next) } label: {
+                        Label(playTitle(next), systemImage: "play.fill")
+                    }
+                    .buttonStyle(PrimaryPlayButtonStyle())
+                }
+
                 Button { shows.toggleMyList(show) } label: {
-                    Label("My List", systemImage: shows.isInMyList(show) ? "checkmark" : "plus")
+                    Image(systemName: inList ? "checkmark" : "plus")
+                        .font(.title3.weight(.semibold))
                         .contentTransition(.symbolEffect(.replace))
-                        .frame(maxWidth: .infinity)
+                        .frame(width: Metrics.playButtonHeight, height: Metrics.playButtonHeight)
+                        .background(.fill.tertiary, in: .circle)
+                        .contentShape(.circle)
                 }
-                .accessibilityValue(shows.isInMyList(show) ? "Added" : "Not added")
-                Button { play(next, inVLC: true) } label: {
-                    Label("Open in VLC", systemImage: "arrow.up.forward.app")
-                        .frame(maxWidth: .infinity)
-                }
-                .disabled(details != nil && next == nil)
+                .buttonStyle(.plain)
+                .accessibilityLabel(inList ? "Remove from My List" : "Add to My List")
+                .sensoryFeedback(.selection, trigger: inList)
             }
-            .buttonStyle(.bordered)
-            .buttonBorderShape(.capsule)
-            .controlSize(.large)
-            .font(.body.weight(.semibold))
-            .sensoryFeedback(.selection, trigger: shows.isInMyList(show))
 
             if let caption = resumeCaption(next) {
                 Text(caption)
                     .font(.footnote)
                     .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity)
+                    .lineLimit(1)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, Space.l)
             }
         }
     }
 
-    /// "Resume", "Play S1 E6" once started, or "Play".
+    /// "Resume S1 E3", "Play Episode 1", or "Play" for a movie: the button names what it starts.
     private func playTitle(_ next: ShowUpNext?) -> String {
-        guard let next, let d = details else { return "Play" }
-        if next.resumeAt != nil { return "Resume" }
-        if next.isContinuing && !d.show.isMovie { return "Play \(ShowsModel.episodeLabel(d, next.season, next.episode))" }
-        return "Play"
+        let verb = next?.resumeAt != nil ? "Resume" : "Play"
+        guard let next, let d = details, !d.show.isMovie else { return verb }
+        return "\(verb) \(ShowsModel.episodeLabel(d, next.season, next.episode))"
     }
 
+    /// The episode's name and the time left, under the Play button.
     private func resumeCaption(_ next: ShowUpNext?) -> String? {
-        guard let next, let d = details, let remaining = next.remaining, let left = Format.remaining(remaining) else { return nil }
+        guard let next, let d = details else { return nil }
+        let left = next.remaining.flatMap(Format.remaining)
         if d.show.isMovie { return left }
-        return "\(ShowsModel.episodeLabel(d, next.season, next.episode)), \(left)"
+        let parts = [next.episode.title, left].compactMap { $0 }.filter { !$0.isEmpty }
+        return parts.isEmpty ? nil : parts.joined(separator: ", ")
     }
 
     private var comingText: String {
@@ -202,12 +207,12 @@ struct ShowView: View {
         return "Coming Soon"
     }
 
-    private func play(_ next: ShowUpNext?, inVLC: Bool = false) {
+    private func play(_ next: ShowUpNext?) {
         guard let d = details, let next else {
-            launch = EpisodeLaunch(show: show, openInVLC: inVLC)
+            launch = EpisodeLaunch(show: show)
             return
         }
-        launch = EpisodeLaunch(show: d.show, seasonID: next.season.id, episode: next.episode.number, openInVLC: inVLC)
+        launch = EpisodeLaunch(show: d.show, seasonID: next.season.id, episode: next.episode.number)
     }
 
     // MARK: about
@@ -295,9 +300,6 @@ struct ShowView: View {
                 Button { versions = EpisodeTarget(details: d, season: s, episode: e) } label: {
                     Label("Choose Version…", systemImage: "slider.horizontal.3")
                 }
-                Button { launch = EpisodeLaunch(show: d.show, seasonID: s.id, episode: e.number, openInVLC: true) } label: {
-                    Label("Open in VLC", systemImage: "arrow.up.forward.app")
-                }
                 Section {
                     if p?.isWatched == true {
                         Button { shows.setWatched(false, show: d.show, season: s, episode: e) } label: {
@@ -320,6 +322,32 @@ struct ShowView: View {
                 .foregroundStyle(.secondary)
             Button("Try Again") { Task { await load(force: true) } }
                 .buttonStyle(.bordered)
+        }
+    }
+
+    // MARK: more like this
+
+    @ViewBuilder
+    private var moreLikeThis: some View {
+        if let list = shows.recommendations[shows.rootID(show)], !list.isEmpty {
+            VStack(alignment: .leading, spacing: Space.m) {
+                Text("More Like This")
+                    .font(.title3.bold())
+                    .accessibilityAddTraits(.isHeader)
+                    .padding(.horizontal, Space.l)
+                ScrollView(.horizontal) {
+                    LazyHStack(alignment: .top, spacing: Space.m) {
+                        ForEach(list.prefix(15)) { s in
+                            ShowPosterCard(show: s) { launch = EpisodeLaunch(show: s) }
+                                .frame(width: Metrics.shelfPoster.width)
+                        }
+                    }
+                    .scrollTargetLayout()
+                    .padding(.horizontal, Space.l)
+                }
+                .scrollIndicators(.hidden)
+                .scrollTargetBehavior(.viewAligned)
+            }
         }
     }
 
@@ -357,29 +385,49 @@ struct ShowEpisodeRow: View {
 
     var body: some View {
         let watched = progress?.isWatched == true
-        HStack(alignment: .top, spacing: Space.m) {
-            VStack(spacing: Space.xs) {
-                PosterImage(url: episode.thumbnailURL, title: String(episode.number),
-                            showsTitle: episode.thumbnailURL == nil, titleFont: .title3.weight(.semibold))
-                    .frame(width: thumbWidth, height: thumbWidth * 9 / 16)
-                if let p = progress, p.fraction > 0.02, !watched {
-                    WatchedBar(fraction: p.fraction)
-                        .frame(width: thumbWidth)
+        let named = episode.title.map { !$0.isEmpty } ?? false
+        // Without a still the tile carries the number, so the line above the name isn't needed.
+        let eyebrow = named && episode.thumbnailURL != nil
+        VStack(alignment: .leading, spacing: Space.s) {
+            HStack(alignment: .top, spacing: Space.m) {
+                VStack(spacing: Space.xs) {
+                    PosterImage(url: episode.thumbnailURL, title: String(episode.number),
+                                showsTitle: episode.thumbnailURL == nil, titleFont: .title3.weight(.semibold))
+                        .frame(width: thumbWidth, height: thumbWidth * 9 / 16)
+                    if let p = progress, p.fraction > 0.02, !watched {
+                        WatchedBar(fraction: p.fraction)
+                            .frame(width: thumbWidth)
+                    }
                 }
-            }
-            VStack(alignment: .leading, spacing: Space.xs) {
-                Text(title)
-                    .font(.body.weight(.medium))
-                    .foregroundStyle(watched || !episode.isAired ? .secondary : .primary)
-                    .lineLimit(2)
-                if let detail {
-                    Text(detail)
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: Space.xxs) {
+                    if eyebrow {
+                        Text("Episode \(episode.number)")
+                            .font(.footnote.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
+                    Text(named ? episode.title ?? "" : "Episode \(episode.number)")
+                        .font(.body.weight(.medium))
+                        .foregroundStyle(watched || !episode.isAired ? .secondary : .primary)
+                        .lineLimit(2)
+                    if let detail {
+                        Text(detail)
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
                 }
+                .padding(.top, Space.xxs)
+                Spacer(minLength: 0)
             }
-            .padding(.top, Space.xxs)
-            Spacer(minLength: 0)
+            // The synopsis spans the row's full width, under the still, as a quieter third tier.
+            if let overview = episode.overview, !overview.isEmpty {
+                Text(overview)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(3)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
         }
         .padding(.vertical, Space.s)
         .frame(minHeight: Metrics.touchTarget)
@@ -389,18 +437,13 @@ struct ShowEpisodeRow: View {
         .accessibilityHint(episode.isAired ? "Plays the episode" : "")
     }
 
-    private var title: String {
-        if let t = episode.title, !t.isEmpty { return "\(episode.number). \(t)" }
-        return "Episode \(episode.number)"
-    }
-
     private var detail: String? {
         if !episode.isAired {
             return episode.airsAt.map { "Airs \($0.formatted(.dateTime.weekday(.wide).month(.abbreviated).day()))" } ?? "Not out yet"
         }
         if progress?.isWatched == true { return "Watched" }
         if let p = progress, p.duration > 0, p.position > 20 { return Format.remaining(p.duration - p.position) }
-        return minutes.flatMap { Format.duration(Double($0 * 60)) }
+        return (episode.runtime ?? minutes).flatMap { Format.duration(Double($0 * 60)) }
     }
 }
 
@@ -411,6 +454,8 @@ struct ShowPosterCard: View {
     @EnvironmentObject var shows: ShowsModel
     let show: Show
     var showsCaption = false
+    /// A short line under the title in the accent color, such as "New Episode".
+    var note: String? = nil
     let onPlay: () -> Void
 
     var body: some View {
@@ -421,9 +466,13 @@ struct ShowPosterCard: View {
                 VStack(alignment: .leading, spacing: Space.xxs) {
                     Text(show.title)
                         .font(.footnote.weight(.medium))
-                        .lineLimit(2, reservesSpace: !showsCaption)
+                        .lineLimit(2, reservesSpace: !showsCaption && note == nil)
                         .multilineTextAlignment(.leading)
-                    if showsCaption, let caption = show.caption {
+                    if let note {
+                        Text(note)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.tint)
+                    } else if showsCaption, let caption = show.caption {
                         Text(caption)
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -461,37 +510,16 @@ struct ShowContinueCard: View {
 
     var body: some View {
         let d = shows.details[entry.show.id]
-        let fraction = next.flatMap { n in shows.progress(entry.show, n.season, n.episode)?.fraction } ?? 0
+        let fraction = next.flatMap { n in shows.progress(entry.show, n.season, n.episode)?.fraction }
         let still = next?.episode.thumbnailURL ?? entry.show.bannerURL ?? entry.show.posterURL
 
         Button(action: onPlay) {
-            VStack(alignment: .leading, spacing: Space.s) {
-                PosterImage(url: still, title: entry.show.title, cornerRadius: Radius.medium)
-                    .frame(width: Metrics.wideCardWidth, height: Metrics.wideCardWidth * 9 / 16)
-                    .overlay {
-                        Image(systemName: "play.fill")
-                            .font(.title3)
-                            .foregroundStyle(.white)
-                            .frame(width: Metrics.touchTarget + Space.s, height: Metrics.touchTarget + Space.s)
-                            .glassEffect(.clear, in: .circle)
-                    }
-                WatchedBar(fraction: fraction)
-                VStack(alignment: .leading, spacing: Space.xxs) {
-                    Text(entry.show.title)
-                        .font(.subheadline.weight(.semibold))
-                        .lineLimit(1)
-                    Text(Self.detail(entry: entry, next: next, details: d))
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-            }
-            .frame(width: Metrics.wideCardWidth, alignment: .leading)
-            .contentShape(.rect)
+            ContinueCardLabel(imageURL: still, title: d?.show.title ?? entry.show.title,
+                              detail: Self.detail(entry: entry, next: next, details: d), progress: fraction)
         }
         .buttonStyle(.plain)
         .accessibilityElement(children: .combine)
-        .accessibilityHint("Plays")
+        .accessibilityHint(next?.resumeAt != nil ? "Resumes" : "Plays")
         .contextMenu {
             Button(action: onPlay) { Label(next?.resumeAt != nil ? "Resume" : "Play", systemImage: "play") }
             Button { model.navigationPath.append(.show(entry.show)) } label: {
@@ -504,9 +532,9 @@ struct ShowContinueCard: View {
     }
 
     /// "S1 E5, 12 min left", "Episode 6", or "12 min left" for a movie.
-    static func detail(entry: WatchEntry, next: ShowUpNext?, details d: ShowDetails?) -> String {
+    static func detail(entry: WatchEntry, next: ShowUpNext?, details d: ShowDetails?) -> String? {
         let left = next?.remaining.flatMap(Format.remaining)
-        if entry.show.isMovie { return left ?? "Start watching" }
+        if entry.show.isMovie || d?.show.isMovie == true { return left }
         let label = next.map { ShowsModel.shortLabel(d, season: $0.season.number, episode: $0.episode.number) }
             ?? ShowsModel.shortLabel(d, season: entry.season, episode: entry.episode)
         return left.map { "\(label), \($0)" } ?? label
@@ -795,13 +823,7 @@ struct PlaybackLauncher: View {
             target = t
             let req = try await shows.request(d, t.season, t.episode, source: chosen ?? launch.source, resumeAt: nil) { status = $0 }
             guard !Task.isCancelled else { return }
-            if launch.openInVLC {
-                shows.playbackStarted(req)
-                ExternalPlayer.openInVLC(req) { model.errorMessage = $0 }
-                dismiss()
-            } else {
-                request = req
-            }
+            request = req
         } catch {
             guard !Task.isCancelled else { return }
             failure = Self.message(for: error)

@@ -6,9 +6,12 @@ straight out of BitTorrent, but you never manage downloads, progress or storage.
 * **A catalog, not a search box**: Home opens on shelves (Trending Now, New This Season, Popular, Top Rated, Movies)
   from AniList, the same database that covers what Nyaa carries (anime). Search finds any show or movie by name; it
   runs on Kitsu, which has no request limit, so typing never gets throttled (AniList is the fallback).
-* **Show pages**: poster, synopsis, genres, one **Play / Resume / Play S2 E5** button, My List, and every season with
-  its episodes (names and stills from Kitsu). Tap an episode and it plays. Progress is saved per episode, and Continue
-  Watching picks up where you stopped.
+* **Tabs**: Home, Schedule, Library and Search.
+* **Show pages**: poster, synopsis, genres, one **Play / Resume / Play S2 E5** button, My List, every season with
+  its episodes (names, stills, runtimes and synopses from ani.zip/TVDB, falling back to Kitsu) and More Like This.
+  Tap an episode and it plays. Progress is saved per episode, and Continue Watching picks up where you stopped.
+* **Schedule**: what airs each day this week (AniList), with times in your time zone, filterable to My List.
+* **Library**: My List (sortable, marks shows with a new episode) and watch History.
 * **Sources are found for you**: when you press Play, TorrentStream searches Nyaa for that episode, parses every
   release name (show, season, episode, absolute numbering, batches, resolution, codec, source, audio, subtitles,
   group, in the spirit of Sonarr's parser), rejects wrong seasons, specials and movies, ranks the rest by your
@@ -20,13 +23,16 @@ straight out of BitTorrent, but you never manage downloads, progress or storage.
 * Home also keeps a hero for what you're watching and **My List** with posters.
 * Add a **magnet link** (paste, or tap one in Safari) or a **.torrent file** (Files app, share sheet, or Add by Link).
 * Seek anywhere: loading jumps to wherever you are watching.
-* Built-in **VLC player** (MobileVLCKit): MKV, AVI, WebM, HEVC, etc., **audio-track switching**, **embedded subtitles**,
-  **subtitle files shipped with the release** (auto-loaded), **load your own subtitle file**, subtitle/audio delay,
-  playback speed.
-* **One tap "Open in VLC"** hands the stream to the VLC for iOS app (TorrentStream keeps serving it in the background).
-* Optional Apple AVPlayer engine (MP4/MOV, AirPlay, Picture in Picture), switchable mid-playback.
-* **iOS 26 Liquid Glass** UI: glass tab bar and player controls, double-tap to skip ±10 s, resume where you left off,
-  and Up Next autoplay.
+* **In-app player** (VLCKit decoding, native UI): MKV, AVI, WebM, HEVC, etc.
+  * **Audio track** switching, remembered per show.
+  * **Primary and secondary subtitles** at once: embedded tracks and subtitle files shipped with the release, or your
+    own file; independent timing for each, Signs & Songs tracks avoided by default, adjustable size.
+  * **Chapters**: marks on the scrubber, chapter name while scrubbing, and a chapter list.
+  * **Skip Intro / Recap** from AniSkip timestamps or the file's chapter names.
+  * **Next Episode** card at the end credits with its name and still, plus optional autoplay.
+  * Episode list, Choose Version, speed, sleep timer, control lock, fill/fit (pinch), double-tap to skip ±10 s,
+    lock screen and Control Center controls.
+* **iOS 26 Liquid Glass** UI.
 * **Automatic cache, sized like a streaming service**: playback loads up to about ten minutes ahead (from the video's
   bitrate, capped at 1 GB), and the first few minutes of the next episode are loaded as soon as an episode starts, so
   Up Next is instant. Nothing else is fetched in the background. What was
@@ -46,8 +52,10 @@ SwiftUI app ──► TorrentKit (pure Swift, no dependencies)
  │               ├─ Streaming piece picker: readahead window at the playhead, file head/tail first,
  │               │  then sequential; slow blocks near the playhead are re-requested from other peers
  │               ├─ SHA-1 verified, sparse on-disk storage with resume
- │               └─ Loopback HTTP server (Range/seek support) ──► VLC / AVPlayer / VLC app
- ├─────────────► CatalogKit: search (Kitsu), rows, seasons and episodes (AniList + Kitsu episode names); name parsing
+ │               └─ Loopback HTTP server (Range/seek support) ──► in-app player (VLCKit)
+ ├─────────────► CatalogKit: search (Kitsu), rows, seasons and episodes (AniList, ani.zip, Kitsu), airing
+ │               schedule, recommendations, skip times (AniSkip); name parsing
+ ├─────────────► SubtitleKit: SRT/VTT/ASS parsing, text subtitle tracks read from partially downloaded MKVs
  ├─────────────► NyaaKit: nyaa.si search (HTML listing, server-side sort and pagination)
  └─────────────► SourceKit: episode → Nyaa queries, release matching and ranking, picking the file inside a pack
 ```
@@ -70,8 +78,7 @@ xcodegen generate
 pod install
 open TorrentStream.xcworkspace
 ```
-Pick your team under *Signing & Capabilities*, choose your iPhone, and Run.
-(If you skip `pod install` and open `TorrentStream.xcodeproj`, the app builds without VLC and uses AVPlayer only.)
+Pick your team under *Signing & Capabilities*, choose your iPhone, and Run. `pod install` is required (VLCKit).
 
 ## Engine development (macOS or Linux)
 ```sh
@@ -88,6 +95,6 @@ swift run -c release tkcli "magnet:?xt=urn:btih:..."   # stream the head and mid
   whose release groups number seasons differently from AniList (split cours, absolute numbering) can occasionally
   pick the wrong file; Choose Version lists everything found.
 * Download-only client (does not upload pieces), IPv4, BitTorrent v1 / hybrid torrents.
-* "Open in VLC" keeps TorrentStream alive in the background via a silent audio session — tap **Stop** in the
-  banner when you're done.
+* No Picture in Picture or AirPlay video: VLCKit 3 doesn't support them. Secondary subtitles cover text tracks
+  (not image-based PGS/VobSub). Skip buttons appear only when AniSkip or the file's chapters know the times.
 * Only download content you have the right to download.

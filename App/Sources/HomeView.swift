@@ -33,7 +33,6 @@ enum ContinueItem: Identifiable {
 struct HomeView: View {
     @EnvironmentObject var model: AppModel
     @EnvironmentObject var shows: ShowsModel
-    @ObservedObject private var keeper = BackgroundKeeper.shared
     @State private var showAdd = false
     @State private var showSettings = false
     @State private var pendingRemoval: LibraryItem?
@@ -85,6 +84,7 @@ struct HomeView: View {
 
     private func load(force: Bool = false) async {
         await shows.loadRows(force: force)
+        await shows.adoptLinkedTitles()
         // Continue Watching needs each started show's episodes to know what plays next.
         for h in shows.history.prefix(10) {
             _ = try? await shows.loadDetails(h.show)
@@ -110,35 +110,40 @@ struct HomeView: View {
         }
     }
 
+    /// Each show or title appears once above the catalog rows: the hero, then the rest of what's started, then
+    /// the rest of My List.
     private var content: some View {
         let continuing = continuing
-        let listCount = shows.myList.count + model.items.count
+        let featured = continuing.first
+        let started = Array(continuing.dropFirst())
+        let shownShows = Set(continuing.compactMap { c -> Int? in if case .show(let e, _) = c { return e.show.id } else { return nil } })
+        let shownLinks = Set(continuing.compactMap { c -> String? in if case .link(let e, _) = c { return e.item.id } else { return nil } })
+        let listShows = shows.myList.filter { !shownShows.contains(shows.rootID($0)) && !shownShows.contains($0.id) }
+        let listItems = model.items.filter { !shownLinks.contains($0.id) }
+        let listTotal = shows.myList.count + model.items.count
+        let trendingHero = featured == nil ? shows.rows.first?.shows.first : nil
 
         return ScrollView {
             VStack(alignment: .leading, spacing: Space.xxl) {
-                if keeper.isActive {
-                    ExternalStreamBanner(keeper: keeper)
-                        .padding(.horizontal, Space.l)
-                }
-
-                hero(continuing.first)
+                hero(featured, trending: trendingHero)
                     .frame(maxWidth: Metrics.heroMaxWidth)
                     .padding(.horizontal, Space.l)
                     .frame(maxWidth: .infinity)
 
-                if !continuing.isEmpty {
+                if !started.isEmpty {
                     Shelf(title: "Continue Watching") {
-                        ForEach(continuing) { continueCard($0) }
+                        ForEach(started) { continueCard($0) }
                     }
                 }
 
-                if listCount > 0 {
-                    Shelf(title: "My List", seeAll: listCount > shelfLimit ? .myList : nil) {
-                        ForEach(shows.myList.prefix(shelfLimit)) { show in
+                if !listShows.isEmpty || !listItems.isEmpty {
+                    Shelf(title: "My List", onSeeAll: listTotal > min(shelfLimit, listShows.count + listItems.count)
+                          ? { model.selectedTab = .library } : nil) {
+                        ForEach(listShows.prefix(shelfLimit)) { show in
                             ShowPosterCard(show: show) { launch = EpisodeLaunch(show: show) }
                                 .frame(width: Metrics.shelfPoster.width)
                         }
-                        ForEach(model.items.prefix(max(0, shelfLimit - shows.myList.count))) { item in
+                        ForEach(listItems.prefix(max(0, shelfLimit - listShows.count))) { item in
                             PosterCard(item: item, onPlay: { play(item) }, onRemove: { pendingRemoval = item })
                                 .frame(width: Metrics.shelfPoster.width)
                         }
@@ -146,10 +151,13 @@ struct HomeView: View {
                 }
 
                 ForEach(shows.rows) { row in
-                    Shelf(title: row.title) {
-                        ForEach(row.shows) { show in
-                            ShowPosterCard(show: show) { launch = EpisodeLaunch(show: show) }
-                                .frame(width: Metrics.shelfPoster.width)
+                    let list = row.shows.filter { $0.id != trendingHero?.id }
+                    if !list.isEmpty {
+                        Shelf(title: row.title) {
+                            ForEach(list) { show in
+                                ShowPosterCard(show: show) { launch = EpisodeLaunch(show: show) }
+                                    .frame(width: Metrics.shelfPoster.width)
+                            }
                         }
                     }
                 }
@@ -175,38 +183,44 @@ struct HomeView: View {
 
     /// The show to pick up, else the first trending one.
     @ViewBuilder
-    private func hero(_ first: ContinueItem?) -> some View {
+    private func hero(_ first: ContinueItem?, trending: Show?) -> some View {
         switch first {
         case .show(let entry, let next):
-            HeroCard(posterURL: entry.show.posterURL, title: entry.show.title,
-                     caption: ShowContinueCard.detail(entry: entry, next: next, details: shows.details[entry.show.id]),
+            let d = shows.details[entry.show.id]
+            let isMovie = entry.show.isMovie || d?.show.isMovie == true
+            let label = next.map { ShowsModel.shortLabel(d, season: $0.season.number, episode: $0.episode.number) }
+                ?? ShowsModel.shortLabel(d, season: entry.season, episode: entry.episode)
+            let name = next?.episode.title
+            HeroCard(imageURL: next?.episode.thumbnailURL ?? entry.show.bannerURL ?? entry.show.posterURL,
+                     title: d?.show.title ?? entry.show.title,
+                     subtitle: isMovie ? nil : [label, name].compactMap { $0 }.joined(separator: ": "),
+                     detail: next?.remaining.flatMap(Format.remaining),
+                     progress: next.flatMap { shows.progress(entry.show, $0.season, $0.episode)?.fraction },
                      playTitle: next?.resumeAt != nil ? "Resume" : "Play",
                      details: .show(entry.show)) {
                 launch = EpisodeLaunch(show: entry.show, seasonID: next?.season.id, episode: next?.episode.number)
             }
         case .link(let c, _):
-            HeroCard(posterURL: model.posterURL(c.item), title: model.displayTitle(c.item),
-                     caption: linkCaption(c.item, c.next),
+            HeroCard(imageURL: model.backdropURL(c.item) ?? model.posterURL(c.item), title: model.displayTitle(c.item),
+                     subtitle: model.episodeLabel(c.next.file),
+                     detail: c.next.remaining.flatMap(Format.remaining),
+                     progress: model.watchedFraction(torrent: c.item.torrent, file: c.next.file),
                      playTitle: c.next.resumeAt != nil ? "Resume" : "Play",
                      isLoading: c.item.status.phase == .fetchingMetadata,
                      details: .title(c.item.id)) {
                 play(c.item, file: c.next.file)
             }
         case nil:
-            if let show = shows.rows.first?.shows.first {
-                HeroCard(posterURL: show.posterURL, title: show.title,
-                         caption: show.genres.isEmpty ? nil : show.genres.prefix(3).joined(separator: ", "),
+            if let show = trending {
+                HeroCard(imageURL: show.bannerURL ?? show.posterURL, title: show.title,
+                         subtitle: nil,
+                         detail: show.genres.isEmpty ? nil : show.genres.prefix(3).joined(separator: ", "),
+                         progress: nil,
                          playTitle: "Play", canPlay: !show.isUpcoming, details: .show(show)) {
                     launch = EpisodeLaunch(show: show)
                 }
             }
         }
-    }
-
-    private func linkCaption(_ item: LibraryItem, _ next: UpNext) -> String? {
-        guard let remaining = next.remaining, let left = Format.remaining(remaining) else { return nil }
-        guard model.playlist(item.status).count > 1 else { return left }
-        return "\(model.episodeLabel(next.file) ?? next.file.title), \(left)"
     }
 
     @ViewBuilder
@@ -241,7 +255,7 @@ struct HomeView: View {
 /// A titled row of cards that scrolls sideways.
 struct Shelf<Content: View>: View {
     let title: String
-    var seeAll: Route? = nil
+    var onSeeAll: (() -> Void)? = nil
     @ViewBuilder let content: Content
 
     var body: some View {
@@ -251,8 +265,8 @@ struct Shelf<Content: View>: View {
                     .font(.title3.bold())
                     .accessibilityAddTraits(.isHeader)
                 Spacer(minLength: Space.s)
-                if let seeAll {
-                    NavigationLink("See All", value: seeAll)
+                if let onSeeAll {
+                    Button("See All", action: onSeeAll)
                         .font(.subheadline)
                 }
             }
@@ -268,12 +282,16 @@ struct Shelf<Content: View>: View {
     }
 }
 
-/// The title to watch now: a large poster with Play and Details.
+/// The one thing to watch now: wide artwork with how far along, the title and episode, then Play.
+/// Tapping the artwork or title opens the show.
 struct HeroCard: View {
-    @EnvironmentObject var model: AppModel
-    let posterURL: URL?
+    let imageURL: URL?
     let title: String
-    let caption: String?
+    /// "S1 E3: The Name".
+    let subtitle: String?
+    /// "12 min left", or genres for a show not started.
+    let detail: String?
+    let progress: Double?
     let playTitle: String
     var isLoading = false
     var canPlay = true
@@ -281,52 +299,52 @@ struct HeroCard: View {
     let onPlay: () -> Void
 
     var body: some View {
-        PosterImage(url: posterURL, title: title, showsTitle: false, cornerRadius: Radius.large)
-            .aspectRatio(2 / 3, contentMode: .fit)
-            .overlay {
-                if isLoading { ProgressView().controlSize(.large) }
-            }
-            .overlay(alignment: .bottom) {
-                VStack(spacing: Space.m) {
-                    Text(title)
-                        .font(.title2.bold())
-                        .multilineTextAlignment(.center)
-                        .lineLimit(3)
-                        .accessibilityAddTraits(.isHeader)
-                    if let caption {
-                        Text(caption)
-                            .font(.subheadline)
-                            .foregroundStyle(.white.opacity(0.8))
-                            .lineLimit(1)
-                    }
-                    HStack(spacing: Space.m) {
-                        Button(action: onPlay) {
-                            Label(playTitle, systemImage: "play.fill")
+        VStack(alignment: .leading, spacing: Space.l) {
+            NavigationLink(value: details) {
+                VStack(alignment: .leading, spacing: Space.m) {
+                    PosterImage(url: imageURL, title: title, showsTitle: imageURL == nil, cornerRadius: Radius.medium,
+                                titleFont: .title3.weight(.semibold))
+                        .aspectRatio(16 / 9, contentMode: .fit)
+                        .overlay {
+                            if isLoading { ProgressView().controlSize(.large) }
                         }
-                        .buttonStyle(PrimaryPlayButtonStyle(fullWidth: false))
-                        .disabled(!canPlay)
+                        .overlay(alignment: .bottom) {
+                            if let progress, progress > 0.02 {
+                                WatchedBar(fraction: progress, onArtwork: true)
+                                    .padding(Space.m)
+                            }
+                        }
+                    VStack(alignment: .leading, spacing: Space.xs) {
+                        Text(title)
+                            .font(.title2.bold())
+                            .lineLimit(2)
+                            .multilineTextAlignment(.leading)
+                            .accessibilityAddTraits(.isHeader)
+                        if let subtitle, !subtitle.isEmpty {
+                            Text(subtitle)
+                                .font(.subheadline.weight(.medium))
+                                .lineLimit(1)
+                        }
+                        if let detail {
+                            Text(detail)
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                    }
+                }
+                .contentShape(.rect)
+            }
+            .buttonStyle(.plain)
+            .accessibilityElement(children: .combine)
+            .accessibilityHint("Opens details")
 
-                        NavigationLink(value: details) {
-                            Label("Details", systemImage: "info.circle")
-                                .frame(minHeight: Metrics.playButtonHeight - Space.l)
-                        }
-                        .buttonStyle(.glass)
-                        .controlSize(.large)
-                    }
-                }
-                .foregroundStyle(.white)
-                .padding(.horizontal, Space.l)
-                .padding(.top, Space.xxl * 3)
-                .padding(.bottom, Space.xl)
-                .frame(maxWidth: .infinity)
-                .background {
-                    // Legibility scrim for the title and buttons over artwork.
-                    LinearGradient(colors: [.clear, .black.opacity(0.8)], startPoint: .top, endPoint: .bottom)
-                }
+            Button(action: onPlay) {
+                Label(playTitle, systemImage: "play.fill")
             }
-            .clipShape(.rect(cornerRadius: Radius.large, style: .continuous))
-            .contentShape(.rect(cornerRadius: Radius.large, style: .continuous))
-            .onTapGesture { model.navigationPath.append(details) }
+            .buttonStyle(PrimaryPlayButtonStyle())
+            .disabled(!canPlay)
+        }
     }
 }
 
@@ -339,34 +357,10 @@ struct ContinueCard: View {
     let onRemove: () -> Void
 
     var body: some View {
-        let title = model.displayTitle(item)
-        let fraction = model.watchedFraction(torrent: item.torrent, file: next.file)
-
         Button(action: onPlay) {
-            VStack(alignment: .leading, spacing: Space.s) {
-                PosterImage(url: model.backdropURL(item) ?? model.posterURL(item), title: title,
-                            cornerRadius: Radius.medium)
-                    .frame(width: Metrics.wideCardWidth, height: Metrics.wideCardWidth * 9 / 16)
-                    .overlay {
-                        Image(systemName: "play.fill")
-                            .font(.title3)
-                            .foregroundStyle(.white)
-                            .frame(width: Metrics.touchTarget + Space.s, height: Metrics.touchTarget + Space.s)
-                            .glassEffect(.clear, in: .circle)
-                    }
-                WatchedBar(fraction: fraction ?? 0)
-                VStack(alignment: .leading, spacing: Space.xxs) {
-                    Text(title)
-                        .font(.subheadline.weight(.semibold))
-                        .lineLimit(1)
-                    Text(detail)
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-            }
-            .frame(width: Metrics.wideCardWidth, alignment: .leading)
-            .contentShape(.rect)
+            ContinueCardLabel(imageURL: model.backdropURL(item) ?? model.posterURL(item), title: model.displayTitle(item),
+                              detail: detail, progress: model.watchedFraction(torrent: item.torrent, file: next.file),
+                              isLoading: item.status.phase == .fetchingMetadata)
         }
         .buttonStyle(.plain)
         .accessibilityElement(children: .combine)
@@ -381,14 +375,12 @@ struct ContinueCard: View {
     }
 
     /// "Episode 5, 12 min left", "Episode 6", or "12 min left" for a movie.
-    private var detail: String {
-        let isSeries = model.playlist(item.status).count > 1
+    private var detail: String? {
         let left = next.remaining.flatMap(Format.remaining)
-        if isSeries {
-            let label = model.episodeLabel(next.file) ?? next.file.title
-            return left.map { "\(label), \($0)" } ?? label
-        }
-        return left ?? "Start watching"
+        let label = model.episodeLabel(next.file)
+            ?? (model.playlist(item.status).count > 1 ? next.file.title : nil)
+        let parts = [label, left].compactMap { $0 }
+        return parts.isEmpty ? nil : parts.joined(separator: ", ")
     }
 }
 
@@ -437,76 +429,6 @@ struct PosterCard: View {
         case .ready:
             EmptyView()
         }
-    }
-}
-
-/// Every show and title in My List.
-struct MyListView: View {
-    @EnvironmentObject var model: AppModel
-    @EnvironmentObject var shows: ShowsModel
-    @State private var pendingRemoval: LibraryItem?
-    @State private var export: ExportItem?
-    @State private var playing: PlaybackRequest?
-    @State private var launch: EpisodeLaunch?
-
-    private let columns = [GridItem(.adaptive(minimum: 104, maximum: 160), spacing: Space.m, alignment: .top)]
-
-    var body: some View {
-        ScrollView {
-            LazyVGrid(columns: columns, spacing: Space.l) {
-                ForEach(shows.myList) { show in
-                    ShowPosterCard(show: show) { launch = EpisodeLaunch(show: show) }
-                }
-                ForEach(model.items) { item in
-                    PosterCard(item: item, onPlay: { play(item) }, onRemove: { pendingRemoval = item })
-                }
-            }
-            .padding(.horizontal, Space.l)
-            .padding(.vertical, Space.s)
-        }
-        .overlay {
-            if shows.myList.isEmpty && model.items.isEmpty {
-                ContentUnavailableView("My List Is Empty", systemImage: "plus.square.on.square",
-                                       description: Text("Add shows from their page to find them here."))
-            }
-        }
-        .navigationTitle("My List")
-        .fullScreenCover(item: $playing) { req in PlayerScreen(request: req) }
-        .fullScreenCover(item: $launch) { PlaybackLauncher(launch: $0) }
-        .exportSheet($export)
-        .removeTitleDialog(item: $pendingRemoval, export: $export)
-    }
-
-    private func play(_ item: LibraryItem) {
-        guard let next = model.upNext(item) else { return }
-        playing = model.playbackRequest(torrent: item.torrent, file: next.file)
-    }
-}
-
-/// Shown while TorrentStream keeps a stream running for the VLC app.
-struct ExternalStreamBanner: View {
-    @ObservedObject var keeper: BackgroundKeeper
-
-    var body: some View {
-        HStack(spacing: Space.m) {
-            Image(systemName: "arrow.up.forward.app")
-                .font(.title3)
-                .foregroundStyle(.tint)
-                .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: Space.xxs) {
-                Text("Playing in VLC")
-                    .font(.headline)
-                Text("The stream keeps running in the background.")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-            }
-            Spacer(minLength: Space.s)
-            Button("Stop") { keeper.stop() }
-                .buttonStyle(.bordered)
-        }
-        .padding(Space.m)
-        .background(.fill.quaternary, in: .rect(cornerRadius: Radius.medium, style: .continuous))
-        .accessibilityElement(children: .combine)
     }
 }
 

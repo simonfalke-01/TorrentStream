@@ -9,6 +9,7 @@ let package = Package(
         .library(name: "NyaaKit", targets: ["NyaaKit"]),
         .library(name: "CatalogKit", targets: ["CatalogKit"]),
         .library(name: "SourceKit", targets: ["SourceKit"]),
+        .library(name: "SubtitleKit", targets: ["SubtitleKit"]),
     ],
     targets: [
         .target(name: "TorrentKit"),
@@ -18,11 +19,14 @@ let package = Package(
         .target(name: "CatalogKit"),
         // Finds the Nyaa release and file that play a catalog episode.
         .target(name: "SourceKit", dependencies: ["CatalogKit", "NyaaKit"]),
+        // SRT/WebVTT/ASS parsing and text subtitle tracks of (partly downloaded) Matroska files.
+        .target(name: "SubtitleKit"),
         // Command line harness used to exercise the engine on Linux/macOS.
         .executableTarget(name: "tkcli", dependencies: ["TorrentKit"]),
         .testTarget(name: "TorrentKitTests", dependencies: ["TorrentKit"]),
         .testTarget(name: "NyaaKitTests", dependencies: ["NyaaKit"]),
         .testTarget(name: "CatalogKitTests", dependencies: ["CatalogKit"]),
         .testTarget(name: "SourceKitTests", dependencies: ["SourceKit"]),
+        .testTarget(name: "SubtitleKitTests", dependencies: ["SubtitleKit"]),
     ]
 )

@@ -44,7 +44,7 @@ enum Metrics {
     static let rowPoster = CGSize(width: 48, height: 72)
     /// Poster on a title page without a backdrop.
     static let headerPosterWidth: CGFloat = 200
-    static let heroMaxWidth: CGFloat = 420
+    static let heroMaxWidth: CGFloat = 640
     static let contentMaxWidth: CGFloat = 720
     static let episodeNumber: CGFloat = 36
     static let indicator: CGFloat = 22
@@ -209,20 +209,63 @@ struct CompactLabelStyle: LabelStyle {
     }
 }
 
-/// Thin watched-progress bar under artwork and episode titles.
+/// Thin watched-progress bar under artwork and episode titles, or along the bottom of artwork.
 struct WatchedBar: View {
     let fraction: Double
+    var onArtwork = false
 
     var body: some View {
         GeometryReader { geo in
             ZStack(alignment: .leading) {
-                Capsule().fill(.fill.secondary)
+                if onArtwork {
+                    Capsule().fill(.white.opacity(0.35))
+                } else {
+                    Capsule().fill(.fill.secondary)
+                }
                 Capsule().fill(.red).frame(width: max(3, geo.size.width * min(max(fraction, 0), 1)))
             }
         }
-        .frame(height: 3)
+        .frame(height: onArtwork ? 4 : 3)
         .accessibilityLabel("Watched")
         .accessibilityValue("\(Int(min(max(fraction, 0), 1) * 100)) percent")
+    }
+}
+
+/// A started show or title on Home: a wide still with how far along, the name, then the episode and time left.
+struct ContinueCardLabel: View {
+    let imageURL: URL?
+    let title: String
+    let detail: String?
+    let progress: Double?
+    var isLoading = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Space.s) {
+            PosterImage(url: imageURL, title: title, cornerRadius: Radius.medium)
+                .frame(width: Metrics.wideCardWidth, height: Metrics.wideCardWidth * 9 / 16)
+                .overlay {
+                    if isLoading { ProgressView().accessibilityLabel("Loading") }
+                }
+                .overlay(alignment: .bottom) {
+                    if let progress, progress > 0.02 {
+                        WatchedBar(fraction: progress, onArtwork: true)
+                            .padding(Space.s)
+                    }
+                }
+            VStack(alignment: .leading, spacing: Space.xxs) {
+                Text(title)
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(1)
+                if let detail {
+                    Text(detail)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+        }
+        .frame(width: Metrics.wideCardWidth, alignment: .leading)
+        .contentShape(.rect)
     }
 }
 

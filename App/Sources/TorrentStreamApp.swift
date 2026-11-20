@@ -42,6 +42,12 @@ struct RootView: View {
             Tab("Home", systemImage: "house", value: AppTab.home) {
                 HomeView()
             }
+            Tab("Schedule", systemImage: "calendar", value: AppTab.schedule) {
+                ScheduleView()
+            }
+            Tab("Library", systemImage: "rectangle.stack", value: AppTab.library) {
+                LibraryView()
+            }
             Tab(value: AppTab.search, role: .search) {
                 SearchView()
             }

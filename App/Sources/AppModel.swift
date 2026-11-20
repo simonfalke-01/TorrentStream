@@ -47,33 +47,24 @@ struct UpNextItem {
     let title: String
     /// The episode's name, when known.
     let subtitle: String?
+    /// The episode's still.
+    var imageURL: URL? = nil
     let resolve: @MainActor () async -> PlaybackRequest?
 }
 
-enum PlayerEngine: String, CaseIterable, Identifiable {
-    case vlc, apple
-    var id: String { rawValue }
-    var title: String { self == .vlc ? "VLC" : "Apple" }
-    var detail: String {
-        self == .vlc ? "Plays almost any format, with audio and subtitle tracks" : "AirPlay and Picture in Picture, for MP4 and MOV"
-    }
-}
+enum AppTab: Hashable { case home, schedule, library, search }
 
-enum AppTab: Hashable { case home, search }
-
-/// Navigation destinations shared by the Home and Search stacks.
+/// Navigation destinations shared by every tab's stack.
 enum Route: Hashable {
     /// A title in My List, by info hash.
     case title(String)
     /// A show or movie from the catalog.
     case show(Show)
-    /// Every title in My List as a grid.
-    case myList
 
     var hash: String {
         switch self {
         case .title(let h): return h
-        case .show, .myList: return ""
+        case .show: return ""
         }
     }
 }
@@ -86,13 +77,17 @@ struct EpisodeGroup: Identifiable, Hashable {
 }
 
 enum SettingsKey {
-    static let playerEngine = "playerEngine"
     static let resumePlayback = "resumePlayback"
+    static let subtitleSize = "subtitleSize"
+    /// Audio and subtitle choices per show, by track label.
+    static let trackChoices = "trackChoices"
     static let autoPlayNext = "autoPlayNext"
     static let useDHT = "useDHT"
     static let publicTrackers = "usePublicTrackers"
     static let nyaaAddress = "nyaaAddress"
     static let recentSearches = "recentShowSearches"
+    /// Titles added by link before shows existed, still to be moved into their show.
+    static let linkAdoption = "linkAdoptionPending"
     /// Vertical resolution to prefer: 2160, 1080, 720 or 480.
     static let preferredResolution = "preferredResolution"
     /// English audio over Japanese.
@@ -127,6 +122,8 @@ final class AppModel: ObservableObject {
     @Published var toast: Toast?
     @Published var navigationPath: [Route] = []
     @Published var searchPath: [Route] = []
+    @Published var schedulePath: [Route] = []
+    @Published var listPath: [Route] = []
     @Published var selectedTab: AppTab = .home
     @Published private(set) var storageUsed: Int64 = 0
     /// Posters and synopses by `CatalogQuery.key`.
@@ -151,11 +148,6 @@ final class AppModel: ObservableObject {
         var paused: Bool?
         var addedAt: Date?
         var isSource: Bool?
-    }
-
-    var playerEngine: PlayerEngine {
-        guard VLCAvailability.isAvailable else { return .apple }
-        return PlayerEngine(rawValue: defaults.string(forKey: SettingsKey.playerEngine) ?? "") ?? .vlc
     }
 
     init() {
@@ -510,6 +502,7 @@ final class AppModel: ObservableObject {
         defaults.removeObject(forKey: watchedAtKey(hash))
         if let i = navigationPath.firstIndex(where: { $0.hash == hash }) { navigationPath.removeSubrange(i...) }
         if let i = searchPath.firstIndex(where: { $0.hash == hash }) { searchPath.removeSubrange(i...) }
+        if let i = listPath.firstIndex(where: { $0.hash == hash }) { listPath.removeSubrange(i...) }
         persist()
         refresh()
         refreshStorage()
@@ -523,7 +516,7 @@ final class AppModel: ObservableObject {
     /// Keeps cached video within budget by dropping the data of the titles watched longest ago, the most recent
     /// one last. Titles stay in My List with their episodes and positions; they stream again when played.
     func trimCache() {
-        guard playing.isEmpty, !BackgroundKeeper.shared.isActive else { return }
+        guard playing.isEmpty else { return }
         // Sources that were found but never played, beyond the most recent few, only take up slots.
         let sources = client.torrents.filter { sourceHashes.contains($0.infoHashHex) }
             .sorted { lastUse($0.infoHashHex) > lastUse($1.infoHashHex) }
@@ -567,6 +560,29 @@ final class AppModel: ObservableObject {
     }
 
     func watchedAt(_ hash: String) -> Date? { defaults.object(forKey: watchedAtKey(hash)) as? Date }
+
+    /// Index of the file played last from a title.
+    func lastPlayedIndex(_ hash: String) -> Int? {
+        defaults.object(forKey: lastPlayedKey(hash)) == nil ? nil : defaults.integer(forKey: lastPlayedKey(hash))
+    }
+
+    /// Where playback of a file stopped and how long it is, when it was played.
+    func storedProgress(torrent: Torrent, file: TorrentFile) -> (position: Double, duration: Double)? {
+        let k = "pos.\(key(torrent, file.index))"
+        let pos = defaults.double(forKey: k), dur = defaults.double(forKey: k + ".dur")
+        return pos > 0 ? (pos, dur) : nil
+    }
+
+    /// Turns a title added by link into an episode source: it leaves My List and plays from its show's page.
+    func makeSource(_ hash: String) {
+        guard client.torrent(infoHashHex: hash) != nil, !sourceHashes.contains(hash) else { return }
+        sourceHashes.insert(hash)
+        if let i = navigationPath.firstIndex(where: { $0 == .title(hash) }) { navigationPath.removeSubrange(i...) }
+        if let i = searchPath.firstIndex(where: { $0 == .title(hash) }) { searchPath.removeSubrange(i...) }
+        if let i = listPath.firstIndex(where: { $0 == .title(hash) }) { listPath.removeSubrange(i...) }
+        persist()
+        refresh()
+    }
 
     /// Deletes a title's data and adds it back with its file list, so nothing changes for the user.
     /// Episode sources are removed outright; they are found again when played.

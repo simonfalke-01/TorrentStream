@@ -66,7 +66,6 @@ struct EpisodeMenu: View {
 
         Section {
             Button(action: onPlay) { Label("Play", systemImage: "play") }
-            Button { openInVLC() } label: { Label("Open in VLC", systemImage: "arrow.up.forward.app") }
         }
         // A fully loaded video can be kept outside the app.
         if isComplete, let url = model.localURL(item.torrent, file) {
@@ -78,11 +77,6 @@ struct EpisodeMenu: View {
             }
         }
         Button { model.copyStreamLink(item.torrent, file) } label: { Label("Copy Stream Link", systemImage: "link") }
-    }
-
-    private func openInVLC() {
-        let request = model.playbackRequest(torrent: item.torrent, file: file)
-        ExternalPlayer.openInVLC(request) { model.errorMessage = $0 }
     }
 }
 

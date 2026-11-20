@@ -6,7 +6,7 @@ struct SettingsView: View {
     @EnvironmentObject var model: AppModel
     @EnvironmentObject var shows: ShowsModel
     @Environment(\.dismiss) private var dismiss
-    @AppStorage(SettingsKey.playerEngine) private var engine: String = PlayerEngine.vlc.rawValue
+    @AppStorage(SettingsKey.subtitleSize) private var subtitleSize = SubtitleSize.medium.rawValue
     @AppStorage(SettingsKey.resumePlayback) private var resumePlayback = true
     @AppStorage(SettingsKey.autoPlayNext) private var autoPlayNext = true
     @AppStorage(SettingsKey.showArtwork) private var showArtwork = true
@@ -18,24 +18,18 @@ struct SettingsView: View {
     @AppStorage(SettingsKey.preferDub) private var preferDub = false
     @State private var confirmClear = false
 
-    private var selectedEngine: PlayerEngine { PlayerEngine(rawValue: engine) ?? .vlc }
-
     var body: some View {
         NavigationStack {
             Form {
                 Section {
-                    if VLCAvailability.isAvailable {
-                        Picker("Player", selection: $engine) {
-                            ForEach(PlayerEngine.allCases) { e in Text(e.title).tag(e.rawValue) }
-                        }
-                        .pickerStyle(.menu)
-                    }
                     Toggle("Resume Where You Left Off", isOn: $resumePlayback)
                     Toggle("Autoplay Next Episode", isOn: $autoPlayNext)
+                    Picker("Subtitle Size", selection: $subtitleSize) {
+                        ForEach(SubtitleSize.allCases) { Text($0.title).tag($0.rawValue) }
+                    }
+                    .pickerStyle(.menu)
                 } header: {
                     Text("Playback")
-                } footer: {
-                    if VLCAvailability.isAvailable { Text(selectedEngine.detail + ".") }
                 }
 
                 Section {

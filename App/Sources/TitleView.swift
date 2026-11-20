@@ -9,7 +9,6 @@ extension View {
             switch route {
             case .title(let hash): TitleView(infoHash: hash)
             case .show(let show): ShowView(show: show)
-            case .myList: MyListView()
             }
         }
     }
@@ -140,20 +139,11 @@ struct TitleView: View {
             if let next = model.upNext(item) {
                 VStack(alignment: .leading, spacing: Space.s) {
                     Button { play(next.file, item: item) } label: {
-                        Label(playTitle(next, item: item, isSeries: isSeries), systemImage: "play.fill")
+                        Label(playTitle(next), systemImage: "play.fill")
                     }
                     .buttonStyle(PrimaryPlayButtonStyle())
 
-                    Button { openInVLC(next.file, item: item) } label: {
-                        Label("Open in VLC", systemImage: "arrow.up.forward.app")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.bordered)
-                    .buttonBorderShape(.capsule)
-                    .controlSize(.large)
-                    .font(.body.weight(.semibold))
-
-                    if let caption = resumeCaption(next, isSeries: isSeries) {
+                    if let caption = resumeCaption(next) {
                         Text(caption)
                             .font(.footnote)
                             .foregroundStyle(.secondary)
@@ -167,19 +157,18 @@ struct TitleView: View {
         }
     }
 
-    /// "Resume", "Play Episode 6" once the series has been started, or "Play".
-    private func playTitle(_ next: UpNext, item: LibraryItem, isSeries: Bool) -> String {
-        if next.resumeAt != nil { return "Resume" }
-        let list = model.playlist(item.status)
-        if isSeries, list.first != next.file, let label = model.episodeLabel(next.file) { return "Play \(label)" }
-        return "Play"
+    /// "Resume Episode 5", "Play Episode 6", or "Play" when the file isn't numbered.
+    private func playTitle(_ next: UpNext) -> String {
+        let verb = next.resumeAt != nil ? "Resume" : "Play"
+        return model.episodeLabel(next.file).map { "\(verb) \($0)" } ?? verb
     }
 
-    /// "Episode 5, 12 min left" under the buttons while resuming.
-    private func resumeCaption(_ next: UpNext, isSeries: Bool) -> String? {
-        guard let remaining = next.remaining, let left = Format.remaining(remaining) else { return nil }
-        guard isSeries else { return left }
-        return "\(model.episodeLabel(next.file) ?? next.file.title), \(left)"
+    /// The episode's name and the time left, under the Play button.
+    private func resumeCaption(_ next: UpNext) -> String? {
+        let name = model.episodeLabel(next.file) != nil ? model.release(next.file.fileName).episodeTitle : nil
+        let left = next.remaining.flatMap(Format.remaining)
+        let parts = [name, left].compactMap { $0 }.filter { !$0.isEmpty }
+        return parts.isEmpty ? nil : parts.joined(separator: ", ")
     }
 
     // MARK: about
@@ -249,11 +238,6 @@ struct TitleView: View {
 
     private func play(_ file: TorrentFile, item: LibraryItem) {
         playing = model.playbackRequest(torrent: item.torrent, file: file)
-    }
-
-    private func openInVLC(_ file: TorrentFile, item: LibraryItem) {
-        let req = model.playbackRequest(torrent: item.torrent, file: file)
-        ExternalPlayer.openInVLC(req) { model.errorMessage = $0 }
     }
 }
 

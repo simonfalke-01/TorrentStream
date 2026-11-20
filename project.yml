@@ -24,12 +24,14 @@ targets:
         product: CatalogKit
       - package: TorrentKit
         product: SourceKit
+      - package: TorrentKit
+        product: SubtitleKit
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.simonfalke.TorrentStream
         PRODUCT_NAME: TorrentStream
-        MARKETING_VERSION: "4.1"
-        CURRENT_PROJECT_VERSION: "9"
+        MARKETING_VERSION: "5.0"
+        CURRENT_PROJECT_VERSION: "10"
         TARGETED_DEVICE_FAMILY: "1,2"
         SWIFT_VERSION: "5.0"
         CODE_SIGN_STYLE: Automatic
@@ -52,7 +54,7 @@ targets:
           - UIInterfaceOrientationPortraitUpsideDown
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
-        # Keeps torrent + local stream server alive while audio plays / while VLC streams from us.
+        # Keeps the torrent and the local stream server alive while audio plays in the background.
         UIBackgroundModes:
           - audio
         # Plain-HTTP trackers and the 127.0.0.1 stream server.
@@ -61,9 +63,6 @@ targets:
           NSAllowsLocalNetworking: true
         NSLocalNetworkUsageDescription: TorrentStream connects to BitTorrent peers that may be on your local network.
         NSPhotoLibraryAddUsageDescription: TorrentStream saves downloaded videos to your photo library when you choose Save to Photos.
-        LSApplicationQueriesSchemes:
-          - vlc
-          - vlc-x-callback
         CFBundleURLTypes:
           - CFBundleURLName: Magnet link
             CFBundleURLSchemes:

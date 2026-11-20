@@ -736,6 +736,23 @@ public final class Torrent {
         return try s.read(offset: f.offset + offset, length: length)
     }
 
+    /// The bytes of a file range if every piece covering it is already downloaded and verified; nil otherwise.
+    /// Never prioritizes, registers readers, or blocks. The range is clamped to the file length, so a range
+    /// starting at or past the end yields empty data.
+    public func availableData(fileIndex: Int, offset: Int64, length: Int) -> Data? {
+        lock.lock()
+        guard let info = info, let storage = storage, fileIndex >= 0, fileIndex < info.files.count,
+              offset >= 0, length >= 0 else { lock.unlock(); return nil }
+        let file = info.files[fileIndex]
+        let count = Int(max(0, min(Int64(length), file.length - offset)))
+        guard count > 0 else { lock.unlock(); return Data() }
+        let start = file.offset + offset
+        let ready = info.pieces(from: start, to: start + Int64(count)).allSatisfy { have[$0] }
+        lock.unlock()
+        guard ready else { return nil }
+        return try? storage.read(offset: start, length: count)
+    }
+
     /// Local path of a file (complete or partial).
     public func localURL(fileIndex: Int) -> URL? {
         lock.lock(); defer { lock.unlock() }
