@@ -146,8 +146,8 @@ private struct PlayerChrome: View {
         GeometryReader { geo in
             let landscape = geo.size.width > geo.size.height
             ZStack {
-                video(geo.size)
-                gestureLayer(geo.size)
+                video
+                gestureLayer
 
                 if let flash = seekFlash {
                     SeekFlashView(flash: flash).transition(.opacity)
@@ -257,22 +257,28 @@ private struct PlayerChrome: View {
 
     // MARK: video
 
-    /// Fill crops the video to the screen; Fit shows all of it.
-    private func video(_ size: CGSize) -> some View {
-        let v = engine.videoSize
-        var zoom: CGFloat = 1
-        if fill, v.width > 0, v.height > 0, size.width > 0, size.height > 0 {
-            let fit = min(size.width / v.width, size.height / v.height)
-            let cover = max(size.width / v.width, size.height / v.height)
-            zoom = cover / fit
+    /// Fill crops the video to the screen; Fit shows all of it. Measured edge to edge, not within the safe area,
+    /// so the picture is centered on the physical screen.
+    private var video: some View {
+        GeometryReader { geo in
+            let size = geo.size
+            let zoom = fillZoom(screen: size)
+            VideoSurface(engine: engine)
+                .scaleEffect(zoom)
+                .frame(width: size.width, height: size.height)
+                .animation(Motion.role(Motion.standard, reduce: reduceMotion), value: zoom)
         }
-        return VideoSurface(engine: engine)
-            .scaleEffect(zoom)
-            .frame(width: size.width, height: size.height)
-            .clipped()
-            .ignoresSafeArea()
-            .animation(Motion.role(Motion.standard, reduce: reduceMotion), value: zoom)
-            .accessibilityHidden(true)
+        .ignoresSafeArea()
+        .clipped()
+        .accessibilityHidden(true)
+    }
+
+    private func fillZoom(screen size: CGSize) -> CGFloat {
+        let v = engine.videoSize
+        guard fill, v.width > 0, v.height > 0, size.width > 0, size.height > 0 else { return 1 }
+        let fit = min(size.width / v.width, size.height / v.height)
+        let cover = max(size.width / v.width, size.height / v.height)
+        return cover / fit
     }
 
     private var scrim: some View {
@@ -287,12 +293,20 @@ private struct PlayerChrome: View {
 
     // MARK: gestures
 
-    private func gestureLayer(_ size: CGSize) -> some View {
+    private var gestureLayer: some View {
+        GeometryReader { geo in
+            gestures(width: geo.size.width)
+        }
+        .ignoresSafeArea()
+        .accessibilityHidden(true)
+    }
+
+    private func gestures(width: CGFloat) -> some View {
         Color.clear
             .contentShape(.rect)
             .onTapGesture(count: 2) { location in
                 guard !engine.didFinish, !locked else { return }
-                doubleTapSeek(forward: location.x > size.width / 2)
+                doubleTapSeek(forward: location.x > width / 2)
             }
             .onTapGesture {
                 if locked {
@@ -311,8 +325,6 @@ private struct PlayerChrome: View {
                     if v.magnification > 1.08 { fill = true } else if v.magnification < 0.92 { fill = false }
                 }
             )
-            .ignoresSafeArea()
-            .accessibilityHidden(true)
     }
 
     /// Each double tap on the same side within a moment adds ten more seconds.
