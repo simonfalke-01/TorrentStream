@@ -201,6 +201,9 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
             config.delegateClass = ExternalSceneDelegate.self
             return config
         }
-        return connectingSceneSession.configuration
+        // A fresh configuration with no delegate class, so SwiftUI installs its own scene delegate. Returning
+        // `connectingSceneSession.configuration` crashes on iOS 27: it already names SwiftUI's AppSceneDelegate as
+        // the delegate class, so SwiftUI wraps its own delegate in itself and recurses until the stack overflows.
+        return UISceneConfiguration(name: nil, sessionRole: connectingSceneSession.role)
     }
 }
