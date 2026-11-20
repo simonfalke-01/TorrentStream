@@ -77,3 +77,24 @@ jobs:
         with:
           name: TorrentStream-simulator-app
           path: TorrentStream-simulator.zip
+      - name: Launch smoke test (simulator)
+        run: |
+          APP=build-sim/Build/Products/Debug-iphonesimulator/TorrentStream.app
+          for f in "$APP"/Frameworks/*.framework; do codesign --force -s - "$f"; done
+          codesign --force -s - "$APP"
+          UDID=$(xcrun simctl list devices available -j | python3 -c "import json,sys; d=json.load(sys.stdin)['devices']; print(next(x['udid'] for k,v in sorted(d.items(), reverse=True) if 'iOS' in k for x in v if x['name'].startswith('iPhone')))")
+          echo "device $UDID"
+          xcrun simctl boot "$UDID"
+          xcrun simctl bootstatus "$UDID" -b > /dev/null
+          xcrun simctl install "$UDID" "$APP"
+          BID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")
+          xcrun simctl launch "$UDID" "$BID"
+          sleep 30
+          if xcrun simctl spawn "$UDID" launchctl list | grep "UIKitApplication:$BID" | grep -qvE '^-'; then
+            echo "still running after 30 s"
+          else
+            echo "APP IS NOT RUNNING"
+            xcrun simctl spawn "$UDID" log show --last 2m --style compact --predicate 'process == "TorrentStream"' 2>/dev/null | tail -60
+            python3 .github/scripts/crash_report.py
+            exit 1
+          fi
