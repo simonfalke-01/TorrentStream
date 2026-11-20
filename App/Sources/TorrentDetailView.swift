@@ -14,7 +14,7 @@ struct TorrentDetailView: View {
             if let item = model.item(infoHash) {
                 content(item)
                     .toolbar {
-                        ToolbarItem(placement: .topBarTrailing) {
+                        ToolbarItem(placement: .primaryAction) {
                             Menu {
                                 TorrentActionsMenu(item: item, onRemove: { pendingRemoval = item })
                             } label: {
@@ -28,7 +28,7 @@ struct TorrentDetailView: View {
         }
         .navigationBarTitleDisplayMode(.inline)
         .fullScreenCover(item: $playing) { req in PlayerScreen(request: req) }
-        .sheet(item: $export) { e in DocumentExporter(urls: e.urls) { ok in if ok { model.showToast("Saved to Files") } }.ignoresSafeArea() }
+        .exportSheet($export)
         .removeTorrentDialog(item: $pendingRemoval, export: $export)
     }
 
@@ -47,42 +47,45 @@ struct TorrentDetailView: View {
             Section {
                 header(item)
                     .listRowBackground(Color.clear)
-                    .listRowInsets(EdgeInsets())
             }
 
             if status.phase == .fetchingMetadata {
                 Section {
-                    HStack(spacing: 14) {
+                    HStack(spacing: Space.m) {
                         ProgressView()
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Getting the file list from peers…").font(.subheadline)
-                            Text("\(status.connectedPeers) connected · \(status.knownPeers) found")
-                                .font(.caption).foregroundStyle(.secondary).monospacedDigit()
+                        VStack(alignment: .leading, spacing: Space.xxs) {
+                            Text("Fetching file list")
+                            Text(status.connectedPeers > 0
+                                 ? "Connected to \(Format.peers(status.connectedPeers))"
+                                 : "Looking for peers")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                                .monospacedDigit()
                         }
                     }
-                    .padding(.vertical, 6)
+                    .accessibilityElement(children: .combine)
                 }
             }
 
             if !media.isEmpty {
-                Section(media.count == 1 ? "Video" : "Videos & Audio") {
+                Section(sectionTitle(media)) {
                     ForEach(media) { fs in mediaRow(fs, item: item) }
                 }
             }
             if !subs.isEmpty {
                 Section {
-                    ForEach(subs) { fs in plainRow(fs, item: item) }
+                    ForEach(subs) { fs in fileRow(fs, item: item) }
                 } header: {
                     Text("Subtitles")
                 } footer: {
-                    Text("Loaded automatically when you play a video. Choose them from the player's subtitle menu.")
+                    Text("Available in the player’s subtitle menu.")
                 }
             }
             if !other.isEmpty {
                 Section("Other Files") {
-                    ForEach(showAllOther ? other : Array(other.prefix(4))) { fs in plainRow(fs, item: item) }
+                    ForEach(showAllOther ? other : Array(other.prefix(4))) { fs in fileRow(fs, item: item) }
                     if other.count > 4 && !showAllOther {
-                        Button("Show All \(other.count) Files") { withAnimation { showAllOther = true } }
+                        Button("Show All \(other.count)") { showAllOther = true }
                     }
                 }
             }
@@ -90,165 +93,161 @@ struct TorrentDetailView: View {
         .listStyle(.insetGrouped)
     }
 
+    private func sectionTitle(_ media: [FileStatus]) -> String {
+        let hasAudio = media.contains { $0.file.kind == .audio }
+        let hasVideo = media.contains { $0.file.kind == .video }
+        if hasAudio && hasVideo { return "Media" }
+        if hasAudio { return media.count == 1 ? "Audio" : "Tracks" }
+        return media.count == 1 ? "Video" : "Videos"
+    }
+
     private func header(_ item: LibraryItem) -> some View {
         let s = item.status
         let main = model.mainPlayable(s)
-        return VStack(spacing: 16) {
-            HStack(alignment: .top, spacing: 16) {
-                ArtworkView(hash: item.id, url: model.artworkURL(item), symbol: "film.stack", cornerRadius: 14)
-                    .frame(width: 96, height: 136)
-                    .shadow(color: .black.opacity(0.2), radius: 10, y: 6)
-                VStack(alignment: .leading, spacing: 8) {
-                    Text(s.name).font(.title3.weight(.bold)).lineLimit(4)
+        return VStack(alignment: .leading, spacing: Space.l) {
+            HStack(alignment: .top, spacing: Space.l) {
+                ArtworkView(url: model.artworkURL(item), symbol: "film", cornerRadius: Radius.medium)
+                    .frame(width: Metrics.headerArtwork.width, height: Metrics.headerArtwork.height)
+                VStack(alignment: .leading, spacing: Space.xs) {
+                    Text(s.name)
+                        .font(.title3.weight(.bold))
+                        .lineLimit(4)
+                        .accessibilityAddTraits(.isHeader)
                     if s.phase == .ready {
-                        Text(summary(s)).font(.subheadline).foregroundStyle(.secondary).monospacedDigit()
+                        Text(s.sizeText)
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                        if let activity = s.activityText {
+                            Text(activity)
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                                .monospacedDigit()
+                        }
                     }
-                    if case .failed(let msg) = s.phase {
-                        Label(msg, systemImage: "exclamationmark.triangle.fill").font(.caption).foregroundStyle(.red)
+                    if case .failed(let message) = s.phase {
+                        Label(message, systemImage: "exclamationmark.triangle.fill")
+                            .font(.subheadline)
+                            .foregroundStyle(.red)
                     }
                 }
-                Spacer(minLength: 0)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
 
-            if s.phase == .ready {
-                GlassEffectContainer(spacing: 10) {
-                    HStack(spacing: 10) {
-                        StatChip(systemImage: "person.2.fill", text: "\(s.connectedPeers)")
-                        StatChip(systemImage: "arrow.down", text: s.isPaused ? "Paused" : Format.rate(s.downloadRate))
-                        StatChip(systemImage: s.isComplete ? "checkmark.circle.fill" : "internaldrive",
-                                 text: s.isComplete ? "Complete" : "\(Int(s.progress * 100))%")
-                        Spacer(minLength: 0)
-                    }
-                }
+            if s.showsProgress {
+                ProgressView(value: s.progress)
+                    .tint(s.isPaused ? .secondary : .accentColor)
+                    .accessibilityLabel("Download progress")
+                    .accessibilityValue(Format.percent(s.progress))
             }
 
             if let main {
                 let resume = model.savedPosition(torrent: item.torrent, file: main.file)
-                GlassEffectContainer(spacing: 12) {
-                    HStack(spacing: 12) {
-                        Button { play(main.file, item: item) } label: {
-                            Label(resume != nil ? "Resume" : "Play", systemImage: "play.fill")
-                                .font(.headline)
-                                .frame(maxWidth: .infinity)
-                                .padding(.vertical, 6)
-                        }
-                        .buttonStyle(.glassProminent)
-                        Button { openInVLC(main.file, item: item) } label: {
-                            Label("VLC", systemImage: "arrow.up.forward.app")
-                                .font(.headline)
-                                .padding(.vertical, 6)
-                                .padding(.horizontal, 6)
-                        }
-                        .buttonStyle(.glass)
+                HStack(spacing: Space.m) {
+                    Button { play(main.file, item: item) } label: {
+                        Label(resume != nil ? "Resume" : "Play", systemImage: "play.fill")
+                            .frame(maxWidth: .infinity)
                     }
+                    .buttonStyle(.borderedProminent)
+                    Button { openInVLC(main.file, item: item) } label: {
+                        Label("VLC", systemImage: "arrow.up.forward.app")
+                    }
+                    .buttonStyle(.bordered)
+                    .accessibilityLabel("Open in VLC")
                 }
                 .controlSize(.large)
+                .font(.body.weight(.semibold))
             }
         }
-        .padding(.vertical, 8)
-    }
-
-    private func summary(_ s: TorrentStatus) -> String {
-        if s.isComplete { return "\(Format.bytes(s.totalLength)) · Downloaded" }
-        var parts = ["\(Format.bytes(s.downloadedBytes)) of \(Format.bytes(s.totalLength))"]
-        if s.hasActiveDownloads && !s.isPaused {
-            let remaining = s.files.filter { $0.isDownloading }.reduce(Int64(0)) { $0 + $1.file.length - $1.downloadedBytes }
-            if let eta = Format.eta(remaining: remaining, rate: s.downloadRate) { parts.append(eta) }
-        }
-        return parts.joined(separator: " · ")
+        .padding(.vertical, Space.s)
     }
 
     // MARK: rows
 
     private func mediaRow(_ fs: FileStatus, item: LibraryItem) -> some View {
         let watched = model.watchedFraction(torrent: item.torrent, file: fs.file)
-        return Button { play(fs.file, item: item) } label: {
-            HStack(spacing: 14) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 10, style: .continuous).fill(torrentTint(for: item.id).gradient)
-                    Image(systemName: fs.file.kind == .audio ? "music.note" : "play.fill")
-                        .font(.headline).foregroundStyle(.white)
-                }
-                .frame(width: 44, height: 44)
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(fs.file.fileName).font(.body).foregroundStyle(.primary).lineLimit(2)
-                    Text(fs.stateText).font(.caption).foregroundStyle(.secondary).monospacedDigit()
-                    if let watched {
-                        ProgressView(value: watched).tint(.orange).frame(maxWidth: 140)
+        return HStack(spacing: Space.s) {
+            Button { play(fs.file, item: item) } label: {
+                HStack(spacing: Space.m) {
+                    Image(systemName: fs.file.kind == .audio ? "music.note" : "play.rectangle")
+                        .font(.title3)
+                        .foregroundStyle(.tint)
+                        .frame(width: Metrics.rowIcon)
+                    VStack(alignment: .leading, spacing: Space.xs) {
+                        Text(fs.file.fileName)
+                            .foregroundStyle(.primary)
+                            .lineLimit(2)
+                        Text(fs.detailText)
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                        if let watched {
+                            ProgressView(value: watched)
+                                .tint(.secondary)
+                                .frame(maxWidth: Metrics.watchedBar)
+                        }
                     }
+                    Spacer(minLength: Space.s)
+                    FileStateIndicator(status: fs, paused: item.status.isPaused)
                 }
-                Spacer(minLength: 8)
-                FileStateIndicator(status: fs)
-                fileMenu(fs, item: item, playable: true)
+                .contentShape(.rect)
             }
-            .contentShape(Rectangle())
+            .buttonStyle(.plain)
+            .accessibilityLabel(fs.file.fileName)
+            .accessibilityValue(rowAccessibilityValue(fs, watched: watched))
+            .accessibilityHint("Plays the file")
+
+            rowMenu(fs, item: item, playable: true)
         }
-        .buttonStyle(.plain)
-        .contextMenu { fileMenuItems(fs, item: item, playable: true) }
+        .contextMenu {
+            FileActionsMenu(torrent: item.torrent, status: fs, export: $export, onPlay: { play(fs.file, item: item) })
+        }
     }
 
-    private func plainRow(_ fs: FileStatus, item: LibraryItem) -> some View {
-        HStack(spacing: 14) {
+    private func fileRow(_ fs: FileStatus, item: LibraryItem) -> some View {
+        HStack(spacing: Space.m) {
             Image(systemName: fs.file.kind.symbol)
-                .font(.title3).foregroundStyle(.secondary).frame(width: 44)
-            VStack(alignment: .leading, spacing: 4) {
+                .font(.title3)
+                .foregroundStyle(.secondary)
+                .frame(width: Metrics.rowIcon)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: Space.xs) {
                 Text(fs.file.fileName).lineLimit(2)
-                Text(fs.stateText).font(.caption).foregroundStyle(.secondary).monospacedDigit()
+                Text(fs.detailText)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
             }
-            Spacer(minLength: 8)
-            FileStateIndicator(status: fs)
-            fileMenu(fs, item: item, playable: false)
+            .accessibilityElement(children: .combine)
+            .accessibilityValue(fs.accessibilityState)
+            Spacer(minLength: Space.s)
+            FileStateIndicator(status: fs, paused: item.status.isPaused)
+            rowMenu(fs, item: item, playable: false)
         }
-        .contextMenu { fileMenuItems(fs, item: item, playable: false) }
+        .contextMenu {
+            FileActionsMenu(torrent: item.torrent, status: fs, export: $export)
+        }
     }
 
-    private func fileMenu(_ fs: FileStatus, item: LibraryItem, playable: Bool) -> some View {
+    private func rowMenu(_ fs: FileStatus, item: LibraryItem, playable: Bool) -> some View {
         Menu {
-            fileMenuItems(fs, item: item, playable: playable)
+            FileActionsMenu(torrent: item.torrent, status: fs, export: $export,
+                            onPlay: playable ? { play(fs.file, item: item) } : nil)
         } label: {
             Image(systemName: "ellipsis")
                 .font(.body.weight(.semibold))
-                .frame(width: 32, height: 32)
-                .contentShape(Rectangle())
+                .foregroundStyle(.secondary)
+                .frame(width: Metrics.touchTarget, height: Metrics.touchTarget)
+                .contentShape(.rect)
         }
-        .buttonStyle(.glass)
-        .buttonBorderShape(.circle)
+        .buttonStyle(.borderless)
         .accessibilityLabel("Actions for \(fs.file.fileName)")
     }
 
-    /// Actions depend on the file's state: finished files can be saved/shared, unfinished ones downloaded or stopped.
-    @ViewBuilder
-    private func fileMenuItems(_ fs: FileStatus, item: LibraryItem, playable: Bool) -> some View {
-        if playable {
-            Section {
-                Button { play(fs.file, item: item) } label: { Label("Play", systemImage: "play.fill") }
-                Button { openInVLC(fs.file, item: item) } label: { Label("Open in VLC", systemImage: "arrow.up.forward.app") }
-            }
-        }
-        if fs.isComplete, let url = model.localURL(item.torrent, fs.file) {
-            Section {
-                Button { export = ExportItem(urls: [url]) } label: { Label("Save to Files", systemImage: "folder") }
-                if PhotoSaver.canSave(fs.file) {
-                    Button { model.saveToPhotos(item.torrent, fs.file) } label: { Label("Save to Photos", systemImage: "photo.on.rectangle") }
-                }
-                ShareLink(item: url) { Label("Share", systemImage: "square.and.arrow.up") }
-            }
-        } else {
-            Section {
-                if fs.isDownloading {
-                    Button { model.stopDownloading(item.torrent, fileIndex: fs.file.index) } label: {
-                        Label("Stop Downloading", systemImage: "stop.circle")
-                    }
-                } else {
-                    Button { model.download(item.torrent, fileIndex: fs.file.index) } label: {
-                        Label("Download for Offline", systemImage: "arrow.down.circle")
-                    }
-                }
-            }
-        }
-        if playable {
-            Button { model.copyStreamLink(item.torrent, fs.file) } label: { Label("Copy Stream Link", systemImage: "link") }
-        }
+    private func rowAccessibilityValue(_ fs: FileStatus, watched: Double?) -> String {
+        var parts = [fs.detailText, fs.accessibilityState]
+        if let watched { parts.append("Watched \(Format.percent(watched))") }
+        return parts.joined(separator: ", ")
     }
 
     // MARK: actions
@@ -259,6 +258,6 @@ struct TorrentDetailView: View {
 
     private func openInVLC(_ file: TorrentFile, item: LibraryItem) {
         let req = model.playbackRequest(torrent: item.torrent, file: file)
-        ExternalPlayer.openInVLC(req) { error in model.errorMessage = error }
+        ExternalPlayer.openInVLC(req) { model.errorMessage = $0 }
     }
 }

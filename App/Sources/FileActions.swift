@@ -32,6 +32,80 @@ struct ExportItem: Identifiable {
     let urls: [URL]
 }
 
+extension View {
+    /// Presents the system "Save to Files" picker for `item` and confirms when it finishes.
+    func exportSheet(_ item: Binding<ExportItem?>) -> some View {
+        modifier(ExportSheet(item: item))
+    }
+}
+
+private struct ExportSheet: ViewModifier {
+    @EnvironmentObject var model: AppModel
+    @Binding var item: ExportItem?
+
+    func body(content: Content) -> some View {
+        content.sheet(item: $item) { e in
+            DocumentExporter(urls: e.urls) { ok in
+                if ok { model.showToast(e.urls.count == 1 ? "Saved to Files" : "Saved \(e.urls.count) files to Files", systemImage: "folder") }
+            }
+            .ignoresSafeArea()
+        }
+    }
+}
+
+/// Per-file actions shared by the torrent screen, Downloads, and the player.
+/// Finished files offer save and share; unfinished ones offer download or stop.
+struct FileActionsMenu: View {
+    @EnvironmentObject var model: AppModel
+    let torrent: Torrent
+    let status: FileStatus
+    @Binding var export: ExportItem?
+    /// Shows Play and Open in VLC when set.
+    var onPlay: (() -> Void)?
+    /// Inside the player the file is always being fetched, so only an explicit download can be stopped.
+    var inPlayer = false
+
+    private var file: TorrentFile { status.file }
+
+    var body: some View {
+        if let onPlay {
+            Section {
+                Button(action: onPlay) { Label("Play", systemImage: "play") }
+                Button { openInVLC() } label: { Label("Open in VLC", systemImage: "arrow.up.forward.app") }
+            }
+        }
+        if status.isComplete, let url = model.localURL(torrent, file) {
+            Section {
+                Button { export = ExportItem(urls: [url]) } label: { Label("Save to Files", systemImage: "folder") }
+                if PhotoSaver.canSave(file) {
+                    Button { model.saveToPhotos(torrent, file) } label: { Label("Save to Photos", systemImage: "photo") }
+                }
+                ShareLink(item: url) { Label("Share", systemImage: "square.and.arrow.up") }
+            }
+        } else {
+            Section {
+                if inPlayer ? model.isOfflineDownload(torrent, fileIndex: file.index) : status.isDownloading {
+                    Button { model.stopDownloading(torrent, fileIndex: file.index) } label: {
+                        Label("Stop Download", systemImage: "stop.circle")
+                    }
+                } else {
+                    Button { model.download(torrent, fileIndex: file.index) } label: {
+                        Label("Download", systemImage: "arrow.down.circle")
+                    }
+                }
+            }
+        }
+        if file.kind.isPlayable {
+            Button { model.copyStreamLink(torrent, file) } label: { Label("Copy Stream Link", systemImage: "link") }
+        }
+    }
+
+    private func openInVLC() {
+        let request = model.playbackRequest(torrent: torrent, file: file)
+        ExternalPlayer.openInVLC(request) { model.errorMessage = $0 }
+    }
+}
+
 enum PhotoSaver {
     enum SaveError: LocalizedError {
         case denied, incompatible

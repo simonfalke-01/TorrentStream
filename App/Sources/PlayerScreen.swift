@@ -471,6 +471,18 @@ private struct PlayerContainer: View {
 
 // MARK: - Glass controls
 
+/// Player-only geometry. Controls float over video, so they use Liquid Glass.
+private enum PlayerMetrics {
+    static let control: CGFloat = 44
+    static let skip: CGFloat = 60
+    static let play: CGFloat = 80
+    static let titleMaxWidth: CGFloat = 460
+    static let panelMaxWidth: CGFloat = 880
+    static let cardMaxWidth: CGFloat = 360
+    static let skipFlash: CGFloat = 80
+    static let skipFlashInset: CGFloat = 48
+}
+
 private struct PlayerChrome: View {
     let request: PlaybackRequest
     @ObservedObject var backend: PlayerBackend
@@ -481,6 +493,7 @@ private struct PlayerChrome: View {
 
     @EnvironmentObject private var model: AppModel
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var showControls = true
     @State private var showTracks = false
     @State private var scrub: Double?
@@ -505,7 +518,7 @@ private struct PlayerChrome: View {
             seekFlashView
 
             if backend.isBuffering && !showControls && backend.errorText == nil {
-                bufferingPill.transition(.opacity.combined(with: .scale(scale: 0.9)))
+                bufferingPill.transition(.opacity)
             }
 
             if showControls && backend.errorText == nil {
@@ -513,14 +526,14 @@ private struct PlayerChrome: View {
             }
 
             if backend.didFinish && backend.errorText == nil {
-                finishedOverlay.transition(.opacity.combined(with: .scale(scale: 0.95)))
+                finishedOverlay.transition(.opacity)
             }
 
             if let err = backend.errorText { errorPanel(err) }
         }
-        .animation(.easeInOut(duration: 0.25), value: showControls)
-        .animation(.spring(duration: 0.35), value: backend.didFinish)
-        .animation(.easeInOut(duration: 0.2), value: backend.isBuffering)
+        .animation(Motion.role(Motion.standard, reduce: reduceMotion), value: showControls)
+        .animation(Motion.role(Motion.standard, reduce: reduceMotion), value: backend.didFinish)
+        .animation(Motion.role(Motion.fast, reduce: reduceMotion), value: backend.isBuffering)
         .statusBarHidden(!showControls)
         .persistentSystemOverlays(.hidden)
         .onAppear {
@@ -538,12 +551,10 @@ private struct PlayerChrome: View {
             TracksSheet(backend: backend, request: request)
                 .presentationDetents([.medium, .large])
         }
-        .sheet(item: $export) { e in
-            DocumentExporter(urls: e.urls) { ok in if ok { model.showToast("Saved to Files") } }.ignoresSafeArea()
-        }
+        .exportSheet($export)
         .overlay(alignment: .top) {
             if let toast = model.toast {
-                ToastView(toast: toast).padding(.top, 8)
+                ToastView(toast: toast).padding(.top, Space.s)
             }
         }
     }
@@ -553,16 +564,18 @@ private struct PlayerChrome: View {
     private var gestureLayer: some View {
         GeometryReader { geo in
             Color.clear
-                .contentShape(Rectangle())
+                .contentShape(.rect)
                 .onTapGesture(count: 2) { location in
                     guard !backend.didFinish else { return }
                     let forward = location.x > geo.size.width / 2
                     backend.skip(by: forward ? 10 : -10)
-                    withAnimation(.spring(duration: 0.3)) { seekFlash = SeekFlash(forward: forward) }
-                    let flash = seekFlash
+                    let flash = SeekFlash(forward: forward)
+                    withAnimation(Motion.role(Motion.fast, reduce: reduceMotion)) { seekFlash = flash }
                     Task { @MainActor in
-                        try? await Task.sleep(for: .milliseconds(650))
-                        if seekFlash == flash { withAnimation(.easeOut) { seekFlash = nil } }
+                        try? await Task.sleep(for: .milliseconds(600))
+                        if seekFlash == flash {
+                            withAnimation(Motion.role(Motion.exit, reduce: reduceMotion)) { seekFlash = nil }
+                        }
                     }
                 }
                 .onTapGesture {
@@ -570,6 +583,7 @@ private struct PlayerChrome: View {
                 }
         }
         .ignoresSafeArea()
+        .accessibilityHidden(true)
     }
 
     @ViewBuilder
@@ -578,15 +592,16 @@ private struct PlayerChrome: View {
             HStack {
                 if flash.forward { Spacer() }
                 Image(systemName: flash.forward ? "goforward.10" : "gobackward.10")
-                    .font(.system(size: 30, weight: .semibold))
+                    .font(.title.weight(.semibold))
                     .foregroundStyle(.white)
-                    .frame(width: 84, height: 84)
+                    .frame(width: PlayerMetrics.skipFlash, height: PlayerMetrics.skipFlash)
                     .glassEffect(.clear, in: .circle)
-                    .padding(.horizontal, 48)
+                    .padding(.horizontal, PlayerMetrics.skipFlashInset)
                 if !flash.forward { Spacer() }
             }
-            .transition(.scale(scale: 0.7).combined(with: .opacity))
+            .transition(.opacity)
             .allowsHitTesting(false)
+            .accessibilityHidden(true)
         }
     }
 
@@ -594,7 +609,8 @@ private struct PlayerChrome: View {
 
     private var controls: some View {
         ZStack {
-            LinearGradient(colors: [.black.opacity(0.55), .clear, .clear, .black.opacity(0.6)],
+            // Scrim so glass and text stay legible over bright video.
+            LinearGradient(colors: [.black.opacity(0.5), .clear, .clear, .black.opacity(0.55)],
                            startPoint: .top, endPoint: .bottom)
                 .ignoresSafeArea()
                 .allowsHitTesting(false)
@@ -602,38 +618,46 @@ private struct PlayerChrome: View {
             VStack(spacing: 0) {
                 topBar
                 if showResumed, let at = request.resumeAt {
-                    resumedPill(at).padding(.top, 10).transition(.move(edge: .top).combined(with: .opacity))
+                    resumedPill(at)
+                        .padding(.top, Space.m)
+                        .transition(.opacity)
                 }
                 Spacer()
                 if !backend.didFinish { centerControls }
                 Spacer()
                 bottomPanel
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 8)
+            .padding(.horizontal, Space.l)
+            .padding(.vertical, Space.s)
         }
         .foregroundStyle(.white)
     }
 
     private var topBar: some View {
-        GlassEffectContainer(spacing: 12) {
-            HStack(spacing: 10) {
+        GlassEffectContainer(spacing: Space.m) {
+            HStack(spacing: Space.s) {
                 GlassIconButton(systemImage: "xmark", label: "Close") { dismiss() }
 
-                VStack(alignment: .leading, spacing: 2) {
+                VStack(alignment: .leading, spacing: Space.xxs) {
                     Text(request.file.fileName)
                         .font(.subheadline.weight(.semibold))
                         .lineLimit(1)
-                    statsLine
+                    if let text = streamText {
+                        Text(text)
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.white.opacity(0.8))
+                            .lineLimit(1)
+                    }
                 }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 7)
-                .frame(maxWidth: 460, alignment: .leading)
+                .padding(.horizontal, Space.l)
+                .padding(.vertical, Space.s)
+                .frame(maxWidth: PlayerMetrics.titleMaxWidth, alignment: .leading)
                 .glassEffect(.clear, in: .capsule)
+                .accessibilityElement(children: .combine)
 
                 Spacer(minLength: 0)
 
-                GlassIconButton(systemImage: "captions.bubble", label: "Audio & Subtitles") {
+                GlassIconButton(systemImage: "captions.bubble", label: "Audio and Subtitles") {
                     showTracks = true
                     hideTask?.cancel()
                 }
@@ -642,7 +666,7 @@ private struct PlayerChrome: View {
                 }
                 if backend.supportsAirPlay {
                     AirPlayButton()
-                        .frame(width: 44, height: 44)
+                        .frame(width: PlayerMetrics.control, height: PlayerMetrics.control)
                         .glassEffect(.clear.interactive(), in: .circle)
                         .accessibilityLabel("AirPlay")
                 }
@@ -651,70 +675,37 @@ private struct PlayerChrome: View {
         }
     }
 
-    @ViewBuilder
-    private var statsLine: some View {
-        Group {
-            if stats.isComplete {
-                Label("Downloaded · playing from device", systemImage: "checkmark.circle.fill")
-            } else if let s = stats.stream {
-                HStack(spacing: 10) {
-                    Label("\(s.connectedPeers)", systemImage: "person.2.fill")
-                    Label(Format.rate(s.downloadRate), systemImage: "arrow.down")
-                    Label(Format.bytes(s.bufferedAhead) + " ahead", systemImage: "forward.fill")
-                }
-            }
-        }
-        .labelStyle(CompactLabelStyle())
-        .font(.caption2.weight(.medium).monospacedDigit())
-        .foregroundStyle(.white.opacity(0.8))
-        .lineLimit(1)
+    /// Live state of the stream: where the bytes come from and how far ahead they are.
+    private var streamText: String? {
+        if stats.isComplete { return "Downloaded" }
+        guard let s = stats.stream else { return nil }
+        if s.connectedPeers == 0 { return "Waiting for peers" }
+        return "\(Format.rate(s.downloadRate)) from \(Format.peers(s.connectedPeers)), \(Format.bytes(s.bufferedAhead)) buffered"
     }
 
     private var moreMenu: some View {
         Menu {
-            Button {
-                backend.pause()
-                ExternalPlayer.openInVLC(request) { model.errorMessage = $0 }
-            } label: { Label("Open in VLC App", systemImage: "arrow.up.forward.app") }
-
-            #if canImport(MobileVLCKit)
-            Button {
-                onSwitchEngine(engine == .vlc ? .apple : .vlc)
-            } label: {
-                Label(engine == .vlc ? "Switch to Apple Player" : "Switch to VLC Engine",
-                      systemImage: "arrow.triangle.2.circlepath")
-            }
-            #endif
-
             Section {
-                if stats.isComplete, let url = model.localURL(request.torrent, request.file) {
-                    Button { export = ExportItem(urls: [url]) } label: { Label("Save to Files", systemImage: "folder") }
-                    if PhotoSaver.canSave(request.file) {
-                        Button { model.saveToPhotos(request.torrent, request.file) } label: {
-                            Label("Save to Photos", systemImage: "photo.on.rectangle")
-                        }
-                    }
-                    ShareLink(item: url) { Label("Share", systemImage: "square.and.arrow.up") }
-                } else if model.isOfflineDownload(request.torrent, fileIndex: request.file.index) {
-                    Label("Downloading \(Int((stats.file?.progress ?? 0) * 100))%", systemImage: "arrow.down.circle")
-                    Button(role: .destructive) {
-                        model.stopDownloading(request.torrent, fileIndex: request.file.index)
-                    } label: { Label("Stop Downloading", systemImage: "stop.circle") }
-                } else {
-                    Button {
-                        model.download(request.torrent, fileIndex: request.file.index)
-                    } label: { Label("Download for Offline", systemImage: "arrow.down.circle") }
+                Button {
+                    backend.pause()
+                    ExternalPlayer.openInVLC(request) { model.errorMessage = $0 }
+                } label: { Label("Open in VLC", systemImage: "arrow.up.forward.app") }
+                #if canImport(MobileVLCKit)
+                Button {
+                    onSwitchEngine(engine == .vlc ? .apple : .vlc)
+                } label: {
+                    Label(engine == .vlc ? "Use Apple Player" : "Use VLC Player", systemImage: "arrow.triangle.2.circlepath")
                 }
+                #endif
             }
-
-            Button { model.copyStreamLink(request.torrent, request.file) } label: {
-                Label("Copy Stream Link", systemImage: "link")
+            if let fs = stats.file {
+                FileActionsMenu(torrent: request.torrent, status: fs, export: $export, inPlayer: true)
             }
         } label: {
             Image(systemName: "ellipsis")
-                .font(.system(size: 17, weight: .semibold))
-                .frame(width: 44, height: 44)
-                .contentShape(Circle())
+                .font(.body.weight(.semibold))
+                .frame(width: PlayerMetrics.control, height: PlayerMetrics.control)
+                .contentShape(.circle)
         }
         .foregroundStyle(.white)
         .glassEffect(.clear.interactive(), in: .circle)
@@ -722,9 +713,10 @@ private struct PlayerChrome: View {
     }
 
     private var centerControls: some View {
-        GlassEffectContainer(spacing: 28) {
-            HStack(spacing: 28) {
-                GlassIconButton(systemImage: "gobackward.10", label: "Back 10 seconds", size: 60, font: .title2) {
+        GlassEffectContainer(spacing: Space.xl) {
+            HStack(spacing: Space.xl) {
+                GlassIconButton(systemImage: "gobackward.10", label: "Back 10 Seconds",
+                                size: PlayerMetrics.skip, font: .title2) {
                     backend.skip(by: -10); scheduleHide()
                 }
                 Button {
@@ -736,17 +728,18 @@ private struct PlayerChrome: View {
                             ProgressView().controlSize(.large).tint(.white)
                         } else {
                             Image(systemName: backend.isPlaying ? "pause.fill" : "play.fill")
-                                .font(.system(size: 34, weight: .semibold))
+                                .font(.largeTitle)
                                 .contentTransition(.symbolEffect(.replace))
                         }
                     }
-                    .frame(width: 84, height: 84)
-                    .contentShape(Circle())
+                    .frame(width: PlayerMetrics.play, height: PlayerMetrics.play)
+                    .contentShape(.circle)
                 }
                 .buttonStyle(.plain)
                 .glassEffect(.clear.interactive(), in: .circle)
                 .accessibilityLabel(backend.isPlaying ? "Pause" : "Play")
-                GlassIconButton(systemImage: "goforward.10", label: "Forward 10 seconds", size: 60, font: .title2) {
+                GlassIconButton(systemImage: "goforward.10", label: "Forward 10 Seconds",
+                                size: PlayerMetrics.skip, font: .title2) {
                     backend.skip(by: 10); scheduleHide()
                 }
             }
@@ -754,12 +747,13 @@ private struct PlayerChrome: View {
     }
 
     private var bottomPanel: some View {
-        VStack(spacing: 8) {
+        VStack(spacing: Space.s) {
             if let next = nextFile, backend.didFinish, !upNextDismissed {
-                upNextCard(next).frame(maxWidth: .infinity, alignment: .trailing)
-                    .transition(.move(edge: .trailing).combined(with: .opacity))
+                upNextCard(next)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+                    .transition(.opacity)
             }
-            VStack(spacing: 4) {
+            VStack(spacing: Space.xs) {
                 TorrentScrubber(progress: backend.duration > 0 ? backend.currentTime / backend.duration : 0,
                                 availability: stats.availability,
                                 duration: backend.duration,
@@ -770,112 +764,126 @@ private struct PlayerChrome: View {
                 .onChange(of: scrub != nil) { _, dragging in if dragging { hideTask?.cancel() } }
 
                 HStack {
-                    Text(Format.seconds(scrub.map { $0 * backend.duration } ?? backend.currentTime))
+                    Text(Format.seconds(displayedTime))
                     Spacer()
                     speedMenu
                     Spacer()
-                    Text("-" + Format.seconds(max(0, backend.duration - (scrub.map { $0 * backend.duration } ?? backend.currentTime))))
+                    Text("-" + Format.seconds(max(0, backend.duration - displayedTime)))
                 }
                 .font(.caption.weight(.medium).monospacedDigit())
                 .foregroundStyle(.white.opacity(0.9))
             }
-            .padding(.horizontal, 18)
-            .padding(.top, 6)
-            .padding(.bottom, 10)
-            .glassEffect(.clear, in: .rect(cornerRadius: 26))
+            .padding(.horizontal, Space.l)
+            .padding(.top, Space.xs)
+            .padding(.bottom, Space.m)
+            .glassEffect(.clear, in: .rect(cornerRadius: Radius.large))
         }
-        .frame(maxWidth: 900)
+        .frame(maxWidth: PlayerMetrics.panelMaxWidth)
     }
+
+    private var displayedTime: Double { scrub.map { $0 * backend.duration } ?? backend.currentTime }
 
     private var speedMenu: some View {
         Menu {
             Picker("Speed", selection: Binding(get: { backend.rate }, set: { backend.setRate($0) })) {
-                ForEach([Float(0.5), 0.75, 1, 1.25, 1.5, 2], id: \.self) { r in
-                    Text(String(format: "%g×", r)).tag(r)
-                }
+                ForEach(PlaybackSpeed.all, id: \.self) { r in Text(PlaybackSpeed.label(r)).tag(r) }
             }
         } label: {
-            Text(String(format: "%g×", backend.rate))
+            Text(PlaybackSpeed.label(backend.rate))
                 .font(.caption.weight(.semibold).monospacedDigit())
-                .padding(.horizontal, 10)
-                .padding(.vertical, 3)
-                .glassEffect(.clear.interactive(), in: .capsule)
+                .padding(.horizontal, Space.m)
+                .padding(.vertical, Space.xs)
+                .contentShape(.capsule)
         }
         .foregroundStyle(.white)
-        .accessibilityLabel("Playback speed")
+        .glassEffect(.clear.interactive(), in: .capsule)
+        .accessibilityLabel("Playback Speed")
+        .accessibilityValue(PlaybackSpeed.label(backend.rate))
     }
 
     private func resumedPill(_ at: Double) -> some View {
-        HStack(spacing: 12) {
-            Label("Resumed at \(Format.seconds(at))", systemImage: "clock.arrow.circlepath")
+        HStack(spacing: Space.m) {
+            Text("Resumed at \(Format.seconds(at))")
                 .font(.subheadline.weight(.medium))
+                .monospacedDigit()
             Button("Start Over") {
                 backend.seek(to: 0)
-                withAnimation { showResumed = false }
+                showResumed = false
             }
             .font(.subheadline.weight(.semibold))
             .buttonStyle(.glass)
         }
-        .padding(.leading, 16)
-        .padding(.trailing, 6)
-        .padding(.vertical, 6)
+        .padding(.leading, Space.l)
+        .padding(.trailing, Space.xs)
+        .padding(.vertical, Space.xs)
         .glassEffect(.regular, in: .capsule)
     }
 
     private var bufferingPill: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: Space.m) {
             ProgressView().tint(.white)
-            VStack(alignment: .leading, spacing: 1) {
-                Text("Buffering from peers…").font(.subheadline.weight(.semibold))
-                if let s = stats.stream {
-                    Text("\(s.connectedPeers) peers · \(Format.rate(s.downloadRate))")
+            VStack(alignment: .leading, spacing: Space.xxs) {
+                Text("Buffering").font(.subheadline.weight(.semibold))
+                if let s = stats.stream, s.connectedPeers > 0 {
+                    Text("\(Format.rate(s.downloadRate)) from \(Format.peers(s.connectedPeers))")
                         .font(.caption.monospacedDigit())
-                        .foregroundStyle(.white.opacity(0.75))
+                        .foregroundStyle(.white.opacity(0.8))
+                } else {
+                    Text("Waiting for peers")
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.8))
                 }
             }
         }
         .foregroundStyle(.white)
-        .padding(.horizontal, 18)
-        .padding(.vertical, 12)
+        .padding(.horizontal, Space.l)
+        .padding(.vertical, Space.m)
         .glassEffect(.clear, in: .capsule)
         .allowsHitTesting(false)
+        .accessibilityElement(children: .combine)
     }
 
     // MARK: end of playback
 
     private func upNextCard(_ next: TorrentFile) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("UP NEXT").font(.caption.weight(.bold)).foregroundStyle(.white.opacity(0.7))
-            Text(next.fileName).font(.headline).lineLimit(2)
-            HStack(spacing: 10) {
+        VStack(alignment: .leading, spacing: Space.m) {
+            VStack(alignment: .leading, spacing: Space.xxs) {
+                Text("Up Next")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.white.opacity(0.8))
+                Text(next.fileName)
+                    .font(.headline)
+                    .lineLimit(2)
+            }
+            HStack(spacing: Space.s) {
                 Button { playNext() } label: {
-                    Label(countdown.map { "Play in \($0)" } ?? "Play Now", systemImage: "play.fill")
-                        .contentTransition(.numericText(countsDown: true))
+                    Label(countdown.map { "Play in \($0)" } ?? "Play", systemImage: "play.fill")
+                        .monospacedDigit()
                 }
                 .buttonStyle(.glassProminent)
                 Button("Cancel") {
                     cancelCountdown()
-                    withAnimation { upNextDismissed = true }
+                    upNextDismissed = true
                 }
                 .buttonStyle(.glass)
             }
         }
-        .padding(18)
-        .frame(maxWidth: 360, alignment: .leading)
-        .glassEffect(.regular, in: .rect(cornerRadius: 26))
+        .padding(Space.l)
+        .frame(maxWidth: PlayerMetrics.cardMaxWidth, alignment: .leading)
+        .glassEffect(.regular, in: .rect(cornerRadius: Radius.large))
     }
 
     @ViewBuilder
     private var finishedOverlay: some View {
         if nextFile == nil || upNextDismissed {
-            GlassEffectContainer(spacing: 16) {
-                HStack(spacing: 16) {
+            GlassEffectContainer(spacing: Space.l) {
+                HStack(spacing: Space.l) {
                     Button { backend.replay(); scheduleHide() } label: {
-                        Label("Replay", systemImage: "arrow.counterclockwise").padding(.horizontal, 6)
+                        Label("Replay", systemImage: "arrow.counterclockwise")
                     }
                     .buttonStyle(.glass)
                     Button { dismiss() } label: {
-                        Label("Done", systemImage: "checkmark").padding(.horizontal, 6)
+                        Label("Done", systemImage: "checkmark")
                     }
                     .buttonStyle(.glassProminent)
                 }
@@ -895,7 +903,7 @@ private struct PlayerChrome: View {
             while let c = countdown, c > 0 {
                 try? await Task.sleep(for: .seconds(1))
                 if Task.isCancelled { return }
-                withAnimation { countdown = c - 1 }
+                countdown = c - 1
             }
             if !Task.isCancelled { playNext() }
         }
@@ -916,25 +924,44 @@ private struct PlayerChrome: View {
     // MARK: errors
 
     private func errorPanel(_ message: String) -> some View {
-        VStack(spacing: 14) {
-            Image(systemName: "exclamationmark.triangle.fill").font(.largeTitle).foregroundStyle(.yellow)
-            Text(message).multilineTextAlignment(.center)
-            #if canImport(MobileVLCKit)
-            if engine == .apple {
-                Button { onSwitchEngine(.vlc) } label: { Label("Play with VLC Engine", systemImage: "play.rectangle") }
-                    .buttonStyle(.glassProminent)
+        VStack(spacing: Space.l) {
+            VStack(spacing: Space.s) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.largeTitle)
+                    .foregroundStyle(.yellow)
+                    .accessibilityHidden(true)
+                Text("Can’t Play This File").font(.headline)
+                Text(message)
+                    .font(.subheadline)
+                    .foregroundStyle(.white.opacity(0.8))
+                    .multilineTextAlignment(.center)
             }
-            #endif
-            Button {
-                ExternalPlayer.openInVLC(request) { model.errorMessage = $0 }
-            } label: { Label("Open in VLC App", systemImage: "arrow.up.forward.app") }
+            VStack(spacing: Space.s) {
+                #if canImport(MobileVLCKit)
+                if engine == .apple {
+                    Button { onSwitchEngine(.vlc) } label: {
+                        Text("Use VLC Player").frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.glassProminent)
+                }
+                #endif
+                Button {
+                    ExternalPlayer.openInVLC(request) { model.errorMessage = $0 }
+                } label: {
+                    Text("Open in VLC").frame(maxWidth: .infinity)
+                }
                 .buttonStyle(.glass)
-            Button("Close") { dismiss() }.buttonStyle(.glass)
+                Button { dismiss() } label: {
+                    Text("Close").frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.glass)
+            }
+            .controlSize(.large)
         }
         .foregroundStyle(.white)
-        .padding(24)
-        .frame(maxWidth: 360)
-        .glassEffect(.regular, in: .rect(cornerRadius: 28))
+        .padding(Space.xl)
+        .frame(maxWidth: PlayerMetrics.cardMaxWidth)
+        .glassEffect(.regular, in: .rect(cornerRadius: Radius.large))
     }
 
     // MARK: visibility
@@ -957,16 +984,23 @@ private struct PlayerChrome: View {
         showResumed = true
         Task { @MainActor in
             try? await Task.sleep(for: .seconds(6))
-            withAnimation { showResumed = false }
+            withAnimation(Motion.role(Motion.exit, reduce: reduceMotion)) { showResumed = false }
         }
     }
 }
 
-struct GlassIconButton: View {
+/// Speeds offered by the player, and how they are labelled.
+enum PlaybackSpeed {
+    static let all: [Float] = [0.5, 0.75, 1, 1.25, 1.5, 2]
+    static func label(_ r: Float) -> String { String(format: "%g×", r) }
+}
+
+/// Circular Liquid Glass control used on top of video.
+private struct GlassIconButton: View {
     let systemImage: String
     let label: String
-    var size: CGFloat = 44
-    var font: Font = .system(size: 17, weight: .semibold)
+    var size: CGFloat = PlayerMetrics.control
+    var font: Font = .body.weight(.semibold)
     let action: () -> Void
 
     var body: some View {
@@ -974,7 +1008,7 @@ struct GlassIconButton: View {
             Image(systemName: systemImage)
                 .font(font)
                 .frame(width: size, height: size)
-                .contentShape(Circle())
+                .contentShape(.circle)
         }
         .buttonStyle(.plain)
         .foregroundStyle(.white)
@@ -983,29 +1017,33 @@ struct GlassIconButton: View {
     }
 }
 
-struct CompactLabelStyle: LabelStyle {
-    func makeBody(configuration: Configuration) -> some View {
-        HStack(spacing: 3) { configuration.icon; configuration.title }
-    }
-}
-
-/// Seek bar that also paints which parts of the file are already downloaded.
+/// Seek bar that also shows which parts of the file are already downloaded,
+/// so it's clear where seeking will play instantly.
 struct TorrentScrubber: View {
     let progress: Double
     let availability: [Double]
     let duration: Double
     @Binding var scrub: Double?
     let onCommit: (Double) -> Void
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private let height: CGFloat = 32
+    private let restingBar: CGFloat = 6
+    private let activeBar: CGFloat = 12
+    private let restingThumb: CGFloat = 14
+    private let activeThumb: CGFloat = 22
+    private let bubbleWidth: CGFloat = 56
+    private let bubbleLift: CGFloat = 32
 
     var body: some View {
         GeometryReader { geo in
             let width = max(geo.size.width, 1)
             let shown = min(max(scrub ?? progress, 0), 1)
-            let barHeight: CGFloat = scrub == nil ? 6 : 12
-            let thumb: CGFloat = scrub == nil ? 14 : 22
+            let barHeight = scrub == nil ? restingBar : activeBar
+            let thumb = scrub == nil ? restingThumb : activeThumb
 
             ZStack(alignment: .leading) {
-                Capsule().fill(.white.opacity(0.18))
+                Capsule().fill(.white.opacity(0.2))
                 Canvas { ctx, size in
                     guard !availability.isEmpty else { return }
                     let w = size.width / CGFloat(availability.count)
@@ -1014,7 +1052,7 @@ struct TorrentScrubber: View {
                         ctx.fill(Path(rect), with: .color(.white.opacity(0.2 + 0.25 * a)))
                     }
                 }
-                .clipShape(Capsule())
+                .clipShape(.capsule)
                 Capsule().fill(.white).frame(width: max(barHeight, width * shown))
             }
             .frame(height: barHeight)
@@ -1029,30 +1067,29 @@ struct TorrentScrubber: View {
                 if let s = scrub, duration > 0 {
                     Text(Format.seconds(s * duration))
                         .font(.caption.weight(.semibold).monospacedDigit())
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 5)
+                        .padding(.horizontal, Space.s)
+                        .padding(.vertical, Space.xs)
                         .glassEffect(.regular, in: .capsule)
                         .fixedSize()
-                        .offset(x: min(max(width * s - 28, 0), width - 56), y: -30)
+                        .offset(x: min(max(width * s - bubbleWidth / 2, 0), width - bubbleWidth), y: -bubbleLift)
                 }
             }
             .frame(maxHeight: .infinity)
-            .contentShape(Rectangle())
+            .contentShape(.rect)
             .gesture(
                 DragGesture(minimumDistance: 0)
                     .onChanged { v in scrub = min(max(v.location.x / width, 0), 1) }
                     .onEnded { v in
-                        let f = min(max(v.location.x / width, 0), 1)
-                        onCommit(f)
+                        onCommit(min(max(v.location.x / width, 0), 1))
                         scrub = nil
                     }
             )
-            .animation(.spring(duration: 0.25), value: scrub == nil)
+            .animation(Motion.role(Motion.fast, reduce: reduceMotion), value: scrub == nil)
         }
-        .frame(height: 30)
+        .frame(height: height)
         .accessibilityElement()
-        .accessibilityLabel("Playback position")
-        .accessibilityValue(Format.seconds(progress * duration))
+        .accessibilityLabel("Playback Position")
+        .accessibilityValue("\(Format.seconds(progress * duration)) of \(Format.seconds(duration))")
         .accessibilityAdjustableAction { direction in
             let step = duration > 0 ? 10 / duration : 0
             onCommit(min(max(progress + (direction == .increment ? step : -step), 0), 1))
@@ -1103,8 +1140,8 @@ struct TracksSheet: View {
                     Text("Subtitles")
                 } footer: {
                     Text(backend.supportsExternalSubtitles
-                         ? "Embedded subtitles (MKV/MP4) and subtitle files shipped in the torrent appear here automatically."
-                         : "The Apple player only shows subtitles embedded in MP4/MOV files. Switch to the VLC engine for .srt/.ass files and MKV.")
+                         ? "Embedded subtitles and subtitle files in the torrent appear here."
+                         : "The Apple player shows only subtitles embedded in MP4 and MOV files. Use the VLC player in Settings for SRT, ASS and MKV.")
                 }
                 if backend.supportsDelays {
                     Section("Sync") {
@@ -1120,8 +1157,8 @@ struct TracksSheet: View {
                 }
                 Section("Playback Speed") {
                     Picker("Speed", selection: Binding(get: { backend.rate }, set: { backend.setRate($0) })) {
-                        ForEach([Float(0.5), 0.75, 1, 1.25, 1.5, 2], id: \.self) { r in
-                            Text(String(format: "%g×", r)).tag(r)
+                        ForEach(PlaybackSpeed.all, id: \.self) { r in
+                            Text(PlaybackSpeed.label(r)).tag(r)
                         }
                     }
                     .pickerStyle(.segmented)
@@ -1131,7 +1168,7 @@ struct TracksSheet: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
-                    Button(role: .confirm) { dismiss() }
+                    Button("Done", role: .confirm) { dismiss() }
                 }
             }
             .fileImporter(isPresented: $importing, allowedContentTypes: [.item], allowsMultipleSelection: false) { result in

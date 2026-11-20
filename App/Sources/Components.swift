@@ -1,6 +1,51 @@
 import SwiftUI
 import TorrentKit
 
+// MARK: - Design tokens
+
+/// 4-point spacing scale. Views use these roles instead of literal paddings.
+enum Space {
+    static let xxs: CGFloat = 2
+    static let xs: CGFloat = 4
+    static let s: CGFloat = 8
+    static let m: CGFloat = 12
+    static let l: CGFloat = 16
+    static let xl: CGFloat = 24
+    static let xxl: CGFloat = 32
+}
+
+enum Radius {
+    /// Artwork thumbnails in rows.
+    static let small: CGFloat = 8
+    /// Artwork in headers.
+    static let medium: CGFloat = 12
+    /// Floating glass panels in the player.
+    static let large: CGFloat = 24
+}
+
+/// Named motion roles. Routine changes stay under 250 ms and never bounce.
+enum Motion {
+    static let fast = Animation.easeOut(duration: 0.12)
+    static let standard = Animation.timingCurve(0.2, 0, 0, 1, duration: 0.18)
+    static let enter = Animation.timingCurve(0.16, 1, 0.3, 1, duration: 0.22)
+    static let exit = Animation.timingCurve(0.4, 0, 1, 1, duration: 0.14)
+
+    /// `nil` when Reduce Motion is on, so state changes land immediately.
+    static func role(_ animation: Animation, reduce: Bool) -> Animation? { reduce ? nil : animation }
+}
+
+/// Fixed geometry shared by list rows.
+enum Metrics {
+    static let rowArtwork = CGSize(width: 48, height: 64)
+    static let headerArtwork = CGSize(width: 96, height: 128)
+    static let rowIcon: CGFloat = 28
+    static let indicator: CGFloat = 22
+    static let touchTarget: CGFloat = 44
+    static let watchedBar: CGFloat = 120
+}
+
+// MARK: - Formatting
+
 enum Format {
     static func bytes(_ v: Int64) -> String {
         ByteCountFormatter.string(fromByteCount: v, countStyle: .file)
@@ -18,12 +63,19 @@ enum Format {
         time(s.isFinite ? Int64(max(0, s) * 1000) : 0)
     }
 
+    static func percent(_ fraction: Double) -> String {
+        "\(Int((min(max(fraction, 0), 1) * 100).rounded(.down)))%"
+    }
+
+    static func peers(_ n: Int) -> String { n == 1 ? "1 peer" : "\(n) peers" }
+
+    /// "12 min left", or nil when the rate is too low to estimate.
     static func eta(remaining: Int64, rate: Double) -> String? {
         guard rate > 1024, remaining > 0 else { return nil }
         let f = DateComponentsFormatter()
         f.allowedUnits = [.hour, .minute, .second]
-        f.unitsStyle = .abbreviated
-        f.maximumUnitCount = 2
+        f.unitsStyle = .short
+        f.maximumUnitCount = 1
         return f.string(from: Double(remaining) / rate).map { "\($0) left" }
     }
 }
@@ -44,105 +96,133 @@ extension TorrentFile {
     var isImage: Bool { ["jpg", "jpeg", "png", "webp", "heic"].contains(fileExtension) }
 }
 
-/// Deterministic accent colour per torrent so placeholders are distinguishable.
-func torrentTint(for hash: String) -> Color {
-    let palette: [Color] = [.indigo, .purple, .pink, .orange, .teal, .blue, .mint, .cyan, .red]
-    let v = hash.unicodeScalars.reduce(0) { ($0 &* 31 &+ Int($1.value)) & 0xffff }
-    return palette[v % palette.count]
+// MARK: - Status vocabulary (the only place user-facing state strings are built)
+
+extension TorrentStatus {
+    private var activeRemaining: Int64 {
+        files.filter { $0.isDownloading && !$0.file.isPadding }
+            .reduce(Int64(0)) { $0 + $1.file.length - $1.downloadedBytes }
+    }
+
+    /// Whether a progress bar is meaningful for this torrent right now.
+    var showsProgress: Bool {
+        phase == .ready && !isComplete && downloadedBytes > 0 && (hasActiveDownloads || isPaused)
+    }
+
+    /// One line for library rows.
+    var summaryText: String {
+        switch phase {
+        case .fetchingMetadata: return connectedPeers > 0 ? "Fetching file list" : "Looking for peers"
+        case .failed(let message): return message
+        case .ready:
+            if isComplete { return "Downloaded" }
+            if isPaused { return "Paused at \(Format.percent(progress))" }
+            if hasActiveDownloads {
+                if connectedPeers == 0 { return "Waiting for peers" }
+                return Format.eta(remaining: activeRemaining, rate: downloadRate) ?? "Downloading"
+            }
+            return Format.bytes(totalLength)
+        }
+    }
+
+    /// Size line for the detail header.
+    var sizeText: String {
+        if isComplete || downloadedBytes == 0 { return Format.bytes(totalLength) }
+        return "\(Format.bytes(downloadedBytes)) of \(Format.bytes(totalLength))"
+    }
+
+    /// Live activity for the detail header, nil when idle.
+    var activityText: String? {
+        guard phase == .ready else { return nil }
+        if isComplete { return "Downloaded" }
+        if isPaused { return "Paused" }
+        guard hasActiveDownloads else { return nil }
+        if connectedPeers == 0 { return "Waiting for peers" }
+        let speed = "\(Format.rate(downloadRate)) from \(Format.peers(connectedPeers))"
+        if let eta = Format.eta(remaining: activeRemaining, rate: downloadRate) { return "\(speed), \(eta)" }
+        return speed
+    }
 }
 
-/// Poster art: an image shipped in the torrent (poster.jpg, cover.png, ...) or a tinted placeholder.
+extension FileStatus {
+    /// Secondary row text. Download state itself is shown by `FileStateIndicator`.
+    var detailText: String {
+        if isComplete || downloadedBytes == 0 { return Format.bytes(file.length) }
+        return "\(Format.bytes(downloadedBytes)) of \(Format.bytes(file.length))"
+    }
+
+    var accessibilityState: String {
+        if isComplete { return "Downloaded" }
+        if isDownloading { return "Downloading, \(Format.percent(progress))" }
+        if downloadedBytes > 0 { return "\(Format.percent(progress)) downloaded" }
+        return "Not downloaded"
+    }
+}
+
+// MARK: - Primitives
+
+/// Poster art shipped inside the torrent (poster.jpg, cover.png, ...), or a neutral placeholder.
 struct ArtworkView: View {
-    let hash: String
     let url: URL?
     let symbol: String
-    var cornerRadius: CGFloat = 12
+    var cornerRadius: CGFloat = Radius.small
 
     var body: some View {
-        let tint = torrentTint(for: hash)
         ZStack {
-            LinearGradient(colors: [tint.opacity(0.9), tint.opacity(0.45)], startPoint: .topLeading, endPoint: .bottomTrailing)
+            Rectangle().fill(.fill.tertiary)
             Image(systemName: symbol)
-                .font(.system(size: 28, weight: .semibold))
-                .foregroundStyle(.white.opacity(0.9))
+                .font(.title3)
+                .foregroundStyle(.secondary)
             if let url {
-                AsyncImage(url: url, transaction: Transaction(animation: .easeInOut)) { phase in
-                    if let image = phase.image {
-                        image.resizable().scaledToFill()
-                    }
+                AsyncImage(url: url) { phase in
+                    if let image = phase.image { image.resizable().scaledToFill() }
                 }
             }
         }
-        .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+        .clipShape(.rect(cornerRadius: cornerRadius, style: .continuous))
+        .accessibilityHidden(true)
     }
 }
 
 struct ProgressRing: View {
     let progress: Double
-    var lineWidth: CGFloat = 3
+    var lineWidth: CGFloat = 2.5
     var tint: Color = .accentColor
 
     var body: some View {
         ZStack {
-            Circle().stroke(tint.opacity(0.2), lineWidth: lineWidth)
+            Circle().stroke(.quaternary, lineWidth: lineWidth)
             Circle()
                 .trim(from: 0, to: max(0.02, min(progress, 1)))
                 .stroke(tint, style: StrokeStyle(lineWidth: lineWidth, lineCap: .round))
                 .rotationEffect(.degrees(-90))
-                .animation(.easeInOut(duration: 0.4), value: progress)
         }
     }
 }
 
-/// Small glass capsule with an icon and a value (peers, speed, ...).
-struct StatChip: View {
-    let systemImage: String
-    let text: String
-
-    var body: some View {
-        Label(text, systemImage: systemImage)
-            .font(.caption.weight(.medium).monospacedDigit())
-            .labelStyle(.titleAndIcon)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
-            .glassEffect(.regular, in: .capsule)
-    }
-}
-
-/// Download state of a single file, shown at the trailing edge of rows.
+/// Download state of a single file at the trailing edge of a row: a checkmark when finished,
+/// a ring while downloading, nothing otherwise.
 struct FileStateIndicator: View {
     let status: FileStatus
+    var paused = false
 
     var body: some View {
-        if status.isComplete {
-            Image(systemName: "checkmark.circle.fill")
-                .font(.title3)
-                .foregroundStyle(.green)
-                .accessibilityLabel("Downloaded")
-        } else if status.isDownloading {
-            ProgressRing(progress: status.progress)
-                .frame(width: 22, height: 22)
-                .accessibilityLabel("Downloading \(Int(status.progress * 100)) percent")
-        } else if status.downloadedBytes > 0 {
-            ProgressRing(progress: status.progress, tint: .secondary)
-                .frame(width: 22, height: 22)
-                .accessibilityLabel("Partially downloaded")
+        Group {
+            if status.isComplete {
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.title3)
+                    .foregroundStyle(.green)
+            } else if status.isDownloading {
+                ProgressRing(progress: status.progress, tint: paused ? .secondary : .accentColor)
+                    .padding(Space.xxs)
+            }
         }
+        .frame(width: Metrics.indicator, height: Metrics.indicator)
+        .accessibilityHidden(true)
     }
 }
 
-extension FileStatus {
-    /// Human readable state line, e.g. "1.2 GB · Downloaded".
-    var stateText: String {
-        let size = Format.bytes(file.length)
-        if isComplete { return "\(size) · Downloaded" }
-        if isDownloading { return "\(size) · Downloading \(Int(progress * 100))%" }
-        if downloadedBytes > 0 { return "\(size) · \(Int(progress * 100))% cached" }
-        return size
-    }
-}
-
-/// Transient confirmation message ("Saved to Photos").
+/// Transient confirmation ("Saved to Photos"). The result is also visible in place.
 struct Toast: Equatable, Identifiable {
     let id = UUID()
     let message: String
@@ -155,9 +235,10 @@ struct ToastView: View {
     var body: some View {
         Label(toast.message, systemImage: toast.systemImage)
             .font(.subheadline.weight(.semibold))
-            .padding(.horizontal, 18)
-            .padding(.vertical, 12)
+            .padding(.horizontal, Space.l)
+            .padding(.vertical, Space.m)
             .glassEffect(.regular, in: .capsule)
             .transition(.move(edge: .top).combined(with: .opacity))
+            .accessibilityAddTraits(.isStaticText)
     }
 }

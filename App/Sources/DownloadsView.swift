@@ -1,7 +1,7 @@
 import SwiftUI
 import TorrentKit
 
-/// Everything being downloaded for offline use, and everything that's ready to watch.
+/// Files being downloaded and files already on this device.
 struct DownloadsView: View {
     @EnvironmentObject var model: AppModel
     @State private var playing: PlaybackRequest?
@@ -11,6 +11,11 @@ struct DownloadsView: View {
         let item: LibraryItem
         let file: FileStatus
         var id: String { "\(item.id)#\(file.file.index)" }
+        /// The torrent name only adds information when it differs from the file name.
+        var source: String? {
+            let base = (file.file.fileName as NSString).deletingPathExtension
+            return item.status.name == file.file.fileName || item.status.name == base ? nil : item.status.name
+        }
     }
 
     private var downloading: [Entry] {
@@ -20,7 +25,7 @@ struct DownloadsView: View {
         }
     }
 
-    private var ready: [Entry] {
+    private var downloaded: [Entry] {
         model.items.flatMap { item in
             item.status.files.filter { $0.isComplete && $0.file.kind.isPlayable }
                 .map { Entry(item: item, file: $0) }
@@ -30,122 +35,135 @@ struct DownloadsView: View {
     var body: some View {
         NavigationStack {
             List {
-                Section {
-                    HStack(spacing: 14) {
-                        Image(systemName: "internaldrive.fill").font(.title2).foregroundStyle(.tint)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(Format.bytes(model.storageUsed)).font(.headline).monospacedDigit()
-                            Text("Used by TorrentStream on this device").font(.caption).foregroundStyle(.secondary)
-                        }
-                    }
-                    .padding(.vertical, 4)
-                }
-
                 if !downloading.isEmpty {
                     Section("Downloading") {
                         ForEach(downloading) { e in downloadingRow(e) }
                     }
                 }
-                if !ready.isEmpty {
-                    Section {
-                        ForEach(ready) { e in readyRow(e) }
-                    } header: {
-                        Text("Ready to Watch")
-                    } footer: {
-                        Text("Saved on this device. Use Save to Files to keep a copy after removing the torrent.")
+                if !downloaded.isEmpty {
+                    Section("Downloaded") {
+                        ForEach(downloaded) { e in downloadedRow(e) }
                     }
                 }
             }
             .listStyle(.insetGrouped)
             .overlay {
-                if downloading.isEmpty && ready.isEmpty {
+                if downloading.isEmpty && downloaded.isEmpty {
                     ContentUnavailableView {
                         Label("No Downloads", systemImage: "arrow.down.circle")
                     } description: {
-                        Text("Choose “Download for Offline” on any video to keep it on this device. Videos you stream keep downloading in the background too.")
+                        Text("Videos you download or stream appear here.")
                     }
                 }
             }
             .navigationTitle("Downloads")
-            .refreshable { model.refreshStorage() }
-            .onAppear { model.refreshStorage() }
             .fullScreenCover(item: $playing) { req in PlayerScreen(request: req) }
-            .sheet(item: $export) { e in DocumentExporter(urls: e.urls) { ok in if ok { model.showToast("Saved to Files") } }.ignoresSafeArea() }
+            .exportSheet($export)
         }
     }
 
     private func downloadingRow(_ e: Entry) -> some View {
         let s = e.item.status
-        return HStack(spacing: 14) {
-            ProgressRing(progress: e.file.progress, lineWidth: 4, tint: s.isPaused ? .secondary : .accentColor)
-                .frame(width: 36, height: 36)
-                .overlay {
-                    Image(systemName: s.isPaused ? "pause.fill" : "arrow.down")
-                        .font(.caption.bold())
-                        .foregroundStyle(s.isPaused ? Color.secondary : Color.accentColor)
+        return HStack(spacing: Space.s) {
+            Button { play(e) } label: {
+                HStack(spacing: Space.m) {
+                    ProgressRing(progress: e.file.progress, lineWidth: 3, tint: s.isPaused ? .secondary : .accentColor)
+                        .frame(width: Metrics.rowIcon, height: Metrics.rowIcon)
+                    VStack(alignment: .leading, spacing: Space.xs) {
+                        Text(e.file.file.fileName)
+                            .foregroundStyle(.primary)
+                            .lineLimit(2)
+                        Text(progressText(e))
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
+                    Spacer(minLength: Space.s)
                 }
-            VStack(alignment: .leading, spacing: 3) {
-                Text(e.file.file.fileName).lineLimit(1)
-                Text(rowDetail(e)).font(.caption).foregroundStyle(.secondary).monospacedDigit().lineLimit(1)
+                .contentShape(.rect)
             }
-            Spacer()
+            .buttonStyle(.plain)
+            .disabled(!e.file.file.kind.isPlayable)
+            .accessibilityValue(Format.percent(e.file.progress))
+
             Button { model.togglePause(e.item.torrent) } label: {
-                Image(systemName: s.isPaused ? "play.fill" : "pause.fill").frame(width: 28, height: 28)
+                Image(systemName: s.isPaused ? "play.fill" : "pause.fill")
+                    .frame(width: Metrics.touchTarget, height: Metrics.touchTarget)
+                    .contentShape(.rect)
             }
-            .buttonStyle(.glass)
-            .buttonBorderShape(.circle)
+            .buttonStyle(.borderless)
             .accessibilityLabel(s.isPaused ? "Resume" : "Pause")
         }
-        .contentShape(Rectangle())
-        .onTapGesture { if e.file.file.kind.isPlayable { playing = model.playbackRequest(torrent: e.item.torrent, file: e.file.file) } }
         .swipeActions {
             Button(role: .destructive) { model.stopDownloading(e.item.torrent, fileIndex: e.file.file.index) } label: {
-                Label("Stop", systemImage: "stop.fill")
+                Label("Stop Download", systemImage: "stop")
             }
+        }
+        .contextMenu {
+            FileActionsMenu(torrent: e.item.torrent, status: e.file, export: $export,
+                            onPlay: e.file.file.kind.isPlayable ? { play(e) } : nil)
         }
     }
 
-    private func rowDetail(_ e: Entry) -> String {
+    private func progressText(_ e: Entry) -> String {
         let s = e.item.status
-        var parts = ["\(Format.bytes(e.file.downloadedBytes)) of \(Format.bytes(e.file.file.length))"]
-        if s.isPaused { parts.append("Paused") }
-        else if let eta = Format.eta(remaining: e.file.file.length - e.file.downloadedBytes, rate: s.downloadRate) { parts.append(eta) }
-        else if s.connectedPeers == 0 { parts.append("Waiting for peers") }
-        return parts.joined(separator: " · ")
+        let amount = e.file.detailText
+        if s.isPaused { return "\(amount), paused" }
+        if s.connectedPeers == 0 { return "\(amount), waiting for peers" }
+        if let eta = Format.eta(remaining: e.file.file.length - e.file.downloadedBytes, rate: s.downloadRate) {
+            return "\(amount), \(eta)"
+        }
+        return amount
     }
 
-    private func readyRow(_ e: Entry) -> some View {
-        let url = model.localURL(e.item.torrent, e.file.file)
-        return HStack(spacing: 14) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 10, style: .continuous).fill(torrentTint(for: e.item.id).gradient)
-                Image(systemName: e.file.file.kind == .audio ? "music.note" : "play.fill").foregroundStyle(.white)
-            }
-            .frame(width: 44, height: 44)
-            VStack(alignment: .leading, spacing: 3) {
-                Text(e.file.file.fileName).lineLimit(2)
-                Text("\(Format.bytes(e.file.file.length)) · \(e.item.status.name)")
-                    .font(.caption).foregroundStyle(.secondary).lineLimit(1)
-            }
-            Spacer()
-            Menu {
-                Button { playing = model.playbackRequest(torrent: e.item.torrent, file: e.file.file) } label: { Label("Play", systemImage: "play.fill") }
-                if let url {
-                    Button { export = ExportItem(urls: [url]) } label: { Label("Save to Files", systemImage: "folder") }
-                    if PhotoSaver.canSave(e.file.file) {
-                        Button { model.saveToPhotos(e.item.torrent, e.file.file) } label: { Label("Save to Photos", systemImage: "photo.on.rectangle") }
+    private func downloadedRow(_ e: Entry) -> some View {
+        HStack(spacing: Space.s) {
+            Button { play(e) } label: {
+                HStack(spacing: Space.m) {
+                    Image(systemName: e.file.file.kind == .audio ? "music.note" : "play.rectangle")
+                        .font(.title3)
+                        .foregroundStyle(.tint)
+                        .frame(width: Metrics.rowIcon)
+                    VStack(alignment: .leading, spacing: Space.xs) {
+                        Text(e.file.file.fileName)
+                            .foregroundStyle(.primary)
+                            .lineLimit(2)
+                        if let source = e.source {
+                            Text(source)
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                        Text(Format.bytes(e.file.file.length))
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
                     }
-                    ShareLink(item: url) { Label("Share", systemImage: "square.and.arrow.up") }
+                    Spacer(minLength: Space.s)
                 }
-            } label: {
-                Image(systemName: "square.and.arrow.down").frame(width: 28, height: 28)
+                .contentShape(.rect)
             }
-            .buttonStyle(.glass)
-            .buttonBorderShape(.circle)
-            .accessibilityLabel("Save or share")
+            .buttonStyle(.plain)
+
+            Menu {
+                FileActionsMenu(torrent: e.item.torrent, status: e.file, export: $export, onPlay: { play(e) })
+            } label: {
+                Image(systemName: "ellipsis")
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: Metrics.touchTarget, height: Metrics.touchTarget)
+                    .contentShape(.rect)
+            }
+            .buttonStyle(.borderless)
+            .accessibilityLabel("Actions for \(e.file.file.fileName)")
         }
-        .contentShape(Rectangle())
-        .onTapGesture { playing = model.playbackRequest(torrent: e.item.torrent, file: e.file.file) }
+        .contextMenu {
+            FileActionsMenu(torrent: e.item.torrent, status: e.file, export: $export, onPlay: { play(e) })
+        }
+    }
+
+    private func play(_ e: Entry) {
+        playing = model.playbackRequest(torrent: e.item.torrent, file: e.file.file)
     }
 }
 
@@ -162,59 +180,58 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section {
-                    Picker("Player", selection: $engine) {
-                        ForEach(PlayerEngine.allCases) { e in
-                            VStack(alignment: .leading) {
-                                Text(e.title)
-                                Text(e.detail).font(.caption).foregroundStyle(.secondary)
+                Section("Playback") {
+                    if VLCAvailability.isAvailable {
+                        Picker("Player", selection: $engine) {
+                            ForEach(PlayerEngine.allCases) { e in
+                                VStack(alignment: .leading, spacing: Space.xxs) {
+                                    Text(e.title)
+                                    Text(e.detail)
+                                        .font(.subheadline)
+                                        .foregroundStyle(.secondary)
+                                }
+                                .tag(e.rawValue)
                             }
-                            .tag(e.rawValue)
                         }
+                        .pickerStyle(.inline)
                     }
-                    .pickerStyle(.inline)
-                    .disabled(!VLCAvailability.isAvailable)
-                    Toggle("Resume Where You Left Off", isOn: $resumePlayback)
-                    Toggle("Play Next Episode Automatically", isOn: $autoPlayNext)
-                } header: {
-                    Text("Playback")
-                } footer: {
-                    Text("VLC plays MKV, AVI, WebM, HEVC and more, with audio track and subtitle selection.")
+                    Toggle("Resume Playback", isOn: $resumePlayback)
+                    Toggle("Autoplay Next Episode", isOn: $autoPlayNext)
                 }
 
                 Section {
                     Toggle("Keep Downloading After Playback", isOn: $keepDownloading)
                 } footer: {
-                    Text("When on, a video you start streaming keeps downloading in the background so it's ready offline. When off, only what you watch is downloaded, unless you choose “Download for Offline”.")
+                    Text("Videos you start keep downloading after you close the player, so they’re ready to watch offline.")
                 }
 
                 Section {
-                    Toggle("DHT (Trackerless Peers)", isOn: $useDHT)
-                    Toggle("Add Public Trackers", isOn: $publicTrackers)
+                    Toggle("DHT", isOn: $useDHT)
+                    Toggle("Public Trackers", isOn: $publicTrackers)
                 } header: {
-                    Text("Network")
+                    Text("Peer Discovery")
                 } footer: {
-                    Text("Helps magnet links find peers faster. Changes apply the next time the app launches.")
+                    Text("Changes take effect the next time TorrentStream opens.")
                 }
 
                 Section("Storage") {
                     LabeledContent("Downloaded Data", value: Format.bytes(model.storageUsed))
-                    Button("Remove All Torrents and Data", role: .destructive) { confirmClear = true }
+                        .monospacedDigit()
+                    Button("Remove All Torrents…", role: .destructive) { confirmClear = true }
                         .disabled(model.items.isEmpty)
                 }
 
-                Section("About") {
-                    LabeledContent("Version", value: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0")
-                    LabeledContent("Engine", value: "TorrentKit")
-                    LabeledContent("Player", value: VLCAvailability.isAvailable ? "VLC + AVPlayer" : "AVPlayer")
+                Section {
+                    LabeledContent("Version", value: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "")
                 }
             }
             .navigationTitle("Settings")
             .onAppear { model.refreshStorage() }
             .confirmationDialog("Remove all torrents?", isPresented: $confirmClear, titleVisibility: .visible) {
-                Button("Remove All and Delete Data", role: .destructive) { model.removeAll() }
+                Button("Remove All and Delete Files", role: .destructive) { model.removeAll() }
+                Button("Cancel", role: .cancel) {}
             } message: {
-                Text("This deletes every torrent and all downloaded files from this device. Save anything you want to keep to Files first.")
+                Text("Every torrent and downloaded file will be deleted from this iPhone.")
             }
         }
     }

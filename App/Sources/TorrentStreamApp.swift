@@ -31,14 +31,14 @@ struct RootView: View {
 
     var body: some View {
         TabView(selection: $model.selectedTab) {
-            Tab("Library", systemImage: "play.square.stack.fill", value: AppTab.library) {
+            Tab("Library", systemImage: "play.square.stack", value: AppTab.library) {
                 LibraryView()
             }
-            Tab("Downloads", systemImage: "arrow.down.circle.fill", value: AppTab.downloads) {
+            Tab("Downloads", systemImage: "arrow.down.circle", value: AppTab.downloads) {
                 DownloadsView()
             }
             .badge(model.activeDownloadCount)
-            Tab("Settings", systemImage: "gearshape.fill", value: AppTab.settings) {
+            Tab("Settings", systemImage: "gear", value: AppTab.settings) {
                 SettingsView()
             }
         }
@@ -46,15 +46,13 @@ struct RootView: View {
         .overlay(alignment: .top) {
             if let toast = model.toast {
                 ToastView(toast: toast)
-                    .padding(.top, 8)
+                    .padding(.top, Space.s)
                     .allowsHitTesting(false)
             }
         }
-        .sensoryFeedback(.success, trigger: model.toast)
-        .alert("Something went wrong", isPresented: Binding(get: { model.errorMessage != nil }, set: { if !$0 { model.errorMessage = nil } })) {
+        .sensoryFeedback(.success, trigger: model.toast) { _, new in new != nil }
+        .alert(model.errorMessage ?? "", isPresented: Binding(get: { model.errorMessage != nil }, set: { if !$0 { model.errorMessage = nil } })) {
             Button("OK", role: .cancel) {}
-        } message: {
-            Text(model.errorMessage ?? "")
         }
     }
 }

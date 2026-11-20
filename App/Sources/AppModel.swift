@@ -32,7 +32,7 @@ enum PlayerEngine: String, CaseIterable, Identifiable {
     var id: String { rawValue }
     var title: String { self == .vlc ? "VLC" : "Apple" }
     var detail: String {
-        self == .vlc ? "Every format · audio tracks · subtitles" : "MP4/MOV · AirPlay · Picture in Picture"
+        self == .vlc ? "Plays almost any format, with audio and subtitle tracks" : "AirPlay and Picture in Picture, for MP4 and MOV"
     }
 }
 
@@ -117,11 +117,11 @@ final class AppModel: ObservableObject {
 
     func showToast(_ message: String, systemImage: String = "checkmark.circle.fill") {
         toastTask?.cancel()
-        withAnimation(.spring(duration: 0.35)) { toast = Toast(message: message, systemImage: systemImage) }
+        withAnimation(Motion.enter) { toast = Toast(message: message, systemImage: systemImage) }
         toastTask = Task { @MainActor in
-            try? await Task.sleep(for: .seconds(2.2))
+            try? await Task.sleep(for: .seconds(2.5))
             guard !Task.isCancelled else { return }
-            withAnimation(.easeOut(duration: 0.3)) { self.toast = nil }
+            withAnimation(Motion.exit) { self.toast = nil }
         }
     }
 
@@ -207,7 +207,7 @@ final class AppModel: ObservableObject {
         explicitDownloads.insert(key(torrent, fileIndex))
         persist()
         refresh()
-        showToast("Downloading for offline", systemImage: "arrow.down.circle.fill")
+        showToast("Download started", systemImage: "arrow.down.circle")
     }
 
     func stopDownloading(_ torrent: Torrent, fileIndex: Int) {
@@ -225,7 +225,7 @@ final class AppModel: ObservableObject {
         }
         persist()
         refresh()
-        showToast("Downloading everything", systemImage: "arrow.down.circle.fill")
+        showToast("Downloading all files", systemImage: "arrow.down.circle")
     }
 
     func stopAllDownloads(_ torrent: Torrent) {
