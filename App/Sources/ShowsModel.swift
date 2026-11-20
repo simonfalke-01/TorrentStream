@@ -140,7 +140,7 @@ final class ShowsModel: ObservableObject {
         restore()
     }
 
-    static func key(_ show: Int, _ season: Int, _ episode: Int) -> String { "\(show).\(season).\(episode)" }
+    nonisolated static func key(_ show: Int, _ season: Int, _ episode: Int) -> String { "\(show).\(season).\(episode)" }
 
     func rootID(_ show: Show) -> Int { roots[show.id] ?? show.id }
 
