@@ -1,49 +1,60 @@
 import SwiftUI
 import AVFoundation
 import MediaPlayer
-import MobileVLCKit
+import VLCKit
 import SubtitleKit
 
 /// An audio or subtitle track as libVLC lists it, with a name fit to show.
 struct MediaTrack: Identifiable, Hashable {
-    let id: Int
+    static let offID = "off"
+    static let off = MediaTrack(id: offID, raw: "", language: nil)
+
+    let id: String
     /// "English", "Signs & Songs", "Off".
     let title: String
     /// The language when the title names something else, e.g. "English" under "Signs & Songs".
     let detail: String?
     /// libVLC's own name, which choices are remembered by.
     let raw: String
+    let language: String?
 
     /// libVLC names tracks "Track 1 - [Japanese]" or "Full Subtitles - [English]".
-    init(id: Int, raw: String) {
+    init(id: String, raw: String, language: String?) {
         self.id = id
         self.raw = raw
-        if id == -1 {
+        self.language = language
+        if id == Self.offID {
             title = "Off"
             detail = nil
             return
         }
         var name = raw
-        var language: String?
+        var label: String?
         if let open = raw.range(of: " - [", options: .backwards), raw.hasSuffix("]") {
             name = String(raw[..<open.lowerBound]).trimmingCharacters(in: .whitespaces)
-            language = String(raw[open.upperBound..<raw.index(before: raw.endIndex)])
+            label = String(raw[open.upperBound..<raw.index(before: raw.endIndex)])
         } else if raw.hasPrefix("["), raw.hasSuffix("]") {
             name = ""
-            language = String(raw.dropFirst().dropLast())
+            label = String(raw.dropFirst().dropLast())
+        }
+        if label == nil, let code = language, !code.isEmpty, code != "und" {
+            label = Locale.current.localizedString(forLanguageCode: code)
         }
         let generic = name.isEmpty || name.range(of: #"^Track \d+$"#, options: .regularExpression) != nil
-        if generic, let language {
-            title = language
+        if generic, let label {
+            title = label
             detail = nil
         } else {
-            title = name.isEmpty ? raw : name
-            detail = language.flatMap { $0.caseInsensitiveCompare(name) == .orderedSame ? nil : $0 }
+            title = name.isEmpty ? (raw.isEmpty ? "Track" : raw) : name
+            detail = label.flatMap { $0.caseInsensitiveCompare(name) == .orderedSame ? nil : $0 }
         }
     }
 
     var isSignsOnly: Bool { SubtitleLabels.isSignsOnly(name: raw) }
-    var isEnglish: Bool { raw.range(of: #"english|\beng\b|\ben\b"#, options: [.regularExpression, .caseInsensitive]) != nil }
+    var isEnglish: Bool {
+        if let l = language?.lowercased(), ["en", "eng"].contains(l) || l.hasPrefix("en-") { return true }
+        return raw.range(of: #"english|\beng\b|\ben\b"#, options: [.regularExpression, .caseInsensitive]) != nil
+    }
 }
 
 /// A chapter of the video, in seconds.
@@ -68,7 +79,8 @@ enum SubtitleSize: Int, CaseIterable, Identifiable {
     }
 }
 
-/// libVLC behind a small observable surface: time, state, tracks, chapters and the video's size.
+/// libVLC behind a small observable surface: time, state, tracks, chapters, the video's size, Picture in
+/// Picture and a connected TV.
 @MainActor
 final class PlaybackEngine: ObservableObject {
     @Published private(set) var isPlaying = false
@@ -79,19 +91,26 @@ final class PlaybackEngine: ObservableObject {
     @Published private(set) var errorText: String?
     @Published private(set) var audioTracks: [MediaTrack] = []
     @Published private(set) var subtitleTracks: [MediaTrack] = []
-    @Published private(set) var currentAudio = -1
-    @Published private(set) var currentSubtitle = -1
+    @Published private(set) var currentAudio = ""
+    @Published private(set) var currentSubtitle = MediaTrack.offID
     @Published private(set) var chapters: [Chapter] = []
     @Published private(set) var subtitleDelay: Double = 0
     @Published private(set) var audioDelay: Double = 0
     @Published private(set) var rate: Float = 1
     @Published private(set) var videoSize: CGSize = .zero
+    @Published private(set) var canPictureInPicture = false
+    @Published private(set) var isPictureInPicture = false
+    /// The video is showing on a TV rather than the phone.
+    @Published private(set) var isOnTV = false
 
-    let surface = UIView()
+    let output: VideoOutput
     private let player: VLCMediaPlayer
+    private let url: URL
+    private let subtitleFiles: [URL]
     private let memoryKey: String
     private let preferDub: Bool
     private var timer: Timer?
+    private var ticks = 0
     private var lastTime: Int32 = -1
     private var lastChange = Date()
     private var seekTarget: Double?
@@ -99,30 +118,48 @@ final class PlaybackEngine: ObservableObject {
     private var tracksSettled = false
     private var chaptersLoaded = false
     private var startedAt = Date()
+    private var hasPlayed = false
+    /// Between asking libVLC to start again and it doing so, a stopped state isn't the end of the video.
+    private var restarting = false
 
     /// - Parameter memoryKey: what audio and subtitle choices are remembered under, usually the show.
     init(request: PlaybackRequest, memoryKey: String) {
         let size = UserDefaults.standard.integer(forKey: SettingsKey.subtitleSize)
         let scale = SubtitleSize(rawValue: size)?.rawValue ?? SubtitleSize.medium.rawValue
         player = VLCMediaPlayer(options: ["--sub-text-scale=\(scale)"])
+        output = VideoOutput(player: player)
+        url = request.url
+        subtitleFiles = request.subtitles.prefix(8).map(\.url)
         self.memoryKey = memoryKey
         preferDub = UserDefaults.standard.bool(forKey: SettingsKey.preferDub)
-        surface.backgroundColor = .black
-        surface.isUserInteractionEnabled = false
 
-        let media = VLCMedia(url: request.url)
+        player.drawable = output
+        load(from: request.resumeAt)
+        if let r = request.resumeAt, r > 0 { currentTime = r }
+
+        output.onPiPReady = { [weak self] in
+            MainActor.assumeIsolated { self?.canPictureInPicture = true }
+        }
+        output.onPiPChange = { [weak self] active in
+            MainActor.assumeIsolated { self?.isPictureInPicture = active }
+        }
+    }
+
+    private func load(from start: Double?) {
+        guard let media = VLCMedia(url: url) else {
+            errorText = "This video couldn’t be opened."
+            return
+        }
         // Generous network cache: the torrent may deliver in bursts.
         media.addOption(":network-caching=4000")
         media.addOption(":http-reconnect")
         media.addOption(preferDub ? ":audio-language=eng,en,jpn,ja" : ":audio-language=jpn,ja,eng,en")
         if !preferDub { media.addOption(":sub-language=eng,en,English") }
-        if let r = request.resumeAt, r > 0 { media.addOption(":start-time=\(Int(r))") }
+        if let start, start > 0 { media.addOption(":start-time=\(Int(start))") }
         player.media = media
-        player.drawable = surface
-        for s in request.subtitles.prefix(8) {
-            player.addPlaybackSlave(s.url, type: .subtitle, enforce: false)
+        for s in subtitleFiles {
+            player.addPlaybackSlave(s, type: .subtitle, enforce: false)
         }
-        if let r = request.resumeAt, r > 0 { currentTime = r }
     }
 
     // MARK: lifecycle
@@ -141,35 +178,53 @@ final class PlaybackEngine: ObservableObject {
     func shutdown() {
         timer?.invalidate()
         timer = nil
+        if isPictureInPicture { output.stopPictureInPicture() }
+        if isOnTV { showOnTV(false) }
         let p = player
         DispatchQueue.global(qos: .userInitiated).async { p.stop() }
     }
 
     private func poll() {
+        ticks += 1
         let state = player.state
         let t = player.time.intValue
         if t != lastTime { lastTime = t; lastChange = Date() }
         let idle = Date().timeIntervalSince(lastChange)
 
-        if state == .ended {
-            if !didFinish { didFinish = true }
+        if state == .playing { hasPlayed = true; restarting = false }
+        if state == .error {
+            if errorText == nil { errorText = "This video couldn’t be played." }
+            isBuffering = false
+            return
+        }
+        if (state == .stopped || state == .stopping) && hasPlayed && !restarting {
+            if !didFinish {
+                didFinish = true
+                output.invalidatePlaybackState()
+            }
             isPlaying = false
             isBuffering = false
             if duration > 0 { currentTime = duration }
             return
         }
-        if state == .error {
-            errorText = "This video couldn’t be played."
-            isBuffering = false
-            return
+
+        let playing = player.isPlaying
+        if playing != isPlaying {
+            isPlaying = playing
+            output.invalidatePlaybackState()
         }
-        isPlaying = player.isPlaying
         isBuffering = state == .opening
-            || (state == .buffering && idle > 0.75)
-            || (player.isPlaying && idle > 1.5)
+            || (!hasPlayed && state == .nothingSpecial)
+            || (playing && idle > 1.25)
 
         let len = player.media?.length.intValue ?? 0
-        if len > 0 { duration = Double(len) / 1000 }
+        if len > 0 {
+            let d = Double(len) / 1000
+            if d != duration {
+                duration = d
+                output.invalidatePlaybackState()
+            }
+        }
 
         let now = Double(t) / 1000
         if let target = seekTarget {
@@ -180,22 +235,22 @@ final class PlaybackEngine: ObservableObject {
         let size = player.videoSize
         if size.width > 0, size != videoSize { videoSize = size }
 
-        refreshTracks()
+        if ticks % 4 == 0 || !tracksSettled { refreshTracks() }
         if !chaptersLoaded, duration > 0 { loadChapters() }
     }
 
     private func refreshTracks() {
-        let aNames = player.audioTrackNames.compactMap { $0 as? String }
-        let aIDs = player.audioTrackIndexes.compactMap { ($0 as? NSNumber)?.intValue }
-        let a = zip(aIDs, aNames).filter { $0.0 != -1 }.map { MediaTrack(id: $0, raw: $1) }
+        let audio = player.audioTracks
+        let a = audio.map { MediaTrack(id: $0.trackId, raw: $0.trackName, language: $0.language) }
         if a != audioTracks { audioTracks = a }
-        currentAudio = Int(player.currentAudioTrackIndex)
+        let selectedAudio = audio.first(where: { $0.isSelected })?.trackId ?? ""
+        if selectedAudio != currentAudio { currentAudio = selectedAudio }
 
-        let sNames = player.videoSubTitlesNames.compactMap { $0 as? String }
-        let sIDs = player.videoSubTitlesIndexes.compactMap { ($0 as? NSNumber)?.intValue }
-        let s = zip(sIDs, sNames).map { MediaTrack(id: $0, raw: $1) }
+        let text = player.textTracks
+        let s = text.isEmpty ? [] : [MediaTrack.off] + text.map { MediaTrack(id: $0.trackId, raw: $0.trackName, language: $0.language) }
         if s != subtitleTracks { subtitleTracks = s }
-        currentSubtitle = Int(player.currentVideoSubTitleIndex)
+        let selectedText = text.first(where: { $0.isSelected })?.trackId ?? MediaTrack.offID
+        if selectedText != currentSubtitle { currentSubtitle = selectedText }
 
         // Tracks appear once the file is open; give slaves a moment to load before choosing.
         if !tracksSettled, !audioTracks.isEmpty, currentTime > 0 || Date().timeIntervalSince(startedAt) > 6 {
@@ -207,15 +262,15 @@ final class PlaybackEngine: ObservableObject {
     private func loadChapters() {
         let title = player.currentTitleIndex
         guard title >= 0 else { return }
-        let list = player.chapterDescriptions(ofTitle: title).compactMap { $0 as? [String: Any] }
+        let list = player.chapterDescriptions(ofTitle: title)
         chaptersLoaded = true
         guard list.count > 1 else { return }
-        chapters = list.enumerated().compactMap { i, d in
-            guard let offset = (d[VLCChapterDescriptionTimeOffset] as? NSNumber)?.doubleValue else { return nil }
-            let length = (d[VLCChapterDescriptionDuration] as? NSNumber)?.doubleValue
-            let name = (d[VLCChapterDescriptionName] as? String)?.trimmingCharacters(in: .whitespaces)
-            return Chapter(id: i, name: name?.isEmpty == false ? name! : "Chapter \(i + 1)",
-                           start: offset / 1000, end: length.map { (offset + $0) / 1000 })
+        chapters = list.enumerated().map { i, c in
+            let offset = Double(c.timeOffset.intValue)
+            let length = Double(c.durationTime.intValue)
+            let name = c.name?.trimmingCharacters(in: .whitespaces) ?? ""
+            return Chapter(id: i, name: name.isEmpty ? "Chapter \(i + 1)" : name,
+                           start: offset / 1000, end: length > 0 ? (offset + length) / 1000 : nil)
         }
     }
 
@@ -234,16 +289,15 @@ final class PlaybackEngine: ObservableObject {
         guard duration > 0 else { return }
         let target = max(0, min(seconds, duration - 1))
         if didFinish {
-            didFinish = false
-            player.play()
+            restart(from: target)
+            return
         }
-        player.position = Float(target / duration)
+        player.position = target / duration
         markSeek(target)
     }
 
     func skip(by seconds: Double) {
-        let s = Int32(abs(seconds))
-        if seconds > 0 { player.jumpForward(s) } else { player.jumpBackward(s) }
+        if seconds > 0 { player.jumpForward(seconds) } else { player.jumpBackward(-seconds) }
         markSeek(max(0, duration > 0 ? min(currentTime + seconds, duration) : currentTime + seconds))
     }
 
@@ -254,31 +308,72 @@ final class PlaybackEngine: ObservableObject {
         lastChange = Date()
     }
 
-    func replay() {
+    func replay() { restart(from: 0) }
+
+    /// A stopped player can't seek; open the file again at `start`.
+    private func restart(from start: Double) {
         didFinish = false
-        markSeek(0)
+        restarting = true
+        tracksSettled = false
+        markSeek(start)
         let p = player
         DispatchQueue.global(qos: .userInitiated).async {
             p.stop()
-            p.play()
+            DispatchQueue.main.async { [weak self] in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.load(from: start)
+                    self.player.rate = self.rate
+                    self.player.play()
+                }
+            }
         }
         isPlaying = true
     }
 
     func setRate(_ r: Float) { rate = r; player.rate = r }
 
+    // MARK: Picture in Picture and TV
+
+    func togglePictureInPicture() {
+        if isPictureInPicture { output.stopPictureInPicture() } else { output.startPictureInPicture() }
+    }
+
+    /// Moves the video to a connected TV, or back to the phone.
+    func showOnTV(_ on: Bool) {
+        if on, let host = ExternalDisplay.shared.claim() {
+            output.attach(external: host)
+            isOnTV = true
+        } else {
+            output.attach(external: nil)
+            ExternalDisplay.shared.release()
+            isOnTV = false
+        }
+    }
+
     // MARK: tracks
 
-    func selectAudio(_ id: Int) {
-        player.currentAudioTrackIndex = Int32(id)
+    func selectAudio(_ id: String) {
+        guard let track = player.audioTracks.first(where: { $0.trackId == id }) else { return }
+        track.isSelectedExclusively = true
         currentAudio = id
         remember(audio: audioTracks.first { $0.id == id }?.raw)
     }
 
-    func selectSubtitle(_ id: Int) {
-        player.currentVideoSubTitleIndex = Int32(id)
+    func selectSubtitle(_ id: String) {
+        applySubtitle(id)
+        remember(subtitle: id == MediaTrack.offID ? Self.offChoice : subtitleTracks.first { $0.id == id }?.raw)
+    }
+
+    private func applySubtitle(_ id: String) {
+        if id == MediaTrack.offID {
+            player.deselectAllTextTracks()
+        } else if let track = player.textTracks.first(where: { $0.trackId == id }) {
+            track.isSelectedExclusively = true
+        } else {
+            return
+        }
         currentSubtitle = id
-        remember(subtitle: id == -1 ? Self.offChoice : subtitleTracks.first { $0.id == id }?.raw)
     }
 
     func setSubtitleDelay(_ seconds: Double) {
@@ -316,38 +411,25 @@ final class PlaybackEngine: ObservableObject {
     private func applyRememberedTracks() {
         let saved = memory
         if let a = saved["audio"], let match = audioTracks.first(where: { $0.raw == a }), match.id != currentAudio {
-            player.currentAudioTrackIndex = Int32(match.id)
-            currentAudio = match.id
+            selectAudio(match.id)
         }
         if let s = saved["subtitle"] {
             if s == Self.offChoice {
-                player.currentVideoSubTitleIndex = -1
-                currentSubtitle = -1
+                applySubtitle(MediaTrack.offID)
                 return
             }
-            if let match = subtitleTracks.first(where: { $0.raw == s }) {
-                if match.id != currentSubtitle {
-                    player.currentVideoSubTitleIndex = Int32(match.id)
-                    currentSubtitle = match.id
-                }
+            if let match = subtitleTracks.first(where: { $0.raw == s && $0.id != MediaTrack.offID }) {
+                if match.id != currentSubtitle { applySubtitle(match.id) }
                 return
             }
         }
         // Releases often flag the signs track as default, which leaves dialogue untranslated.
         guard !preferDub, let current = subtitleTracks.first(where: { $0.id == currentSubtitle }), current.isSignsOnly else { return }
-        let real = subtitleTracks.filter { $0.id != -1 && !$0.isSignsOnly }
+        let real = subtitleTracks.filter { $0.id != MediaTrack.offID && !$0.isSignsOnly }
         if let better = real.first(where: \.isEnglish) ?? real.first {
-            player.currentVideoSubTitleIndex = Int32(better.id)
-            currentSubtitle = better.id
+            applySubtitle(better.id)
         }
     }
-}
-
-/// The video itself.
-struct VideoSurface: UIViewRepresentable {
-    let engine: PlaybackEngine
-    func makeUIView(context: Context) -> UIView { engine.surface }
-    func updateUIView(_ uiView: UIView, context: Context) {}
 }
 
 /// Lock Screen and Control Center: what's playing, and play, pause and seek from there.

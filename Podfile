@@ -2,8 +2,8 @@ platform :ios, '26.0'
 use_frameworks!
 
 target 'TorrentStream' do
-  # libVLC for iOS: MKV/AVI/WebM/HEVC playback, audio track + subtitle selection.
-  pod 'MobileVLCKit', '~> 3.6'
+  # libVLC 4 for iOS: MKV/AVI/WebM/HEVC playback, tracks, chapters and Picture in Picture.
+  pod 'VLCKit', '4.0.0a26'
 end
 
 post_install do |installer|

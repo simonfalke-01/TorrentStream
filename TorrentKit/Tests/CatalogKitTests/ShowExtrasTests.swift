@@ -1,5 +1,8 @@
 import XCTest
 @testable import CatalogKit
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 final class ShowExtrasTests: XCTestCase {
     private func object(_ json: String) throws -> [String: Any] {
@@ -25,20 +28,51 @@ final class ShowExtrasTests: XCTestCase {
         }}
         """)
         let eps = ShowCatalog.aniZipEpisodes(root)
-        XCTAssertEqual(Set(eps.keys), [1, 2, 3])
+        XCTAssertEqual(Set(eps.keys), [1, 2, 3, 4])
         XCTAssertEqual(eps[1]?.title, "The Journey's End")
         XCTAssertEqual(eps[1]?.overview, "The world celebrates.")
         XCTAssertEqual(eps[1]?.thumbnail?.absoluteString, "https://img/1.jpg")
         XCTAssertEqual(eps[1]?.runtime, 26)
-        // No English or romanized name, so no title rather than the Japanese or German one.
-        XCTAssertNil(eps[2]?.title)
+        // No English or romanized name, so the Japanese one rather than the German one.
+        XCTAssertEqual(eps[2]?.title, "オスガキにも穴はあるんだよな")
         XCTAssertEqual(eps[2]?.overview, "Ume joins the council.")
         XCTAssertEqual(eps[2]?.runtime, 25)
         XCTAssertEqual(eps[3]?.title, "Hito o Korosu Mahou")
         XCTAssertNil(eps[3]?.overview)
         XCTAssertNil(eps[3]?.thumbnail)
         XCTAssertEqual(eps[3]?.runtime, 24)
+        XCTAssertEqual(eps[4], ShowCatalog.EpisodeInfo(title: "人を殺す魔法"))
+        XCTAssertNil(eps[5])
+    }
+
+    func testAniZipTitlePreference() throws {
+        let root = try object("""
+        {"episodes": {
+          "1": {"title": {"ja": "冒険の終わり", "x-jat": "Bouken no Owari", "en": "The Journey's End"}},
+          "2": {"title": {"ja": "別に魔法じゃなくたって", "x-jat": "Betsu ni Mahou ja Nakutatte", "en": null}},
+          "3": {"title": {"ja": "人を殺す魔法", "en": "Episode 3"}},
+          "4": {"title": {"ja": "第4話", "en": ""}},
+          "5": {"title": {"ja": "  ", "x-jat": "冒険", "en": "エピソード"}}
+        }}
+        """)
+        let eps = ShowCatalog.aniZipEpisodes(root)
+        XCTAssertEqual(eps[1]?.title, "The Journey's End")
+        XCTAssertEqual(eps[2]?.title, "Betsu ni Mahou ja Nakutatte")
+        XCTAssertEqual(eps[3]?.title, "人を殺す魔法")
         XCTAssertNil(eps[4])
+        // Japanese script only counts from the Japanese field.
+        XCTAssertNil(eps[5])
+    }
+
+    func testKitsuTitlePreference() {
+        func title(_ a: [String: Any]) -> String? { ShowCatalog.kitsuEpisode(a).title }
+        XCTAssertEqual(title(["canonicalTitle": "Bouken no Owari", "titles": ["en": "The Journey's End", "en_jp": "Bouken no Owari", "ja_jp": "冒険の終わり"]]),
+                       "The Journey's End")
+        XCTAssertEqual(title(["canonicalTitle": "Episode 2", "titles": ["en_jp": "Betsu ni Mahou ja Nakutatte", "ja_jp": "別に魔法じゃなくたって"]]),
+                       "Betsu ni Mahou ja Nakutatte")
+        XCTAssertEqual(title(["canonicalTitle": "Episode 3", "titles": ["ja_jp": "人を殺す魔法"]]), "人を殺す魔法")
+        XCTAssertEqual(title(["canonicalTitle": "人を殺す魔法", "titles": [String: Any]()]), "人を殺す魔法")
+        XCTAssertNil(title(["canonicalTitle": "Episode 4", "titles": ["en": "", "ja_jp": ""]]))
     }
 
     func testEpisodeInfoMergeKeepsExistingValues() {
@@ -102,6 +136,110 @@ final class ShowExtrasTests: XCTestCase {
 
         let missing = try object(#"{"found": false, "results": [], "message": "No skip times found", "statusCode": 404}"#)
         XCTAssertEqual(ShowCatalog.skipSegments(missing, duration: 1440), [])
+
+        let preview = try object(#"{"found": true, "results": [{"interval": {"startTime": 1410, "endTime": 1440}, "skipType": "preview", "episodeLength": 1440}]}"#)
+        XCTAssertEqual(ShowCatalog.skipSegments(preview, duration: 1440).map(\.kind), [.preview])
+    }
+
+    func testSkipSegmentDecodesWithoutInferredFlag() throws {
+        let old = #"{"kind": "intro", "start": 1.5, "end": 91.5}"#
+        XCTAssertEqual(try JSONDecoder().decode(SkipSegment.self, from: Data(old.utf8)), SkipSegment(kind: .intro, start: 1.5, end: 91.5))
+        let inferred = SkipSegment(kind: .credits, start: 1300, end: 1390, isInferred: true)
+        XCTAssertEqual(try JSONDecoder().decode(SkipSegment.self, from: JSONEncoder().encode(inferred)), inferred)
+    }
+
+    // MARK: Skip inference
+
+    private func t(_ kind: SkipSegment.Kind, _ start: Double, _ end: Double, _ length: Double? = 1440) -> SkipTime {
+        SkipTime(kind: kind, start: start, end: end, length: length)
+    }
+
+    func testInferredCreditsKeepDistanceFromEnd() {
+        let one = ShowCatalog.inferredSegments([[t(.intro, 0, 90), t(.credits, 1330, 1420)]], missing: [.credits], duration: 1430)
+        XCTAssertEqual(one, [SkipSegment(kind: .credits, start: 1320, end: 1410, isInferred: true)])
+
+        // Two neighbours of different lengths agree once measured from the end; the nearest is used.
+        let agree = ShowCatalog.inferredSegments([[t(.credits, 1330, 1420, 1440)], [t(.credits, 1362, 1452, 1470)]],
+                                                 missing: [.credits], duration: 1440)
+        XCTAssertEqual(agree, [SkipSegment(kind: .credits, start: 1330, end: 1420, isInferred: true)])
+
+        let disagree = ShowCatalog.inferredSegments([[t(.credits, 1330, 1420)], [t(.credits, 1300, 1390)]], missing: [.credits], duration: 1440)
+        XCTAssertEqual(disagree, [])
+
+        // A neighbour without a known length can't be measured from the end, and nor can a file of unknown length.
+        XCTAssertEqual(ShowCatalog.inferredSegments([[t(.credits, 1330, 1420, nil)]], missing: [.credits], duration: 1440), [])
+        XCTAssertEqual(ShowCatalog.inferredSegments([[t(.credits, 1330, 1420)]], missing: [.credits], duration: 0), [])
+
+        // Of the submissions a neighbour has, the one timed against the closest length is used.
+        let closest = ShowCatalog.inferredSegments([[t(.credits, 1400, 1490, 1500), t(.credits, 1340, 1430, 1445)]],
+                                                   missing: [.credits], duration: 1440)
+        XCTAssertEqual(closest, [SkipSegment(kind: .credits, start: 1335, end: 1425, isInferred: true)])
+    }
+
+    func testInferredIntroNeedsAgreementOrAnEarlyStart() {
+        XCTAssertEqual(ShowCatalog.inferredSegments([[t(.intro, 2, 92)]], missing: [.intro], duration: 1440),
+                       [SkipSegment(kind: .intro, start: 2, end: 92, isInferred: true)])
+        XCTAssertEqual(ShowCatalog.inferredSegments([[t(.intro, 60, 150)]], missing: [.intro], duration: 1440), [])
+        XCTAssertEqual(ShowCatalog.inferredSegments([[t(.intro, 60, 150)], [], [t(.intro, 63, 153, 1470)]], missing: [.intro], duration: 1440),
+                       [SkipSegment(kind: .intro, start: 60, end: 150, isInferred: true)])
+        XCTAssertEqual(ShowCatalog.inferredSegments([[t(.intro, 60, 150)], [t(.intro, 153, 243)]], missing: [.intro], duration: 1440), [])
+        // The largest group that agrees wins over a nearer outlier.
+        XCTAssertEqual(ShowCatalog.inferredSegments([[t(.intro, 153, 243)], [t(.intro, 1.4, 91.4)], [t(.intro, 2, 92)]],
+                                                    missing: [.intro], duration: 1440),
+                       [SkipSegment(kind: .intro, start: 1.4, end: 91.4, isInferred: true)])
+        // Intros keep their time from the start, so a file of unknown length still gets one.
+        XCTAssertEqual(ShowCatalog.inferredSegments([[t(.intro, 0, 90, nil)]], missing: [.intro], duration: 0).count, 1)
+        XCTAssertEqual(ShowCatalog.inferredSegments([[t(.recap, 0, 40)], [t(.recap, 1, 41)]], missing: [.recap], duration: 1440).map(\.kind),
+                       [.recap])
+    }
+
+    func testInferredSegmentsClampAndSkipKnownKinds() {
+        let neighbours = [[t(.intro, 0, 90), t(.credits, 1330, 1420), t(.preview, 1420, 1440)]]
+        // Only kinds the episode lacks are filled in.
+        XCTAssertEqual(ShowCatalog.inferredSegments(neighbours, missing: [.credits, .recap], duration: 1440).map(\.kind), [.credits])
+        // In a much shorter file an early ending would start before 0; it is clamped.
+        XCTAssertEqual(ShowCatalog.inferredSegments([[t(.credits, 10, 100, 1440)]], missing: [.credits], duration: 1400),
+                       [SkipSegment(kind: .credits, start: 0, end: 60, isInferred: true)])
+        // Under 5 seconds once clamped.
+        XCTAssertEqual(ShowCatalog.inferredSegments([[t(.credits, 10, 43, 1440)]], missing: [.credits], duration: 1400), [])
+        XCTAssertEqual(ShowCatalog.inferredSegments([[t(.intro, 0, 4)]], missing: [.intro], duration: 1440), [])
+        XCTAssertEqual(ShowCatalog.inferredSegments([], missing: [.intro, .credits], duration: 1440), [])
+    }
+
+    func testSkipSegmentsAskNeighboursOnlyWhenSomethingIsMissing() async throws {
+        let base = "https://api.aniskip.com/v2/skip-times"
+        func found(_ results: String) -> String { #"{"found": true, "results": ["# + results + "]}" }
+        let op = #"{"interval": {"startTime": 1, "endTime": 91}, "skipType": "op", "episodeLength": 1440}"#
+        let ed = #"{"interval": {"startTime": 1330, "endTime": 1420}, "skipType": "ed", "episodeLength": 1440}"#
+        StubProtocol.set(responses: [
+            "\(base)/1/5": (200, found(op)),
+            "\(base)/1/4": (200, found("\(op), \(ed)")),
+            "\(base)/1/6": (404, #"{"found": false, "results": []}"#),
+            "\(base)/1/3": (200, found(ed)),
+            "\(base)/1/7": (200, found("")),
+            "\(base)/2/1": (200, found("\(op), \(ed)")),
+        ])
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [StubProtocol.self]
+        let catalog = ShowCatalog(session: URLSession(configuration: config))
+
+        let segments = try await catalog.skipSegments(malID: 1, episode: 5, duration: 1430)
+        XCTAssertEqual(segments, [SkipSegment(kind: .intro, start: 1, end: 91),
+                                  SkipSegment(kind: .credits, start: 1320, end: 1410, isInferred: true)])
+        let first = StubProtocol.takeRequested()
+        XCTAssertEqual(first.count, 5)
+        XCTAssertTrue(first.contains("\(base)/1/5?episodeLength=1430.000"))
+        XCTAssertEqual(Set(first.filter { $0.hasSuffix("episodeLength=0") }),
+                       Set([4, 6, 3, 7].map { "\(base)/1/\($0)?episodeLength=0" }))
+
+        // Answers are cached, so asking again sends nothing.
+        _ = try await catalog.skipSegments(malID: 1, episode: 5, duration: 1430)
+        XCTAssertEqual(StubProtocol.takeRequested(), [])
+
+        // An episode with both an intro and an ending needs no neighbours.
+        let complete = try await catalog.skipSegments(malID: 2, episode: 1, duration: 1440)
+        XCTAssertEqual(complete.map(\.kind), [.intro, .credits])
+        XCTAssertEqual(StubProtocol.takeRequested(), ["\(base)/2/1?episodeLength=1440.000"])
     }
 
     // MARK: Chapters
@@ -226,6 +364,12 @@ final class ShowExtrasTests: XCTestCase {
         XCTAssertFalse(onePiece.isEmpty)
         let none = try await catalog.skipSegments(malID: 52991, episode: 500, duration: 1440)
         XCTAssertEqual(none, [])
+
+        // Episode 4 has only an opening submitted for this cut; the ending comes from its neighbours.
+        let inferred = try await catalog.skipSegments(malID: 52991, episode: 4, duration: 1440)
+        print("Frieren E4:", inferred)
+        XCTAssertTrue(inferred.contains { $0.kind == .intro && !$0.isInferred })
+        XCTAssertTrue(inferred.contains { $0.kind == .credits && $0.isInferred })
     }
 
     /// Hits AniList. Run with CATALOG_LIVE=1.
@@ -246,4 +390,46 @@ final class ShowExtrasTests: XCTestCase {
         XCTAssertLessThanOrEqual(recs.count, 12)
         XCTAssertFalse(recs.contains { $0.id == 154587 })
     }
+}
+
+/// Answers requests from canned bodies keyed by URL without the query, and records each request as the URL with only
+/// its episodeLength parameter.
+final class StubProtocol: URLProtocol {
+    private static let lock = NSLock()
+    private static var responses: [String: (Int, String)] = [:]
+    private static var requested: [String] = []
+
+    static func set(responses: [String: (Int, String)]) {
+        lock.lock(); defer { lock.unlock() }
+        self.responses = responses
+        requested = []
+    }
+
+    static func takeRequested() -> [String] {
+        lock.lock(); defer { lock.unlock() }
+        let out = requested
+        requested = []
+        return out
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        guard let url = request.url, var c = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return }
+        c.queryItems = c.queryItems?.filter { $0.name == "episodeLength" }
+        let recorded = c.url?.absoluteString ?? ""
+        c.query = nil
+        let key = c.url?.absoluteString ?? ""
+        Self.lock.lock()
+        Self.requested.append(recorded)
+        let (status, body) = Self.responses[key] ?? (404, "{}")
+        Self.lock.unlock()
+        let response = HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: nil)!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data(body.utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
 }

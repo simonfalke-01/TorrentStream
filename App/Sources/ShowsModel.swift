@@ -124,6 +124,8 @@ final class ShowsModel: ObservableObject {
     private var scheduleFetchedAt: Date?
     private var skipCache: [String: [SkipSegment]] = [:]
     private var detailsTasks: [Int: Task<ShowDetails, Error>] = [:]
+    /// Shows whose episode names and stills were looked up this session, so a cached copy gets them once.
+    private var enriched: Set<Int> = []
     private var prefetchTask: Task<Void, Never>?
 
     private struct Saved: Codable {
@@ -213,13 +215,18 @@ final class ShowsModel: ObservableObject {
     @discardableResult
     func loadDetails(_ show: Show, force: Bool = false) async throws -> ShowDetails {
         let root = rootID(show)
-        if !force, let d = cachedDetails(show), isFresh(d) { return d }
+        if !force, let d = cachedDetails(show), isFresh(d) {
+            if !enriched.contains(root), Self.missesEpisodeInfo(d) { Task { await enrich(d) } }
+            return d
+        }
         if let running = detailsTasks[root] { return try await running.value }
         let task = Task { try await catalog.details(id: show.id) }
         detailsTasks[root] = task
         defer { detailsTasks[root] = nil }
         do {
-            let d = try await task.value
+            // Keep the names and stills found last time while the new copy is looked up again.
+            let fetched = try await task.value
+            let d = Self.carryingEpisodeInfo(from: details[root], into: fetched)
             store(d)
             Task { await enrich(d) }
             return d
@@ -252,9 +259,35 @@ final class ShowsModel: ObservableObject {
 
     /// Adds episode names and stills the main catalog lacks.
     private func enrich(_ d: ShowDetails) async {
+        enriched.insert(d.show.id)
         let full = await catalog.withEpisodeInfo(d)
         guard full != d else { return }
-        store(full)
+        // The page may have been refreshed meanwhile; fill that copy rather than replace it.
+        store(Self.carryingEpisodeInfo(from: full, into: details[d.show.id] ?? full))
+    }
+
+    private static func missesEpisodeInfo(_ d: ShowDetails) -> Bool {
+        d.seasons.contains { $0.episodes.contains { $0.isAired && ($0.thumbnailURL == nil || $0.overview == nil) } }
+    }
+
+    /// `new` with episode names, stills, synopses and runtimes it lacks taken from `old`.
+    private static func carryingEpisodeInfo(from old: ShowDetails?, into new: ShowDetails) -> ShowDetails {
+        guard let old else { return new }
+        var out = new
+        for i in out.seasons.indices {
+            guard let before = old.seasons.first(where: { $0.media.id == out.seasons[i].media.id }) else { continue }
+            let byNumber = Dictionary(before.episodes.map { ($0.number, $0) }, uniquingKeysWith: { a, _ in a })
+            out.seasons[i].episodes = out.seasons[i].episodes.map { e in
+                guard let b = byNumber[e.number] else { return e }
+                var e = e
+                e.title = e.title ?? b.title
+                e.thumbnailURL = e.thumbnailURL ?? b.thumbnailURL
+                e.overview = e.overview ?? b.overview
+                e.runtime = e.runtime ?? b.runtime
+                return e
+            }
+        }
+        return out
     }
 
     // MARK: My List

@@ -27,7 +27,12 @@ jobs:
         run: brew install xcodegen
       - name: Generate Xcode project
         run: xcodegen generate
-      - name: Install MobileVLCKit (CocoaPods)
+      - name: Cache CocoaPods downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/CocoaPods
+          key: pods-${{ hashFiles('Podfile') }}
+      - name: Install VLCKit (CocoaPods)
         run: pod install --repo-update
       - name: Build (device, unsigned)
         run: |
@@ -50,7 +55,7 @@ jobs:
           app=ipa-check/Payload/TorrentStream.app
           plutil -lint "$app/Info.plist"
           /usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' -c 'Print :CFBundleIdentifier' -c 'Print :CFBundleShortVersionString' -c 'Print :CFBundleVersion' "$app/Info.plist"
-          lipo -info "$app/TorrentStream" "$app/Frameworks/MobileVLCKit.framework/MobileVLCKit"
+          lipo -info "$app/TorrentStream" "$app/Frameworks/VLCKit.framework/VLCKit"
           otool -L "$app/TorrentStream" | grep '@rpath' | while read -r lib _; do
             test -e "$app/Frameworks/${lib#@rpath/}" || { echo "missing embedded $lib"; exit 1; }
           done

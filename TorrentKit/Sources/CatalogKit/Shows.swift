@@ -188,6 +188,7 @@ public struct ShowRow: Codable, Hashable, Identifiable, Sendable {
 /// Anime shows and movies from AniList: browse rows, search, and seasons with their episodes.
 public final class ShowCatalog: @unchecked Sendable {
     private let session: URLSession
+    let skipCache = SkipTimesCache()
     private static let endpoint = URL(string: "https://graphql.anilist.co")!
     /// Formats that make up the seasons of a show.
     static let seasonFormats: Set<String> = ["TV", "TV_SHORT", "ONA"]
@@ -554,7 +555,7 @@ public final class ShowCatalog: @unchecked Sendable {
             guard let n = Int(key), n > 0, let e = value as? [String: Any] else { continue }
             let titles = e["title"] as? [String: Any] ?? [:]
             let info = EpisodeInfo(
-                title: [titles["en"], titles["x-jat"]].compactMap { ($0 as? String).flatMap(episodeTitle) }.first,
+                title: episodeTitle(latin: [titles["en"], titles["x-jat"]], japanese: [titles["ja"]]),
                 overview: (e["overview"] as? String).flatMap(episodeOverview),
                 thumbnail: (e["image"] as? String).flatMap { $0.isEmpty ? nil : URL(string: $0) },
                 runtime: [e["runtime"], e["length"]].compactMap(integer).first { $0 > 0 }
@@ -564,11 +565,17 @@ public final class ShowCatalog: @unchecked Sendable {
         return out
     }
 
-    /// A title worth showing: not empty, not "Episode 5", not in Japanese script.
-    static func episodeTitle(_ raw: String) -> String? {
+    /// The first title worth showing, from English and romanized names in order of preference, then Japanese ones.
+    static func episodeTitle(latin: [Any?], japanese: [Any?]) -> String? {
+        latin.lazy.compactMap { ($0 as? String).flatMap { episodeTitle($0) } }.first
+            ?? japanese.lazy.compactMap { ($0 as? String).flatMap { episodeTitle($0, allowJapanese: true) } }.first
+    }
+
+    /// A title worth showing: not empty, not "Episode 5", and in Japanese script only when that is allowed.
+    static func episodeTitle(_ raw: String, allowJapanese: Bool = false) -> String? {
         let t = raw.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: "`", with: "'")
-        guard !t.isEmpty, t.range(of: #"^(?i)episode\s*\d+$"#, options: .regularExpression) == nil,
-              t.range(of: #"[\p{Han}\p{Hiragana}\p{Katakana}\p{Hangul}]"#, options: .regularExpression) == nil else { return nil }
+        guard !t.isEmpty, t.range(of: #"^(?i)(episode|第)\s*\d+\s*(話)?$"#, options: .regularExpression) == nil else { return nil }
+        if !allowJapanese, t.range(of: #"[\p{Han}\p{Hiragana}\p{Katakana}\p{Hangul}]"#, options: .regularExpression) != nil { return nil }
         return t
     }
 
@@ -621,10 +628,8 @@ public final class ShowCatalog: @unchecked Sendable {
 
     static func kitsuEpisode(_ a: [String: Any]) -> (title: String?, thumbnail: URL?) {
         let titles = a["titles"] as? [String: Any] ?? [:]
-        let candidates = [titles["en"], titles["en_us"], a["canonicalTitle"], titles["en_jp"]].compactMap { $0 as? String }
-        // Kitsu fills missing names with "Episode 5"; those say nothing.
-        let title = candidates.map { $0.trimmingCharacters(in: .whitespaces) }
-            .first { !$0.isEmpty && $0.range(of: #"^(?i)episode\s*\d+$"#, options: .regularExpression) == nil }
+        let title = episodeTitle(latin: [titles["en"], titles["en_us"], a["canonicalTitle"], titles["en_jp"]],
+                                 japanese: [titles["ja_jp"], a["canonicalTitle"]])
         let thumb = ((a["thumbnail"] as? [String: Any])?["original"] as? String).flatMap(URL.init(string:))
         return (title, thumb)
     }

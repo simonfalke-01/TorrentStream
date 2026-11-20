@@ -23,13 +23,16 @@ straight out of BitTorrent, but you never manage downloads, progress or storage.
 * Home also keeps a hero for what you're watching and **My List** with posters.
 * Add a **magnet link** (paste, or tap one in Safari) or a **.torrent file** (Files app, share sheet, or Add by Link).
 * Seek anywhere: loading jumps to wherever you are watching.
-* **In-app player** (VLCKit decoding, native UI): MKV, AVI, WebM, HEVC, etc.
+* **In-app player** (VLCKit 4 decoding, native UI): MKV, AVI, WebM, HEVC, etc.
   * **Audio track** switching, remembered per show.
   * **Primary and secondary subtitles** at once: embedded tracks and subtitle files shipped with the release, or your
     own file; independent timing for each, Signs & Songs tracks avoided by default, adjustable size.
   * **Chapters**: marks on the scrubber, chapter name while scrubbing, and a chapter list.
-  * **Skip Intro / Recap** from AniSkip timestamps or the file's chapter names.
+  * **Skip Intro / Recap / Credits / Preview** from AniSkip timestamps (gaps filled from neighbouring episodes) or
+    the file's chapter names.
   * **Next Episode** card at the end credits with its name and still, plus optional autoplay.
+  * **Picture in Picture** (button, or automatically when you leave the app) and **AirPlay**: pick an Apple TV
+    for screen mirroring and the video plays full screen on the TV while the controls stay on the phone.
   * Episode list, Choose Version, speed, sleep timer, control lock, fill/fit (pinch), double-tap to skip ±10 s,
     lock screen and Control Center controls.
 * **iOS 26 Liquid Glass** UI.
@@ -95,6 +98,7 @@ swift run -c release tkcli "magnet:?xt=urn:btih:..."   # stream the head and mid
   whose release groups number seasons differently from AniList (split cours, absolute numbering) can occasionally
   pick the wrong file; Choose Version lists everything found.
 * Download-only client (does not upload pieces), IPv4, BitTorrent v1 / hybrid torrents.
-* No Picture in Picture or AirPlay video: VLCKit 3 doesn't support them. Secondary subtitles cover text tracks
-  (not image-based PGS/VobSub). Skip buttons appear only when AniSkip or the file's chapters know the times.
+* AirPlay video uses screen mirroring (the TV gets the video only); the second subtitle track shows on the phone,
+  not in Picture in Picture or on the TV. Secondary subtitles cover text tracks (not image-based PGS/VobSub). Skip
+  buttons need AniSkip data for the episode or its neighbours, or named chapters in the file.
 * Only download content you have the right to download.

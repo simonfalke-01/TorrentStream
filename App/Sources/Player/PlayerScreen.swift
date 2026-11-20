@@ -79,8 +79,12 @@ private struct PlayerContainer: View {
             let e = PlaybackEngine(request: request, memoryKey: key)
             engine = e
             e.start()
+            e.showOnTV(ExternalDisplay.shared.isConnected)
             secondary.prepare(request)
             nowPlaying.activate(engine: e, title: request.title, subtitle: request.episode)
+        }
+        .onReceive(ExternalDisplay.shared.$isConnected.dropFirst()) { connected in
+            engine?.showOnTV(connected)
         }
         .onDisappear {
             stats.stop()
@@ -147,6 +151,7 @@ private struct PlayerChrome: View {
             let landscape = geo.size.width > geo.size.height
             ZStack {
                 video
+                if let place = elsewhere, !controlsVisible { elsewhereNote(place).transition(.opacity) }
                 gestureLayer
 
                 if let flash = seekFlash {
@@ -255,6 +260,25 @@ private struct PlayerChrome: View {
 
     private var controlsVisible: Bool { showControls && panel == nil && !locked && engine.errorText == nil }
 
+    /// Where the picture is when it isn't on this screen.
+    private var elsewhere: (title: String, systemImage: String)? {
+        if engine.isOnTV { return ("Playing on TV", "tv") }
+        if engine.isPictureInPicture { return ("Playing in Picture in Picture", "pip") }
+        return nil
+    }
+
+    private func elsewhereNote(_ place: (title: String, systemImage: String)) -> some View {
+        VStack(spacing: Space.m) {
+            Image(systemName: place.systemImage)
+                .font(.system(size: 44, weight: .light))
+            Text(place.title)
+                .font(.subheadline.weight(.medium))
+        }
+        .foregroundStyle(.white.opacity(0.55))
+        .allowsHitTesting(false)
+        .accessibilityElement(children: .combine)
+    }
+
     // MARK: video
 
     /// Fill crops the video to the screen; Fit shows all of it. Measured edge to edge, not within the safe area,
@@ -263,7 +287,7 @@ private struct PlayerChrome: View {
         GeometryReader { geo in
             let size = geo.size
             let zoom = fillZoom(screen: size)
-            VideoSurface(engine: engine)
+            VideoSurface(output: engine.output)
                 .scaleEffect(zoom)
                 .frame(width: size.width, height: size.height)
                 .animation(Motion.role(Motion.standard, reduce: reduceMotion), value: zoom)
@@ -351,6 +375,11 @@ private struct PlayerChrome: View {
     private var topBar: some View {
         HStack(alignment: .center, spacing: Space.m) {
             PlayerIconButton(systemImage: "xmark", label: "Close") { dismiss() }
+            if engine.canPictureInPicture && !engine.isOnTV {
+                PlayerIconButton(systemImage: "pip.enter", label: "Picture in Picture") {
+                    engine.togglePictureInPicture()
+                }
+            }
 
             VStack(alignment: .leading, spacing: Space.xxs) {
                 Text(request.title)
@@ -369,13 +398,10 @@ private struct PlayerChrome: View {
 
             Spacer(minLength: 0)
 
-            if engine.videoSize.width > 0 {
-                PlayerIconButton(systemImage: fill ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right",
-                                 label: fill ? "Fit to Screen" : "Fill Screen") {
-                    fill.toggle()
-                    scheduleHide()
-                }
-            }
+            AirPlayButton()
+                .frame(width: PlayerMetrics.control, height: PlayerMetrics.control)
+                .glassEffect(.clear.interactive(), in: .circle)
+                .accessibilityLabel("AirPlay")
             moreMenu
         }
     }
@@ -386,6 +412,14 @@ private struct PlayerChrome: View {
                 Button {
                     versions = target
                 } label: { Label("Choose Version…", systemImage: "slider.horizontal.3") }
+            }
+            if engine.videoSize.width > 0 && !engine.isOnTV {
+                Button {
+                    fill.toggle()
+                } label: {
+                    Label(fill ? "Fit to Screen" : "Fill Screen",
+                          systemImage: fill ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
+                }
             }
             Picker(selection: Binding(get: { sleep }, set: { setSleep($0) })) {
                 Text("Off").tag(SleepTimer.off)
@@ -568,9 +602,11 @@ private struct PlayerChrome: View {
 
     private var activeSkip: SkipSegment? {
         let t = engine.currentTime
+        // At the credits the Next Episode card is the way on; without one, skip them like anything else.
+        let nextCovers = upNext != nil && !nextDismissed
         return skips.first { s in
-            s.kind != .credits && t >= s.start && t < s.end - 1
-                && !(s.kind == .preview && upNext != nil)
+            t >= s.start && t < s.end - 1
+                && !((s.kind == .credits || s.kind == .preview) && nextCovers)
         }
     }
 
@@ -631,14 +667,16 @@ private struct PlayerChrome: View {
         }
     }
 
-    /// Times marked by viewers come first; chapter names fill in when there are none.
+    /// Times marked by viewers come first; the file's chapter names fill in whatever kinds they don't cover.
     private func updateSkips() {
-        if !catalogSkips.isEmpty {
-            skips = catalogSkips
-        } else if engine.duration > 0, !engine.chapters.isEmpty {
-            skips = ChapterSkips.segments(engine.chapters.map { (name: $0.name, start: $0.start, end: $0.end) },
-                                          duration: engine.duration)
+        var out = catalogSkips
+        if engine.duration > 0, !engine.chapters.isEmpty {
+            let fromChapters = ChapterSkips.segments(engine.chapters.map { (name: $0.name, start: $0.start, end: $0.end) },
+                                                     duration: engine.duration)
+            let covered = Set(out.map(\.kind))
+            out += fromChapters.filter { !covered.contains($0.kind) }
         }
+        skips = out.sorted { $0.start < $1.start }
     }
 
     // MARK: chapters

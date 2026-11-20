@@ -4,6 +4,7 @@ import TorrentKit
 
 @main
 struct TorrentStreamApp: App {
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var model: AppModel
     @StateObject private var shows: ShowsModel
     @Environment(\.scenePhase) private var scenePhase

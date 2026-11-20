@@ -109,7 +109,7 @@ struct TracksPanel: View {
             }
             .buttonStyle(.plain)
             .foregroundStyle(.white.opacity(0.8))
-            if engine.currentSubtitle != -1 {
+            if engine.currentSubtitle != MediaTrack.offID {
                 TimingControl(title: "Subtitle Timing", value: engine.subtitleDelay, step: 0.1) { engine.setSubtitleDelay($0) }
             }
         }
