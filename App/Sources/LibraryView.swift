@@ -28,7 +28,7 @@ struct LibraryView: View {
                 }
                 Section {
                     ForEach(filtered) { item in
-                        NavigationLink(value: item.id) {
+                        NavigationLink(value: Route.torrent(item.id)) {
                             TorrentRow(item: item, artwork: model.artworkURL(item))
                         }
                         .swipeActions(edge: .trailing) {
@@ -55,18 +55,19 @@ struct LibraryView: View {
                     ContentUnavailableView {
                         Label("No Torrents", systemImage: "play.rectangle.on.rectangle")
                     } description: {
-                        Text("Add a magnet link or a .torrent file to start watching.")
+                        Text("Search Nyaa, or add a magnet link or .torrent file.")
                     } actions: {
-                        Button("Add Torrent") { showAdd = true }
+                        Button("Search Nyaa") { model.selectedTab = .search }
                             .buttonStyle(.borderedProminent)
+                        Button("Add Magnet Link or File") { showAdd = true }
                     }
                 } else if filtered.isEmpty {
                     ContentUnavailableView.search(text: search)
                 }
             }
-            .searchable(text: $search, prompt: "Search")
+            .searchable(text: $search, prompt: "Filter Library")
             .navigationTitle("Library")
-            .navigationDestination(for: String.self) { hash in TorrentDetailView(infoHash: hash) }
+            .routeDestinations()
             .toolbar {
                 ToolbarItem(placement: .primaryAction) {
                     Button { showAdd = true } label: { Label("Add Torrent", systemImage: "plus") }

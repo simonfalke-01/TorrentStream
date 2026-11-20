@@ -41,6 +41,9 @@ struct RootView: View {
             Tab("Settings", systemImage: "gear", value: AppTab.settings) {
                 SettingsView()
             }
+            Tab(value: AppTab.search, role: .search) {
+                SearchView()
+            }
         }
         .tabBarMinimizeBehavior(.onScrollDown)
         .overlay(alignment: .top) {

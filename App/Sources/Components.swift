@@ -69,14 +69,35 @@ enum Format {
 
     static func peers(_ n: Int) -> String { n == 1 ? "1 peer" : "\(n) peers" }
 
-    /// "12 min left", or nil when the rate is too low to estimate.
-    static func eta(remaining: Int64, rate: Double) -> String? {
-        guard rate > 1024, remaining > 0 else { return nil }
+    static func count(_ n: Int) -> String { n.formatted(.number) }
+
+    static func videos(_ n: Int) -> String { n == 1 ? "1 video" : "\(count(n)) videos" }
+
+    /// Folder rows: "12 videos, 4.2 GB", or "3 of 12 watched, 4.2 GB" once watching has started.
+    static func folderSummary(videos n: Int, watched: Int, bytes: Int64) -> String {
+        let lead = watched > 0 ? "\(count(watched)) of \(count(n)) watched" : videos(n)
+        return "\(lead), \(Format.bytes(bytes))"
+    }
+
+    /// "3 days ago".
+    static func age(_ date: Date) -> String {
+        date.formatted(.relative(presentation: .named, unitsStyle: .abbreviated))
+    }
+
+    /// "12 min", one unit.
+    static func duration(_ seconds: Double) -> String? {
+        guard seconds.isFinite, seconds >= 1 else { return nil }
         let f = DateComponentsFormatter()
         f.allowedUnits = [.hour, .minute, .second]
         f.unitsStyle = .short
         f.maximumUnitCount = 1
-        return f.string(from: Double(remaining) / rate).map { "\($0) left" }
+        return f.string(from: seconds)
+    }
+
+    /// "12 min left", or nil when the rate is too low to estimate.
+    static func eta(remaining: Int64, rate: Double) -> String? {
+        guard rate > 1024, remaining > 0 else { return nil }
+        return duration(Double(remaining) / rate).map { "\($0) left" }
     }
 }
 
@@ -94,6 +115,12 @@ extension MediaKind {
 extension TorrentFile {
     var kind: MediaKind { MediaKind(fileExtension: fileExtension) }
     var isImage: Bool { ["jpg", "jpeg", "png", "webp", "heic"].contains(fileExtension) }
+    /// Readable name for rows and the player: no extension, release-group tag or checksum.
+    var title: String { MediaTitle.clean(fileName) }
+    /// "MKV", or nil for files without an extension.
+    var formatTag: String? { fileExtension.isEmpty || fileExtension.count > 5 ? nil : fileExtension.uppercased() }
+    /// Folder inside the torrent, for rows that list files from several folders.
+    var folderPath: String? { path.count > 1 ? path.dropLast().joined(separator: " / ") : nil }
 }
 
 // MARK: - Status vocabulary (the only place user-facing state strings are built)
@@ -121,14 +148,18 @@ extension TorrentStatus {
                 if connectedPeers == 0 { return "Waiting for peers" }
                 return Format.eta(remaining: activeRemaining, rate: downloadRate) ?? "Downloading"
             }
-            return Format.bytes(totalLength)
+            return sizeText
         }
     }
 
-    /// Size line for the detail header.
+    private var videoCount: Int { files.filter { $0.file.kind == .video && !$0.file.isPadding }.count }
+
+    /// Size line for the detail header and idle library rows: "12 videos, 14.2 GB".
     var sizeText: String {
-        if isComplete || downloadedBytes == 0 { return Format.bytes(totalLength) }
-        return "\(Format.bytes(downloadedBytes)) of \(Format.bytes(totalLength))"
+        let amount = isComplete || downloadedBytes == 0
+            ? Format.bytes(totalLength)
+            : "\(Format.bytes(downloadedBytes)) of \(Format.bytes(totalLength))"
+        return videoCount > 1 ? "\(Format.videos(videoCount)), \(amount)" : amount
     }
 
     /// Live activity for the detail header, nil when idle.
@@ -145,10 +176,17 @@ extension TorrentStatus {
 }
 
 extension FileStatus {
-    /// Secondary row text. Download state itself is shown by `FileStateIndicator`.
+    /// Secondary row text: "MKV, 1.4 GB". Download state itself is shown by `FileStateIndicator`.
     var detailText: String {
-        if isComplete || downloadedBytes == 0 { return Format.bytes(file.length) }
-        return "\(Format.bytes(downloadedBytes)) of \(Format.bytes(file.length))"
+        let amount = isComplete || downloadedBytes == 0
+            ? Format.bytes(file.length)
+            : "\(Format.bytes(downloadedBytes)) of \(Format.bytes(file.length))"
+        return file.formatTag.map { "\($0), \(amount)" } ?? amount
+    }
+
+    /// Media rows: "Watched, MKV, 1.4 GB" once the file has been watched to the end.
+    func detailText(watched: Bool) -> String {
+        watched ? "Watched, \(detailText)" : detailText
     }
 
     var accessibilityState: String {
@@ -200,25 +238,37 @@ struct ProgressRing: View {
     }
 }
 
-/// Download state of a single file at the trailing edge of a row: a checkmark when finished,
-/// a ring while downloading, nothing otherwise.
-struct FileStateIndicator: View {
-    let status: FileStatus
+/// Download state at the trailing edge of a row: a checkmark when finished, a ring while downloading,
+/// nothing otherwise.
+struct StateIndicator: View {
+    let isComplete: Bool
+    let isDownloading: Bool
+    let progress: Double
     var paused = false
 
     var body: some View {
         Group {
-            if status.isComplete {
+            if isComplete {
                 Image(systemName: "checkmark.circle.fill")
                     .font(.title3)
                     .foregroundStyle(.green)
-            } else if status.isDownloading {
-                ProgressRing(progress: status.progress, tint: paused ? .secondary : .accentColor)
+            } else if isDownloading {
+                ProgressRing(progress: progress, tint: paused ? .secondary : .accentColor)
                     .padding(Space.xxs)
             }
         }
         .frame(width: Metrics.indicator, height: Metrics.indicator)
         .accessibilityHidden(true)
+    }
+}
+
+struct FileStateIndicator: View {
+    let status: FileStatus
+    var paused = false
+
+    var body: some View {
+        StateIndicator(isComplete: status.isComplete, isDownloading: status.isDownloading,
+                       progress: status.progress, paused: paused)
     }
 }
 

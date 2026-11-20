@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 import TorrentKit
+import NyaaKit
 
 struct LibraryItem: Identifiable {
     let torrent: Torrent
@@ -36,7 +37,23 @@ enum PlayerEngine: String, CaseIterable, Identifiable {
     }
 }
 
-enum AppTab: Hashable { case library, downloads, settings }
+enum AppTab: Hashable { case library, downloads, settings, search }
+
+/// Navigation destinations shared by the Library and Search stacks.
+enum Route: Hashable {
+    case torrent(String)
+    /// A folder inside a torrent, by `FileFolder.id`.
+    case folder(hash: String, folder: String)
+    /// A search result that is added to the library when opened.
+    case nyaa(NyaaResult)
+
+    var hash: String {
+        switch self {
+        case .torrent(let h), .folder(let h, _): return h
+        case .nyaa(let r): return r.infoHash ?? ""
+        }
+    }
+}
 
 enum SettingsKey {
     static let playerEngine = "playerEngine"
@@ -45,6 +62,20 @@ enum SettingsKey {
     static let autoPlayNext = "autoPlayNext"
     static let useDHT = "useDHT"
     static let publicTrackers = "usePublicTrackers"
+    static let nyaaAddress = "nyaaAddress"
+    static let searchSort = "searchSort"
+    static let searchAscending = "searchAscending"
+    static let searchCategory = "searchCategory"
+    static let searchFilter = "searchFilter"
+    static let recentSearches = "recentSearches"
+}
+
+/// What the header's Play button starts.
+struct UpNext {
+    let file: TorrentFile
+    let resumeAt: Double?
+    /// Seconds left when resuming.
+    let remaining: Double?
 }
 
 @MainActor
@@ -53,7 +84,8 @@ final class AppModel: ObservableObject {
     @Published private(set) var items: [LibraryItem] = []
     @Published var errorMessage: String?
     @Published var toast: Toast?
-    @Published var navigationPath: [String] = []
+    @Published var navigationPath: [Route] = []
+    @Published var searchPath: [Route] = []
     @Published var selectedTab: AppTab = .library
     @Published private(set) var storageUsed: Int64 = 0
 
@@ -127,28 +159,43 @@ final class AppModel: ObservableObject {
 
     // MARK: adding
 
+    /// Adds and shows the torrent in the Library tab.
     @discardableResult
     func addMagnet(_ text: String) -> Bool {
+        guard let hash = addTorrent(magnet: text) else { return false }
+        reveal(hash)
+        return true
+    }
+
+    /// Adds and shows the torrent in the Library tab.
+    @discardableResult
+    func addTorrentFile(_ data: Data) -> Bool {
+        guard let hash = addTorrent(data: data) else { return false }
+        reveal(hash)
+        return true
+    }
+
+    /// Adds without navigating. Returns the info hash, or nil after reporting the error.
+    func addTorrent(magnet: String, reportErrors: Bool = true) -> String? {
         do {
-            let t = try client.add(magnet: text)
+            let t = try client.add(magnet: magnet)
             didAdd(t)
-            return true
+            return t.infoHashHex
         } catch {
-            errorMessage = error.localizedDescription
-            return false
+            if reportErrors { errorMessage = error.localizedDescription }
+            return nil
         }
     }
 
-    @discardableResult
-    func addTorrentFile(_ data: Data) -> Bool {
+    func addTorrent(data: Data, reportErrors: Bool = true) -> String? {
         do {
             let t = try client.add(torrentData: data)
             try? data.write(to: torrentFileURL(t.infoHashHex))
             didAdd(t)
-            return true
+            return t.infoHashHex
         } catch {
-            errorMessage = error.localizedDescription
-            return false
+            if reportErrors { errorMessage = error.localizedDescription }
+            return nil
         }
     }
 
@@ -168,8 +215,28 @@ final class AppModel: ObservableObject {
         if addedAt[t.infoHashHex] == nil { addedAt[t.infoHashHex] = Date() }
         persist()
         refresh()
+    }
+
+    private func reveal(_ hash: String) {
         selectedTab = .library
-        navigationPath = [t.infoHashHex]
+        navigationPath = [.torrent(hash)]
+    }
+
+    // MARK: search
+
+    var nyaa: NyaaClient {
+        NyaaClient(baseURL: AppModel.nyaaURL(from: defaults.string(forKey: SettingsKey.nyaaAddress)))
+    }
+
+    /// Accepts "nyaa.si", "https://nyaa.si/" or a mirror; falls back to nyaa.si.
+    static func nyaaURL(from text: String?) -> URL {
+        var s = (text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !s.isEmpty else { return NyaaClient.defaultBaseURL }
+        if !s.contains("://") { s = "https://" + s }
+        guard var c = URLComponents(string: s), c.host?.isEmpty == false else { return NyaaClient.defaultBaseURL }
+        c.path = ""
+        c.query = nil
+        return c.url ?? NyaaClient.defaultBaseURL
     }
 
     func handleOpen(url: URL) {
@@ -188,7 +255,9 @@ final class AppModel: ObservableObject {
         try? FileManager.default.removeItem(at: torrentFileURL(hash))
         addedAt[hash] = nil
         explicitDownloads = explicitDownloads.filter { !$0.hasPrefix(hash) }
-        navigationPath.removeAll { $0 == hash }
+        defaults.removeObject(forKey: lastPlayedKey(hash))
+        if let i = navigationPath.firstIndex(where: { $0.hash == hash }) { navigationPath.removeSubrange(i...) }
+        if let i = searchPath.firstIndex(where: { $0.hash == hash }) { searchPath.removeSubrange(i...) }
         persist()
         refresh()
         refreshStorage()
@@ -211,8 +280,26 @@ final class AppModel: ObservableObject {
     }
 
     func stopDownloading(_ torrent: Torrent, fileIndex: Int) {
-        torrent.setWanted(false, fileIndex: fileIndex)
-        explicitDownloads.remove(key(torrent, fileIndex))
+        stopDownloading(torrent, fileIndices: [fileIndex])
+    }
+
+    func download(_ torrent: Torrent, fileIndices: [Int]) {
+        torrent.resume()
+        for i in fileIndices {
+            torrent.setWanted(true, fileIndex: i)
+            explicitDownloads.insert(key(torrent, i))
+        }
+        persist()
+        refresh()
+        showToast(fileIndices.count == 1 ? "Download started" : "Downloading \(Format.videos(fileIndices.count))",
+                  systemImage: "arrow.down.circle")
+    }
+
+    func stopDownloading(_ torrent: Torrent, fileIndices: [Int]) {
+        for i in fileIndices {
+            torrent.setWanted(false, fileIndex: i)
+            explicitDownloads.remove(key(torrent, i))
+        }
         persist()
         refresh()
     }
@@ -256,12 +343,16 @@ final class AppModel: ObservableObject {
             .prefix(40)
             .map { SubtitleRef(name: $0.displayPath, url: client.streamURL(for: torrent, fileIndex: $0.index, fileName: $0.fileName)) }
         let resume = defaults.bool(forKey: SettingsKey.resumePlayback) ? savedPosition(torrent: torrent, file: file) : nil
+        defaults.set(file.index, forKey: lastPlayedKey(torrent.infoHashHex))
         return PlaybackRequest(torrent: torrent, file: file, url: url, subtitles: Array(subs), resumeAt: resume)
     }
+
+    private func lastPlayedKey(_ hash: String) -> String { "last.\(hash)" }
 
     /// Called when the player closes.
     func playbackEnded(torrent: Torrent, file: TorrentFile, positionSeconds: Double, durationSeconds: Double) {
         savePosition(torrent: torrent, file: file, seconds: positionSeconds, duration: durationSeconds)
+        defaults.set(file.index, forKey: lastPlayedKey(torrent.infoHashHex))
         let keep = defaults.bool(forKey: SettingsKey.keepDownloading)
         let complete = torrent.status().files.first { $0.file.index == file.index }?.isComplete ?? false
         if !keep && !complete && !explicitDownloads.contains(key(torrent, file.index)) {
@@ -288,25 +379,57 @@ final class AppModel: ObservableObject {
         return min(1, pos / dur)
     }
 
+    /// Watched to the end credits.
+    func isWatched(torrent: Torrent, file: TorrentFile) -> Bool {
+        (watchedFraction(torrent: torrent, file: file) ?? 0) >= 0.9
+    }
+
+    /// Videos in the order they should be watched, without samples when there is real content.
+    func playlist(_ status: TorrentStatus) -> [TorrentFile] {
+        let media = status.files.map(\.file).filter { !$0.isPadding && $0.kind.isPlayable }
+        let videos = media.filter { $0.kind == .video }
+        let pool = videos.isEmpty ? media : videos
+        let content = pool.filter { !$0.fileName.lowercased().contains("sample") }
+        return (content.isEmpty ? pool : content)
+            .sorted { FileTree.naturalOrder($0.displayPath, $1.displayPath) }
+    }
+
+    /// The video the Play button starts: the one in progress, the episode after the last one finished, the movie
+    /// when one file dominates, or the first episode.
+    func upNext(_ item: LibraryItem) -> UpNext? {
+        let list = playlist(item.status)
+        guard !list.isEmpty else { return nil }
+        let torrent = item.torrent
+
+        func make(_ f: TorrentFile) -> UpNext {
+            let resume = defaults.bool(forKey: SettingsKey.resumePlayback) ? savedPosition(torrent: torrent, file: f) : nil
+            let dur = defaults.double(forKey: "pos.\(key(torrent, f.index)).dur")
+            return UpNext(file: f, resumeAt: resume, remaining: resume.map { dur - $0 })
+        }
+
+        if defaults.object(forKey: lastPlayedKey(torrent.infoHashHex)) != nil,
+           let i = list.firstIndex(where: { $0.index == defaults.integer(forKey: lastPlayedKey(torrent.infoHashHex)) }) {
+            if isWatched(torrent: torrent, file: list[i]), i + 1 < list.count { return make(list[i + 1]) }
+            return make(list[i])
+        }
+        let total = list.reduce(Int64(0)) { $0 + $1.length }
+        if let largest = list.max(by: { $0.length < $1.length }), Double(largest.length) > Double(total) * 0.6 {
+            return make(largest)
+        }
+        return make(list[0])
+    }
+
     private func savePosition(torrent: Torrent, file: TorrentFile, seconds: Double, duration: Double) {
         let k = "pos.\(key(torrent, file.index))"
         defaults.set(seconds, forKey: k)
         if duration > 0 { defaults.set(duration, forKey: k + ".dur") }
     }
 
-    /// Next video in the torrent (episodes), by natural filename order.
+    /// Next video in the torrent (episodes), in playlist order across folders.
     func nextPlayable(after file: TorrentFile, in torrent: Torrent) -> TorrentFile? {
-        let videos = (torrent.torrentInfo?.files ?? [])
-            .filter { $0.kind == file.kind && !$0.isPadding }
-            .sorted { $0.displayPath.localizedStandardCompare($1.displayPath) == .orderedAscending }
-        guard let i = videos.firstIndex(of: file), i + 1 < videos.count else { return nil }
-        return videos[i + 1]
-    }
-
-    /// The file most likely to be "the movie".
-    func mainPlayable(_ status: TorrentStatus) -> FileStatus? {
-        status.files.filter { $0.file.kind == .video && !$0.file.isPadding }.max { $0.file.length < $1.file.length }
-            ?? status.files.filter { $0.file.kind == .audio }.first
+        let list = playlist(torrent.status())
+        guard let i = list.firstIndex(of: file), i + 1 < list.count else { return nil }
+        return list[i + 1]
     }
 
     func artworkURL(_ item: LibraryItem) -> URL? {

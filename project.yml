@@ -18,12 +18,14 @@ targets:
     dependencies:
       - package: TorrentKit
         product: TorrentKit
+      - package: TorrentKit
+        product: NyaaKit
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.simonfalke.TorrentStream
         PRODUCT_NAME: TorrentStream
-        MARKETING_VERSION: "2.1"
-        CURRENT_PROJECT_VERSION: "3"
+        MARKETING_VERSION: "2.2"
+        CURRENT_PROJECT_VERSION: "4"
         TARGETED_DEVICE_FAMILY: "1,2"
         SWIFT_VERSION: "5.0"
         CODE_SIGN_STYLE: Automatic

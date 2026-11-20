@@ -11,10 +11,11 @@ struct DownloadsView: View {
         let item: LibraryItem
         let file: FileStatus
         var id: String { "\(item.id)#\(file.file.index)" }
-        /// The torrent name only adds information when it differs from the file name.
+        /// The torrent name only adds information when it differs from the file's title.
         var source: String? {
             let base = (file.file.fileName as NSString).deletingPathExtension
-            return item.status.name == file.file.fileName || item.status.name == base ? nil : item.status.name
+            let name = item.status.name
+            return name == file.file.fileName || name == base || name == file.file.title ? nil : name
         }
     }
 
@@ -70,7 +71,7 @@ struct DownloadsView: View {
                     ProgressRing(progress: e.file.progress, lineWidth: 3, tint: s.isPaused ? .secondary : .accentColor)
                         .frame(width: Metrics.rowIcon, height: Metrics.rowIcon)
                     VStack(alignment: .leading, spacing: Space.xs) {
-                        Text(e.file.file.fileName)
+                        Text(e.file.file.title)
                             .foregroundStyle(.primary)
                             .lineLimit(2)
                         Text(progressText(e))
@@ -125,7 +126,7 @@ struct DownloadsView: View {
                         .foregroundStyle(.tint)
                         .frame(width: Metrics.rowIcon)
                     VStack(alignment: .leading, spacing: Space.xs) {
-                        Text(e.file.file.fileName)
+                        Text(e.file.file.title)
                             .foregroundStyle(.primary)
                             .lineLimit(2)
                         if let source = e.source {
@@ -134,7 +135,7 @@ struct DownloadsView: View {
                                 .foregroundStyle(.secondary)
                                 .lineLimit(1)
                         }
-                        Text(Format.bytes(e.file.file.length))
+                        Text(e.file.detailText)
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
                             .monospacedDigit()
@@ -155,7 +156,7 @@ struct DownloadsView: View {
                     .contentShape(.rect)
             }
             .buttonStyle(.borderless)
-            .accessibilityLabel("Actions for \(e.file.file.fileName)")
+            .accessibilityLabel("Actions for \(e.file.file.title)")
         }
         .contextMenu {
             FileActionsMenu(torrent: e.item.torrent, status: e.file, export: $export, onPlay: { play(e) })
@@ -175,26 +176,26 @@ struct SettingsView: View {
     @AppStorage(SettingsKey.autoPlayNext) private var autoPlayNext = true
     @AppStorage(SettingsKey.useDHT) private var useDHT = true
     @AppStorage(SettingsKey.publicTrackers) private var publicTrackers = true
+    @AppStorage(SettingsKey.nyaaAddress) private var nyaaAddress = ""
     @State private var confirmClear = false
+
+    private var selectedEngine: PlayerEngine { PlayerEngine(rawValue: engine) ?? .vlc }
 
     var body: some View {
         NavigationStack {
             Form {
-                Section("Playback") {
-                    if VLCAvailability.isAvailable {
+                if VLCAvailability.isAvailable {
+                    Section {
                         Picker("Player", selection: $engine) {
-                            ForEach(PlayerEngine.allCases) { e in
-                                VStack(alignment: .leading, spacing: Space.xxs) {
-                                    Text(e.title)
-                                    Text(e.detail)
-                                        .font(.subheadline)
-                                        .foregroundStyle(.secondary)
-                                }
-                                .tag(e.rawValue)
-                            }
+                            ForEach(PlayerEngine.allCases) { e in Text(e.title).tag(e.rawValue) }
                         }
-                        .pickerStyle(.inline)
+                        .pickerStyle(.menu)
+                    } footer: {
+                        Text(selectedEngine.detail + ".")
                     }
+                }
+
+                Section("Playback") {
                     Toggle("Resume Playback", isOn: $resumePlayback)
                     Toggle("Autoplay Next Episode", isOn: $autoPlayNext)
                 }
@@ -203,6 +204,21 @@ struct SettingsView: View {
                     Toggle("Keep Downloading After Playback", isOn: $keepDownloading)
                 } footer: {
                     Text("Videos you start keep downloading after you close the player, so they’re ready to watch offline.")
+                }
+
+                Section {
+                    LabeledContent("Nyaa Address") {
+                        TextField("nyaa.si", text: $nyaaAddress)
+                            .multilineTextAlignment(.trailing)
+                            .keyboardType(.URL)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .submitLabel(.done)
+                    }
+                } header: {
+                    Text("Search")
+                } footer: {
+                    Text("Use a mirror if nyaa.si is blocked on your network.")
                 }
 
                 Section {

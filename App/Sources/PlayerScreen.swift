@@ -639,7 +639,7 @@ private struct PlayerChrome: View {
                 GlassIconButton(systemImage: "xmark", label: "Close") { dismiss() }
 
                 VStack(alignment: .leading, spacing: Space.xxs) {
-                    Text(request.file.fileName)
+                    Text(request.file.title)
                         .font(.subheadline.weight(.semibold))
                         .lineLimit(1)
                     if let text = streamText {
@@ -851,7 +851,7 @@ private struct PlayerChrome: View {
                 Text("Up Next")
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(.white.opacity(0.8))
-                Text(next.fileName)
+                Text(next.title)
                     .font(.headline)
                     .lineLimit(2)
             }
