@@ -42,6 +42,19 @@ jobs:
           cp -R build/Build/Products/Release-iphoneos/TorrentStream.app Payload/
           zip -qry TorrentStream-unsigned.ipa Payload
           ls -lh TorrentStream-unsigned.ipa
+      - name: Validate IPA
+        run: |
+          set -e
+          unzip -tq TorrentStream-unsigned.ipa
+          rm -rf ipa-check && mkdir ipa-check && unzip -q TorrentStream-unsigned.ipa -d ipa-check
+          app=ipa-check/Payload/TorrentStream.app
+          plutil -lint "$app/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' -c 'Print :CFBundleIdentifier' -c 'Print :CFBundleShortVersionString' -c 'Print :CFBundleVersion' "$app/Info.plist"
+          lipo -info "$app/TorrentStream" "$app/Frameworks/MobileVLCKit.framework/MobileVLCKit"
+          otool -L "$app/TorrentStream" | grep '@rpath' | while read -r lib _; do
+            test -e "$app/Frameworks/${lib#@rpath/}" || { echo "missing embedded $lib"; exit 1; }
+          done
+          shasum -a 256 TorrentStream-unsigned.ipa
       - uses: actions/upload-artifact@v4
         with:
           name: TorrentStream-unsigned-ipa
