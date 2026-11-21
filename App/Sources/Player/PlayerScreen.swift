@@ -308,6 +308,11 @@ private struct PlayerChrome: View {
             loadSkips()
         }
         .onChange(of: Int(engine.currentTime)) {
+            // Going back before the ending brings the card back the next time the ending comes round.
+            if nextDismissed, !engine.didFinish, engine.duration > 0,
+               engine.currentTime < (creditsStart ?? engine.duration) - 2 {
+                nextDismissed = false
+            }
             guard engine.isPlaying, !engine.isBuffering, engine.duration > 0 else { return }
             steadySeconds += 1
             if steadySeconds == Self.steadyBeforePrefetch {
