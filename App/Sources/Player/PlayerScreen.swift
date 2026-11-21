@@ -73,6 +73,8 @@ private struct PlayerContainer: View {
     @State private var previews: SeekPreviews?
     @State private var nowPlaying = NowPlaying()
     @State private var backgroundTask: Task<Void, Never>?
+    /// Held in state so re-rendering doesn't restart it.
+    @State private var saveTimer = Timer.publish(every: 10, on: .main, in: .common).autoconnect()
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
@@ -101,8 +103,12 @@ private struct PlayerContainer: View {
         .onReceive(ExternalDisplay.shared.$isConnected.dropFirst()) { connected in
             engine?.showOnTV(connected)
         }
+        .onReceive(saveTimer) { _ in
+            if engine?.isPlaying == true { saveProgress() }
+        }
         .onChange(of: scenePhase) { _, phase in
             backgroundTask?.cancel()
+            if phase != .active { saveProgress() }
             switch phase {
             case .background:
                 // Picture in Picture starts as the app leaves; give it a moment to say so.
@@ -124,13 +130,22 @@ private struct PlayerContainer: View {
             secondary.shutdown()
             nowPlaying.deactivate()
             if let e = engine {
-                let position = e.didFinish ? e.duration : e.currentTime
+                let position = e.positionToSave
                 model.playbackEnded(torrent: request.torrent, file: request.file,
                                     positionSeconds: position, durationSeconds: e.duration)
                 shows.playbackEnded(request, position: position, duration: e.duration)
                 e.shutdown()
             }
         }
+    }
+
+    /// Remembers the position as playback goes, so a closed or killed app still resumes in the right place.
+    private func saveProgress() {
+        guard let e = engine, e.duration > 0, !e.didFinish else { return }
+        let position = e.positionToSave
+        guard position > 0 else { return }
+        model.playbackProgressed(torrent: request.torrent, file: request.file, positionSeconds: position, durationSeconds: e.duration)
+        shows.playbackEnded(request, position: position, duration: e.duration)
     }
 }
 

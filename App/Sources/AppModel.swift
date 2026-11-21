@@ -786,6 +786,12 @@ final class AppModel: ObservableObject {
         return make(list[0])
     }
 
+    /// Saves the position while playing, so it survives the app being closed or killed mid-episode.
+    func playbackProgressed(torrent: Torrent, file: TorrentFile, positionSeconds: Double, durationSeconds: Double) {
+        guard positionSeconds > 0 else { return }
+        savePosition(torrent: torrent, file: file, seconds: positionSeconds, duration: durationSeconds)
+    }
+
     private func savePosition(torrent: Torrent, file: TorrentFile, seconds: Double, duration: Double) {
         let k = "pos.\(key(torrent, file.index))"
         defaults.set(seconds, forKey: k)

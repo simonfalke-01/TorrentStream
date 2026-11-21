@@ -125,6 +125,14 @@ final class PlaybackEngine: ObservableObject {
     private var hasPlayed = false
     /// Between asking libVLC to start again and it doing so, a stopped state isn't the end of the video.
     private var restarting = false
+    private var restartBegan = Date()
+    /// Times the stream was reopened after ending early; reset once playback has run well for a while.
+    private var recoveries = 0
+    private var lastRecovery = Date.distantPast
+    private static let maxRecoveries = 6
+    /// Where the viewer left off last time, checked once the picture is up.
+    private let resumeAt: Double?
+    private var resumeChecked = false
 
     /// - Parameter memoryKey: what audio and subtitle choices are remembered under, usually the show.
     init(request: PlaybackRequest, memoryKey: String) {
@@ -136,6 +144,7 @@ final class PlaybackEngine: ObservableObject {
         subtitleFiles = request.subtitles.prefix(8).map(\.url)
         self.memoryKey = memoryKey
         preferDub = UserDefaults.standard.bool(forKey: SettingsKey.preferDub)
+        resumeAt = request.resumeAt.flatMap { $0 > 0 ? $0 : nil }
 
         player.drawable = output
         load(from: request.resumeAt)
@@ -213,12 +222,32 @@ final class PlaybackEngine: ObservableObject {
         }
 
         if state == .playing { hasPlayed = true; restarting = false }
+        if restarting, Date().timeIntervalSince(restartBegan) > 20 { restarting = false }
+        if recoveries > 0, state == .playing, Date().timeIntervalSince(lastRecovery) > 60 { recoveries = 0 }
+
+        // A stream that stops short of the end didn't finish: the read from the torrent was cut off (a cold
+        // swarm after a relaunch, a connection iOS closed while the app was away). Open it again where the
+        // viewer was, rather than calling the episode over and saving it as watched.
+        let ended = state == .stopped || state == .stopping
+        if (state == .error || (ended && hasPlayed)) && !restarting {
+            let at = currentTime
+            let atEnd = duration > 0 && at >= duration - max(15, duration * 0.02)
+            if !atEnd && recoveries < Self.maxRecoveries {
+                recoveries += 1
+                lastRecovery = Date()
+                PlaybackTrace.shared.mark(String(format: "stream \(state == .error ? "failed" : "ended early") at %.1fs of %.0fs; reopening (try %d)",
+                                                 at, duration, recoveries))
+                isBuffering = true
+                restart(from: at, after: recoveries == 1 ? 0 : Double(recoveries))
+                return
+            }
+        }
         if state == .error {
             if errorText == nil { errorText = "This video couldn’t be played." }
             isBuffering = false
             return
         }
-        if (state == .stopped || state == .stopping) && hasPlayed && !restarting {
+        if ended && hasPlayed && !restarting {
             if !didFinish {
                 didFinish = true
                 output.invalidatePlaybackState()
@@ -259,6 +288,16 @@ final class PlaybackEngine: ObservableObject {
             }
         }
         if seekTarget == nil, t > 0 { currentTime = now }
+
+        // libVLC sometimes ignores the start time (a file it can't seek in yet); go there once it can.
+        if !resumeChecked, let r = resumeAt, duration > 0, t > 0, state == .playing {
+            resumeChecked = true
+            if r > 15, now < r - 15, r < duration - 5 {
+                PlaybackTrace.shared.mark(String(format: "started at %.1fs instead of %.1fs; seeking there", now, r))
+                player.position = r / duration
+                markSeek(r)
+            }
+        }
 
         let size = player.videoSize
         if size.width > 0, size != videoSize { videoSize = size }
@@ -382,16 +421,25 @@ final class PlaybackEngine: ObservableObject {
 
     func replay() { restart(from: 0) }
 
+    /// Where the viewer got to, for remembering: the end once finished, and the old resume point until playback
+    /// has actually reached it, so a slow or failed start never overwrites it with the opening seconds.
+    var positionToSave: Double {
+        if didFinish { return duration }
+        if let r = resumeAt, !resumeChecked { return r }
+        return currentTime
+    }
+
     /// A stopped player can't seek; open the file again at `start`.
-    private func restart(from start: Double) {
+    private func restart(from start: Double, after delay: Double = 0) {
         didFinish = false
         restarting = true
+        restartBegan = Date()
         tracksSettled = false
         markSeek(start)
         let p = player
         DispatchQueue.global(qos: .userInitiated).async {
             p.stop()
-            DispatchQueue.main.async { [weak self] in
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
                 MainActor.assumeIsolated {
                     guard let self else { return }
                     self.load(from: start)
