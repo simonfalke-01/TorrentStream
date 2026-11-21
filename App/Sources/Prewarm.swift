@@ -379,7 +379,7 @@ final class Prewarmer {
     /// Every range has arrived, checked one byte every 2 MB and at each end. Doesn't fetch or wait.
     nonisolated private static func isLoaded(torrent: Torrent, fileIndex: Int, ranges: [Range<Int64>]) async -> Bool {
         for r in ranges where !r.isEmpty {
-            var probes = Array(stride(from: r.lowerBound, to: r.upperBound, by: Int64(2 << 20)))
+            var probes = Array(stride(from: r.lowerBound, to: r.upperBound, by: 2 << 20))
             probes.append(r.upperBound - 1)
             for p in probes.reversed() {
                 if await torrent.waitForBlocks(fileIndex: fileIndex, offset: p, length: 1, timeout: 0) == nil { return false }
