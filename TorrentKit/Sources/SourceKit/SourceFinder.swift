@@ -38,14 +38,19 @@ public final class SourceFinder: @unchecked Sendable {
         self.nyaa = nyaa
     }
 
+    /// `provisional` is called with the releases ranked so far each time one of the searches answers before the
+    /// last, so the caller can start fetching the likely winners' .torrent files while the rest are still running.
     public func sources(for details: ShowDetails, season: ShowSeason, episode: ShowEpisode,
-                        prefs: SourcePreferences) async throws -> [EpisodeSource] {
+                        prefs: SourcePreferences,
+                        provisional: (@Sendable ([EpisodeSource]) -> Void)? = nil) async throws -> [EpisodeSource] {
         let queries = Self.queries(details: details, season: season, episode: episode)
-        var results = try await search(queries)
+        var results = try await search(queries) { partial in
+            provisional?(Self.rank(partial, details: details, season: season, episode: episode, prefs: prefs))
+        }
         var sources = Self.rank(results, details: details, season: season, episode: episode, prefs: prefs)
         if sources.count < 3 {
             let extra = Self.fallbackQueries(details: details, season: season, episode: episode).filter { !queries.contains($0) }
-            if !extra.isEmpty, let more = try? await search(extra) {
+            if !extra.isEmpty, let more = try? await search(extra, partial: nil) {
                 results += more
                 sources = Self.rank(results, details: details, season: season, episode: episode, prefs: prefs)
             }
@@ -54,7 +59,7 @@ public final class SourceFinder: @unchecked Sendable {
     }
 
     /// Runs searches side by side. Fails only when every one fails.
-    private func search(_ queries: [NyaaQuery]) async throws -> [NyaaResult] {
+    private func search(_ queries: [NyaaQuery], partial: (([NyaaResult]) -> Void)?) async throws -> [NyaaResult] {
         try await withThrowingTaskGroup(of: Result<[NyaaResult], Error>.self) { group in
             for q in queries {
                 group.addTask {
@@ -64,9 +69,14 @@ public final class SourceFinder: @unchecked Sendable {
             var out: [NyaaResult] = []
             var lastError: Error?
             var anySuccess = false
+            var answered = 0
             for try await r in group {
+                answered += 1
                 switch r {
-                case .success(let list): out += list; anySuccess = true
+                case .success(let list):
+                    out += list
+                    anySuccess = true
+                    if answered < queries.count, !list.isEmpty { partial?(out) }
                 case .failure(let e): lastError = e
                 }
             }

@@ -126,11 +126,7 @@ struct PosterImage: View {
             }
             .overlay {
                 if let url {
-                    AsyncImage(url: url, transaction: Transaction(animation: Motion.standard)) { phase in
-                        if let image = phase.image {
-                            image.resizable().scaledToFill().transition(.opacity)
-                        }
-                    }
+                    PipelineImage(url: url)
                 }
             }
             .clipShape(.rect(cornerRadius: cornerRadius, style: .continuous))

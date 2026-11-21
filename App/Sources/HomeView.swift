@@ -39,6 +39,7 @@ struct HomeView: View {
     @State private var export: ExportItem?
     @State private var playing: PlaybackRequest?
     @State private var launch: EpisodeLaunch?
+    @Environment(\.displayScale) private var displayScale
 
     /// Shelves show this many posters before offering See All.
     private let shelfLimit = 12
@@ -82,17 +83,57 @@ struct HomeView: View {
         }
     }
 
+    /// Everything on screen comes from disk first; the catalog rows and the started shows' episodes are then
+    /// brought up to date together, and what the viewer is likely to open or play next is fetched ahead.
     private func load(force: Bool = false) async {
-        await shows.loadRows(force: force)
-        await shows.adoptLinkedTitles()
-        // Continue Watching needs each started show's episodes to know what plays next.
-        for h in shows.history.prefix(10) {
-            _ = try? await shows.loadDetails(h.show)
-        }
+        let shows = self.shows
+        let started = Date()
+        PlaybackTrace.shared.launch("home shown (\(shows.rows.count) rows, \(shows.history.count) started on disk)")
         // The show at the front of Continue Watching is the likeliest next play; have it ready.
+        warmFirst()
+        prefetchArtwork()
+        async let rows: Void = shows.loadRows(force: force)
+        async let startedShows: Void = shows.refreshContinueWatching()
+        _ = await (rows, startedShows)
+        PlaybackTrace.shared.timing("home rows and Continue Watching up to date", since: started)
+        PlaybackTrace.shared.launch("home up to date")
+        warmFirst()
+        prefetchArtwork()
+        shows.planContinueWatching()
+        // Shows likely to be opened next: the start of My List and of the first shelf.
+        var likely: [Show] = shows.myList.prefix(3).map { $0 }
+        likely += shows.rows.first?.shows.prefix(4) ?? []
+        shows.prefetchDetails(likely)
+        await shows.adoptLinkedTitles()
+    }
+
+    private func warmFirst() {
         if let first = shows.continueWatching.first, let d = shows.details[first.entry.show.id] {
             shows.warm(d)
         }
+    }
+
+    /// Downloads the hero and Continue Watching artwork, and decodes the posters of the first screen of each
+    /// shelf, so they appear on their first frame.
+    private func prefetchArtwork() {
+        let pipeline = ImagePipeline.shared
+        var wide: [URL] = []
+        for c in continuing.prefix(6) {
+            switch c {
+            case .show(let entry, let next):
+                if let u = next?.episode.thumbnailURL ?? entry.show.bannerURL ?? entry.show.posterURL { wide.append(u) }
+            case .link(let entry, _):
+                if let u = model.backdropURL(entry.item) ?? model.posterURL(entry.item) { wide.append(u) }
+            }
+        }
+        if continuing.isEmpty, let show = shows.rows.first?.shows.first, let u = show.bannerURL ?? show.posterURL {
+            wide.append(u)
+        }
+        pipeline.prefetch(wide)
+        let poster = CGSize(width: Metrics.shelfPoster.width * displayScale, height: Metrics.shelfPoster.height * displayScale)
+        var posters = shows.myList.prefix(4).compactMap(\.posterURL)
+        for row in shows.rows { posters += row.shows.prefix(4).compactMap(\.posterURL) }
+        pipeline.prefetch(posters, pixels: poster)
     }
 
     @ViewBuilder

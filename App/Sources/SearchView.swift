@@ -135,22 +135,48 @@ struct SearchView: View {
             phase = .idle
             return
         }
-        if let hit = cache[q.lowercased()] {
+        let key = q.lowercased()
+        if let hit = cache[key] {
             phase = .loaded(query: q, shows: hit)
+            prefetchTop(hit)
             return
         }
-        // Wait for typing to pause; the catalog limits how often it can be asked.
-        try? await Task.sleep(for: .milliseconds(400))
+        let started = Date()
+        // Straight away: what was found for the start of this query, else shows the app already knows.
+        let early = narrowed(q) ?? shows.localMatches(q)
+        if !early.isEmpty { phase = .loaded(query: q, shows: early) }
+        // Wait for typing to pause; superseded searches are cancelled along with their requests.
+        try? await Task.sleep(for: .milliseconds(250))
         guard !Task.isCancelled else { return }
         if case .loaded = phase {} else { phase = .loading }
         do {
             let found = try await shows.search(q)
             guard !Task.isCancelled else { return }
-            cache[q.lowercased()] = found
-            phase = .loaded(query: q, shows: found)
+            PlaybackTrace.shared.timing("search \"\(q)\" (\(found.count) found)", since: started)
+            cache[key] = found
+            phase = .loaded(query: q, shows: found.isEmpty ? early : found)
+            prefetchTop(found)
         } catch {
             guard !Task.isCancelled else { return }
-            phase = .failed(PlaybackLauncher.message(for: error))
+            if early.isEmpty { phase = .failed(PlaybackLauncher.message(for: error)) }
+        }
+    }
+
+    /// Earlier results for a shorter query, kept to the ones that still match.
+    private func narrowed(_ q: String) -> [Show]? {
+        let key = q.lowercased()
+        guard let prefix = cache.keys.filter({ key.hasPrefix($0) }).max(by: { $0.count < $1.count }) else { return nil }
+        let list = cache[prefix, default: []].filter { ShowsModel.matches($0, q) }
+        return list.isEmpty ? nil : list
+    }
+
+    /// Once the results have stayed put a moment, the top one's episodes are fetched so opening it is instant.
+    private func prefetchTop(_ list: [Show]) {
+        guard let top = list.first else { return }
+        Task {
+            try? await Task.sleep(for: .milliseconds(800))
+            guard case .loaded(_, let shown) = phase, shown.first?.id == top.id else { return }
+            shows.prefetchDetails([top])
         }
     }
 

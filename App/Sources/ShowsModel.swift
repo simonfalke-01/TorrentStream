@@ -47,6 +47,12 @@ struct SavedSource: Codable, Hashable {
     var isBatch: Bool
 }
 
+/// A release picked ahead of time for an episode the viewer is likely to play next.
+struct PlannedSource: Codable, Hashable {
+    var source: SavedSource
+    var at: Date
+}
+
 /// Something to start: an episode, the show's next episode, or a movie.
 struct EpisodeLaunch: Identifiable {
     let id = UUID()
@@ -128,7 +134,14 @@ final class ShowsModel: ObservableObject {
     private var enriched: Set<Int> = []
     private var prefetchTask: Task<Void, Never>?
     private var warmTask: Task<Void, Never>?
+    /// Episode the running warm task is for.
+    private var warmKey: String?
     private weak var warmed: Torrent?
+    /// Releases picked ahead of time, by episode key.
+    private var planned: [String: PlannedSource] = [:]
+    private var planTask: Task<Void, Never>?
+    /// How long a release picked ahead of time is trusted to still be the best one.
+    private static let planLifetime: TimeInterval = 6 * 3600
 
     private struct Saved: Codable {
         var myList: [Show] = []
@@ -138,6 +151,7 @@ final class ShowsModel: ObservableObject {
         var groups: [String: String] = [:]
         var roots: [String: Int] = [:]
         var addedAt: [String: Date]? = nil
+        var planned: [String: PlannedSource]? = nil
     }
 
     private struct SavedRows: Codable {
@@ -179,12 +193,44 @@ final class ShowsModel: ObservableObject {
         try await catalog.search(text)
     }
 
-    /// Loads shows like this one for the bottom of its page.
+    /// Shows the app already knows whose names hold every word typed: My List and started shows first, then
+    /// the home shelves and shows seen this session. Shown while the catalog is asked.
+    func localMatches(_ text: String, limit: Int = 12) -> [Show] {
+        var seen = Set<Int>()
+        var out: [Show] = []
+        func consider(_ show: Show) {
+            guard out.count < limit, Self.matches(show, text), seen.insert(rootID(show)).inserted else { return }
+            out.append(show)
+        }
+        myList.forEach(consider)
+        history.forEach { consider(details[$0.show.id]?.show ?? $0.show) }
+        rows.forEach { $0.shows.forEach(consider) }
+        details.values.forEach { consider($0.show) }
+        recommendations.values.forEach { $0.forEach(consider) }
+        return out
+    }
+
+    nonisolated static func matches(_ show: Show, _ text: String) -> Bool {
+        let words = text.split(whereSeparator: { $0.isWhitespace })
+        guard !words.isEmpty else { return false }
+        let names = ([show.title, show.romaji, show.english].compactMap { $0 } + show.synonyms).joined(separator: " ")
+        return words.allSatisfy { names.localizedStandardContains($0) }
+    }
+
+    /// Loads shows like this one for the bottom of its page. Waits behind what the viewer is waiting on when
+    /// AniList's request budget is low.
     func loadRecommendations(_ show: Show) async {
         let root = rootID(show)
         guard recommendations[root] == nil else { return }
-        let list = (try? await catalog.recommendations(id: root)) ?? []
-        recommendations[root] = list.filter { $0.id != root && !$0.isUpcoming }
+        let catalog = self.catalog
+        do {
+            let list = try await CatalogPriority.$isBackground.withValue(true) { try await catalog.recommendations(id: root) }
+            recommendations[root] = list.filter { $0.id != root && !$0.isUpcoming }
+        } catch CatalogError.rateLimited {
+            // Tried again next time the page opens.
+        } catch {
+            recommendations[root] = []
+        }
     }
 
     /// What airs from two days ago to six days ahead. Refreshed every half hour.
@@ -212,22 +258,83 @@ final class ShowsModel: ObservableObject {
         return list
     }
 
-    /// Seasons and episodes, from memory or disk when fresh enough, else from the catalog. A stale copy is
-    /// returned when the catalog can't be reached.
+    /// Seasons and episodes. A copy from memory or disk is returned at once unless an episode has aired since it
+    /// was fetched; an old copy is then refreshed in the background (the page updates when it arrives). A stale
+    /// copy is also returned when the catalog can't be reached.
     @discardableResult
     func loadDetails(_ show: Show, force: Bool = false) async throws -> ShowDetails {
         let root = rootID(show)
-        if !force, let d = cachedDetails(show), isFresh(d) {
-            if !enriched.contains(root), Self.missesEpisodeInfo(d) { Task { await enrich(d) } }
+        if !force, let d = cachedDetails(show), !Self.hasAiredSinceFetch(d) {
+            if !isFresh(d) {
+                refreshDetails(show)
+            } else if !enriched.contains(root), Self.missesEpisodeInfo(d) {
+                Task { await enrich(d) }
+            }
             return d
         }
-        if let running = detailsTasks[root] { return try await running.value }
-        let task = Task { try await catalog.details(id: show.id) }
+        return try await fetchDetails(show, background: false)
+    }
+
+    /// Brings a show's details up to date without anyone waiting on it.
+    func refreshDetails(_ show: Show) {
+        guard detailsTasks[rootID(show)] == nil else { return }
+        Task { _ = try? await fetchDetails(show, background: true) }
+    }
+
+    /// Details of shows the viewer is likely to open next, fetched while AniList's request budget has room.
+    func prefetchDetails(_ list: [Show]) {
+        var started = 0
+        for show in list where details[rootID(show)] == nil && detailsTasks[rootID(show)] == nil {
+            // Known spare requests, or a couple when nothing is known yet.
+            guard started < (AniListBudget.shared.spare.map { $0 / 2 } ?? 2) else { return }
+            guard cachedDetails(show) == nil else { continue }
+            started += 1
+            Task { _ = try? await fetchDetails(show, background: true) }
+        }
+    }
+
+    /// Continue Watching needs each started show's episodes to know what plays next. All are brought up to date
+    /// at once; ones on disk without newly aired episodes don't hold anything up.
+    func refreshContinueWatching() async {
+        let list = history.prefix(10).map(\.show)
+        await withTaskGroup(of: Void.self) { group in
+            for show in list {
+                group.addTask { @MainActor in _ = try? await self.loadDetails(show) }
+            }
+        }
+    }
+
+    /// "New Episode" in My List needs each airing show's episodes. Copies on disk show at once; old ones are
+    /// brought up to date together in the background.
+    func refreshMyList() {
+        for show in myList.prefix(30) where show.isAiring {
+            if let d = cachedDetails(show), isFresh(d), !Self.hasAiredSinceFetch(d) { continue }
+            refreshDetails(show)
+        }
+    }
+
+    private func fetchDetails(_ show: Show, background: Bool) async throws -> ShowDetails {
+        let root = rootID(show)
+        if let running = detailsTasks[root] {
+            do {
+                return try await running.value
+            } catch CatalogError.rateLimited where !background {
+                // That was a background request giving way; this one is wanted now.
+            } catch {
+                if let d = cachedDetails(show) { return d }
+                throw error
+            }
+        }
+        let catalog = self.catalog
+        let id = show.id
+        let started = Date()
+        let task = Task { try await CatalogPriority.$isBackground.withValue(background) { try await catalog.details(id: id) } }
         detailsTasks[root] = task
-        defer { detailsTasks[root] = nil }
+        defer { if detailsTasks[root] == task { detailsTasks[root] = nil } }
         do {
             // Keep the names and stills found last time while the new copy is looked up again.
             let fetched = try await task.value
+            PlaybackTrace.shared.timing("details \(fetched.show.title) (\(background ? "background" : "waited on"))", since: started)
             let d = Self.carryingEpisodeInfo(from: details[root], into: fetched)
             store(d)
             Task { await enrich(d) }
@@ -250,6 +357,11 @@ final class ShowsModel: ObservableObject {
     private func isFresh(_ d: ShowDetails) -> Bool {
         let airing = d.seasons.contains { $0.media.isAiring || $0.media.isUpcoming }
         return Date().timeIntervalSince(d.fetchedAt) < (airing ? 6 * 3600 : 7 * 86400)
+    }
+
+    /// An airing season's next episode was due before now, so the copy lacks an episode the viewer may want.
+    static func hasAiredSinceFetch(_ d: ShowDetails, now: Date = Date()) -> Bool {
+        d.seasons.contains { s in s.media.nextAiringAt.map { $0 <= now } ?? false }
     }
 
     private func store(_ d: ShowDetails) {
@@ -409,8 +521,12 @@ final class ShowsModel: ObservableObject {
     func warm(_ d: ShowDetails) {
         guard let next = upNext(d), next.episode.isAired else { return }
         let key = Self.key(d.show.id, next.season.id, next.episode.number)
+        // Already on it.
+        if warmKey == key, warmTask != nil { return }
         warmTask?.cancel()
+        warmKey = key
         warmTask = Task {
+            defer { if warmKey == key { warmTask = nil; warmKey = nil } }
             if prepared[key] == nil, let r = try? await resolve(d, next.season, next.episode, source: nil, status: { _ in }) {
                 prepared[key] = r
             }
@@ -482,15 +598,22 @@ final class ShowsModel: ObservableObject {
     func preferencesChanged() {
         sourceCache.removeAll()
         prepared.removeAll()
+        planned.removeAll()
+        save()
     }
 
-    /// Releases that play an episode, best first. Kept for ten minutes.
+    /// Releases that play an episode, best first. Kept for ten minutes. The likeliest picks' .torrent files start
+    /// downloading as soon as the first search answers, so opening one doesn't wait for a download.
     func sources(_ d: ShowDetails, _ s: ShowSeason, _ e: ShowEpisode, refresh: Bool = false) async throws -> [EpisodeSource] {
         let key = Self.key(d.show.id, s.id, e.number)
         if !refresh, let c = sourceCache[key], Date().timeIntervalSince(c.at) < 600 { return c.list }
         var prefs = preferences
         prefs.group = groups[String(d.show.id)]
-        let list = try await SourceFinder(nyaa: app.nyaa).sources(for: d, season: s, episode: e, prefs: prefs)
+        let store = app.torrentFiles
+        let list = try await SourceFinder(nyaa: app.nyaa).sources(for: d, season: s, episode: e, prefs: prefs) { partial in
+            store.prefetch(partial.prefix(2).compactMap(\.result.torrentURL))
+        }
+        store.prefetch(list.prefix(2).compactMap(\.result.torrentURL))
         sourceCache[key] = (Date(), list)
         return list
     }
@@ -522,13 +645,19 @@ final class ShowsModel: ObservableObject {
                 PlaybackTrace.shared.mark("resolve: release played before didn't open")
             }
             // Packs hold the next episodes too.
-            for other in savedSources.filter({ $0.key.hasPrefix("\(d.show.id).") && $0.value.isBatch }).map(\.value) {
-                guard let t = app.client.torrent(infoHashHex: other.infoHash), let info = t.torrentInfo,
-                      let f = Self.pickFile(info, s, e, isMovie: isMovie) else { continue }
-                if t.isPaused { t.resume() }
-                return ResolvedEpisode(torrent: t, file: f, source: SavedSource(infoHash: other.infoHash, fileIndex: f.index,
-                                                                                  magnet: other.magnet, torrentURL: other.torrentURL,
-                                                                                  group: other.group, isBatch: true))
+            if let r = packEpisode(d, s, e, isMovie: isMovie) {
+                PlaybackTrace.shared.mark("resolve: next file of a pack already added")
+                if r.torrent.isPaused { r.torrent.resume() }
+                return r
+            }
+            if let p = planned[key], Date().timeIntervalSince(p.at) < Self.planLifetime {
+                PlaybackTrace.shared.mark("resolve: opening the release picked ahead of time")
+                planned[key] = nil
+                if let r = await open(p.source) {
+                    PlaybackTrace.shared.mark("resolve: opened")
+                    return r
+                }
+                PlaybackTrace.shared.mark("resolve: release picked ahead of time didn't open")
             }
         }
 
@@ -577,6 +706,61 @@ final class ShowsModel: ObservableObject {
         let label = isMovie ? nil : [Self.episodeLabel(d, s, e), e.title].compactMap { $0 }.joined(separator: ": ")
         return app.playbackRequest(torrent: r.torrent, file: r.file)
             .with(title: isMovie ? s.media.title : d.show.title, episode: label, resumeAt: resumeAt ?? saved, show: ctx)
+    }
+
+    /// The episode's file in a season pack played before, if one holds it.
+    private func packEpisode(_ d: ShowDetails, _ s: ShowSeason, _ e: ShowEpisode, isMovie: Bool) -> ResolvedEpisode? {
+        var tried = Set<String>()
+        for other in savedSources.filter({ $0.key.hasPrefix("\(d.show.id).") && $0.value.isBatch }).map(\.value)
+        where tried.insert(other.infoHash).inserted {
+            // Read the file list without starting a source that doesn't hold the episode.
+            guard let info = app.sourceInfo(other.infoHash), let f = Self.pickFile(info, s, e, isMovie: isMovie),
+                  let t = app.sourceTorrent(other.infoHash) else { continue }
+            return ResolvedEpisode(torrent: t, file: f, source: SavedSource(infoHash: other.infoHash, fileIndex: f.index,
+                                                                              magnet: other.magnet, torrentURL: other.torrentURL,
+                                                                              group: other.group, isBatch: true))
+        }
+        return nil
+    }
+
+    // MARK: picking ahead of time
+
+    /// Picks the release for what plays next in the first Continue Watching shows: searches Nyaa, downloads the
+    /// best release's .torrent and finds the episode's file, so Play skips straight to joining the swarm. Shows are
+    /// done one after another, in the background.
+    func planContinueWatching(limit: Int = 4) {
+        let targets = continueWatching.prefix(limit).compactMap { c -> (ShowDetails, ShowSeason, ShowEpisode)? in
+            guard let next = c.next, next.episode.isAired, let d = details[c.entry.show.id] else { return nil }
+            return (d, next.season, next.episode)
+        }
+        planTask?.cancel()
+        planTask = Task {
+            for (d, s, e) in targets {
+                guard !Task.isCancelled else { return }
+                await plan(d, s, e)
+            }
+        }
+    }
+
+    private func plan(_ d: ShowDetails, _ s: ShowSeason, _ e: ShowEpisode) async {
+        let key = Self.key(d.show.id, s.id, e.number)
+        let isMovie = d.show.isMovie || s.media.isMovie
+        if savedSources[key] != nil || prepared[key] != nil { return }
+        if let p = planned[key], Date().timeIntervalSince(p.at) < Self.planLifetime { return }
+        if packEpisode(d, s, e, isMovie: isMovie) != nil { return }
+        let started = Date()
+        guard let list = try? await sources(d, s, e) else { return }
+        for c in list.prefix(2) {
+            guard let url = c.result.torrentURL, let data = try? await app.torrentFiles.data(for: url),
+                  let descriptor = try? TorrentDescriptor.parse(torrentData: data), let info = descriptor.info,
+                  let f = Self.pickFile(info, s, e, isMovie: isMovie) else { continue }
+            planned[key] = PlannedSource(source: SavedSource(infoHash: descriptor.infoHashHex, fileIndex: f.index,
+                                                             magnet: c.result.magnet ?? descriptor.magnetURI, torrentURL: url,
+                                                             group: c.group, isBatch: c.isBatch), at: Date())
+            save()
+            PlaybackTrace.shared.timing("picked ahead: \(d.show.title) \(Self.episodeLabel(d, s, e)) → \(c.result.title)", since: started)
+            return
+        }
     }
 
     /// Adds back a release played before.
@@ -714,6 +898,7 @@ final class ShowsModel: ObservableObject {
         s.groups = groups
         s.roots = Dictionary(uniqueKeysWithValues: roots.map { (String($0.key), $0.value) })
         s.addedAt = Dictionary(uniqueKeysWithValues: addedAt.map { (String($0.key), $0.value) })
+        s.planned = planned.filter { Date().timeIntervalSince($0.value.at) < Self.planLifetime }
         if let data = try? JSONEncoder().encode(s) { try? data.write(to: stateURL, options: .atomic) }
     }
 
@@ -726,6 +911,7 @@ final class ShowsModel: ObservableObject {
             groups = s.groups
             roots = Dictionary(uniqueKeysWithValues: s.roots.compactMap { k, v in Int(k).map { ($0, v) } })
             addedAt = Dictionary(uniqueKeysWithValues: (s.addedAt ?? [:]).compactMap { k, v in Int(k).map { ($0, v) } })
+            planned = (s.planned ?? [:]).filter { Date().timeIntervalSince($0.value.at) < Self.planLifetime }
         }
         if let data = try? Data(contentsOf: rowsURL), let r = try? JSONDecoder().decode(SavedRows.self, from: data) {
             rows = r.rows

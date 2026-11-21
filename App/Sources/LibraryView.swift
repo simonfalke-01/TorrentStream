@@ -63,7 +63,7 @@ struct LibraryView: View {
             .routeDestinations()
             .task {
                 // "New Episode" needs each saved show's episodes.
-                for s in shows.myList.prefix(30) where s.isAiring { _ = try? await shows.loadDetails(s) }
+                shows.refreshMyList()
             }
             .fullScreenCover(item: $playing) { req in PlayerScreen(request: req) }
             .fullScreenCover(item: $launch) { PlaybackLauncher(launch: $0) }

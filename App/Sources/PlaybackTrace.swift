@@ -37,6 +37,39 @@ final class PlaybackTrace: @unchecked Sendable {
         }
     }
 
+    /// When the process started, for launch and page-load timings.
+    static let processStart: Date = {
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.stride
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()]
+        guard sysctl(&mib, u_int(mib.count), &info, &size, nil, 0) == 0 else { return Date() }
+        let t = info.kp_proc.p_un.__p_starttime
+        return Date(timeIntervalSince1970: TimeInterval(t.tv_sec) + TimeInterval(t.tv_usec) / 1_000_000)
+    }()
+
+    /// Notes a step of launch or of loading a screen, timed from process start, in its own section.
+    func launch(_ event: String) {
+        let now = Date()
+        queue.async {
+            if !self.launchStarted {
+                self.launchStarted = true
+                self.append("")
+                self.append("=== Launch — \(now.formatted(date: .abbreviated, time: .standard))")
+            }
+            self.append(String(format: "%8.2fs  ", now.timeIntervalSince(Self.processStart)) + "[launch] " + event)
+        }
+    }
+
+    private var launchStarted = false
+
+    /// Times something that isn't part of a playback start (a page or a search), from `start`.
+    func timing(_ event: String, since start: Date) {
+        let now = Date()
+        queue.async {
+            self.append(String(format: "%8.2fs  ", now.timeIntervalSince(start)) + "[load] " + event)
+        }
+    }
+
     private func append(_ line: String) {
         lines.append(line)
         if lines.count > maxLines { lines.removeFirst(lines.count - maxLines) }

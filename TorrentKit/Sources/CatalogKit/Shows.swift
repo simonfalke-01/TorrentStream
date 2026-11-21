@@ -230,12 +230,62 @@ public final class ShowCatalog: @unchecked Sendable {
     }
 
     /// Shows and movies matching what the user typed, best match first. Searches Kitsu, which has no request
-    /// limit, and falls back to AniList when Kitsu can't be reached.
+    /// limit, and falls back to AniList when Kitsu can't be reached. Kitsu often takes over a second, so when it
+    /// hasn't answered after `hedgeDelay` and AniList's request budget has room, AniList is asked too and whichever
+    /// answers first is used.
     public func search(_ text: String) async throws -> [Show] {
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !t.isEmpty else { return [] }
-        if let found = try? await kitsuSearch(t) { return found }
-        return try await anilistSearch(t)
+        return try await hedged(primary: { try await self.kitsuSearch(t) },
+                                fallback: { try await self.anilistSearch(t) },
+                                delay: Self.hedgeDelay,
+                                hedgeAllowed: { (AniListBudget.shared.spare ?? .max) > 6 })
+    }
+
+    static let hedgeDelay: TimeInterval = 0.7
+
+    private enum Answer: Sendable { case primary([Show]?), fallback(Result<[Show], Error>), skipped }
+
+    /// `primary`'s answer, or `fallback`'s when the primary fails, or when it is slower than `delay` and the fallback
+    /// answers first.
+    func hedged(primary: @escaping @Sendable () async throws -> [Show], fallback: @escaping @Sendable () async throws -> [Show],
+                delay: TimeInterval, hedgeAllowed: @escaping @Sendable () -> Bool) async throws -> [Show] {
+        let started = Flag()
+        let runFallback: @Sendable () async -> Answer = {
+            do { return .fallback(.success(try await fallback())) } catch { return .fallback(.failure(error)) }
+        }
+        return try await withThrowingTaskGroup(of: Answer.self) { group in
+            group.addTask { .primary(try? await primary()) }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                guard !Task.isCancelled, hedgeAllowed(), started.setOnce() else { return .skipped }
+                return await runFallback()
+            }
+            var lastError: Error = CatalogError.unreadable
+            var primaryFailed = false
+            var fallbackDone = false
+            while let answer = try await group.next() {
+                switch answer {
+                case .primary(let list?):
+                    group.cancelAll()
+                    return list
+                case .primary(nil):
+                    primaryFailed = true
+                    if started.setOnce() { group.addTask { await runFallback() } }
+                    else if fallbackDone { throw lastError }
+                case .fallback(.success(let list)):
+                    group.cancelAll()
+                    return list
+                case .fallback(.failure(let e)):
+                    lastError = e
+                    fallbackDone = true
+                    if primaryFailed { throw e }
+                case .skipped:
+                    break
+                }
+            }
+            throw lastError
+        }
     }
 
     func kitsuSearch(_ text: String) async throws -> [Show] {
@@ -317,31 +367,31 @@ public final class ShowCatalog: @unchecked Sendable {
 
     /// The whole show an entry belongs to: earlier and later seasons in order, with episode titles where known.
     public func details(id: Int) async throws -> ShowDetails {
-        // Each request returns an entry and its neighbours, so walking the seasons takes about one request per two.
-        var known = try await nodes(id)
-        func node(_ id: Int) async throws -> Node {
-            if let n = known[id] { return n }
-            known.merge(try await nodes(id)) { old, _ in old }
-            guard let n = known[id] else { throw CatalogError.unreadable }
-            return n
+        // The first request returns the entry, its neighbours in full, and the ids of everything one step further
+        // (a franchise's manga links every season). When the chain runs past the neighbours, all of those are fetched
+        // in one more request; anything still missing is walked back and forward at the same time.
+        let first = try await nodes(id)
+        var known = first.nodes
+        guard let start = known[id] else { throw CatalogError.unreadable }
+        let wanted = first.nearby.filter { known[$0] == nil }
+        if Self.seasonFormats.contains(start.show.format ?? ""), Self.chainContinues(from: start, known: known), !wanted.isEmpty,
+           let more = try? await nodes(ids: Array(wanted.prefix(50))) {
+            known.merge(more) { old, _ in old }
         }
-        let start = try await node(id)
         guard Self.seasonFormats.contains(start.show.format ?? "") else {
             // Movies, OVAs and specials stand alone.
             let count = start.show.isMovie ? 1 : max(1, start.show.episodes ?? start.show.airedEpisodes)
             return ShowDetails(show: start.show, seasons: [season(start, number: 1, offset: 0, count: count)])
         }
-        var chain = [start]
-        var visited: Set<Int> = [start.show.id]
-        // Walk back to the first season, then forward to the last.
-        while chain.count < 24, let prev = chain[0].prequel, visited.insert(prev).inserted {
-            chain.insert(try await node(prev), at: 0)
-        }
-        while chain.count < 24, let next = chain[chain.count - 1].sequel, visited.insert(next).inserted {
-            let n = try await node(next)
-            if n.show.isUpcoming && n.show.nextAiringAt == nil { break }
+        let resolved = known
+        async let back = walk(from: start, known: resolved, forward: false)
+        async let ahead = walk(from: start, known: resolved, forward: true)
+        var chain: [Node] = []
+        var seen = Set<Int>()
+        for n in (try await back).reversed() + [start] + (try await ahead) where seen.insert(n.show.id).inserted {
             chain.append(n)
         }
+        chain = Array(chain.prefix(24))
         var seasons: [ShowSeason] = []
         var offset = 0
         for (i, n) in chain.enumerated() {
@@ -370,10 +420,22 @@ public final class ShowCatalog: @unchecked Sendable {
             if let info = found[out.seasons[i].media.id] {
                 out.seasons[i].episodes = Self.merged(out.seasons[i].episodes, with: info)
             }
-            let eps = out.seasons[i].episodes
-            guard eps.contains(where: { $0.title == nil || $0.thumbnailURL == nil }),
-                  let info = try? await kitsuEpisodes(anilistID: out.seasons[i].media.id, count: eps.count) else { continue }
-            out.seasons[i].episodes = Self.merged(eps, with: info.mapValues { EpisodeInfo(title: $0.title, thumbnail: $0.thumbnail) })
+        }
+        // Kitsu for what ani.zip lacked, all seasons at once.
+        let gaps = targets.filter { out.seasons[$0].episodes.contains { $0.title == nil || $0.thumbnailURL == nil } }
+        let wanted = gaps.map { (out.seasons[$0].media.id, out.seasons[$0].episodes.count) }
+        let kitsu = await withTaskGroup(of: (Int, [Int: (title: String?, thumbnail: URL?)]?).self) { group -> [Int: [Int: EpisodeInfo]] in
+            for (id, count) in wanted { group.addTask { (id, try? await self.kitsuEpisodes(anilistID: id, count: count)) } }
+            var all: [Int: [Int: EpisodeInfo]] = [:]
+            for await (id, info) in group {
+                if let info { all[id] = info.mapValues { EpisodeInfo(title: $0.title, thumbnail: $0.thumbnail) } }
+            }
+            return all
+        }
+        for i in gaps {
+            if let info = kitsu[out.seasons[i].media.id] {
+                out.seasons[i].episodes = Self.merged(out.seasons[i].episodes, with: info)
+            }
         }
         return out
     }
@@ -444,26 +506,91 @@ public final class ShowCatalog: @unchecked Sendable {
         var streaming: [Int: (title: String?, thumbnail: URL?)]
     }
 
-    /// An entry and, in full, every entry related to it.
-    private func nodes(_ id: Int) async throws -> [Int: Node] {
-        let relations = "relations { edges { relationType node { id format status nextAiringEpisode { airingAt } startDate { year month day } } } }"
+    /// Prequels (`forward` false, nearest first) or sequels of `start`, one request per two seasons not yet known.
+    private func walk(from start: Node, known: [Int: Node], forward: Bool) async throws -> [Node] {
+        var known = known
+        var out: [Node] = []
+        var visited: Set<Int> = [start.show.id]
+        var current = start
+        while out.count < 23, let id = forward ? current.sequel : current.prequel, visited.insert(id).inserted {
+            if known[id] == nil { known.merge(try await nodes(id).nodes) { old, _ in old } }
+            guard let n = known[id] else { throw CatalogError.unreadable }
+            if forward && n.show.isUpcoming && n.show.nextAiringAt == nil { break }
+            out.append(n)
+            current = n
+        }
+        return out
+    }
+
+    /// An entry with what it links to (for walking seasons) and its streaming episode list.
+    private static let nodeFields = """
+    \(fields) streamingEpisodes { title thumbnail } \
+    relations { edges { relationType node { id format status nextAiringEpisode { airingAt } startDate { year month day } } } }
+    """
+
+    /// An entry and its neighbours in full, and the ids of seasons one step beyond them. AniList leaves relations
+    /// nested deeper than that empty, so those can't be read in the same request.
+    private func nodes(_ id: Int) async throws -> (nodes: [Int: Node], nearby: [Int]) {
         let query = """
         query ($id: Int) {
           m: Media(id: $id, type: ANIME) {
             \(Self.fields)
             streamingEpisodes { title thumbnail }
-            relations { edges { relationType node { \(Self.fields) streamingEpisodes { title thumbnail } \(relations) } } }
+            relations { edges { relationType node { \(Self.nodeFields) } } }
           }
         }
         """
         let data = try await graphQL(query, variables: ["id": id])
-        guard let m = data["m"] as? [String: Any], let first = Self.node(m) else { throw CatalogError.unreadable }
-        var out = [first.show.id: first]
-        let edges = ((m["relations"] as? [String: Any])?["edges"] as? [[String: Any]]) ?? []
-        for e in edges {
-            if let n = (e["node"] as? [String: Any]).flatMap(Self.node) { out[n.show.id] = n }
-        }
+        guard let m = data["m"] as? [String: Any] else { throw CatalogError.unreadable }
+        return Self.nodes(m)
+    }
+
+    /// Several entries in full, in one request.
+    private func nodes(ids: [Int]) async throws -> [Int: Node] {
+        let query = """
+        query ($ids: [Int]) { p: Page(perPage: 50) { media(id_in: $ids, type: ANIME) { \(Self.nodeFields) } } }
+        """
+        let data = try await graphQL(query, variables: ["ids": ids])
+        let media = ((data["p"] as? [String: Any])?["media"] as? [[String: Any]]) ?? []
+        var out: [Int: Node] = [:]
+        for m in media { if let n = Self.node(m) { out[n.show.id] = n } }
         return out
+    }
+
+    /// The entry and its neighbours keyed by id, and the ids of season-like entries the neighbours link to that
+    /// aren't among them.
+    static func nodes(_ m: [String: Any]) -> (nodes: [Int: Node], nearby: [Int]) {
+        var out: [Int: Node] = [:]
+        func edges(_ m: [String: Any]) -> [[String: Any]] {
+            (((m["relations"] as? [String: Any])?["edges"] as? [[String: Any]]) ?? []).compactMap { $0["node"] as? [String: Any] }
+        }
+        guard let root = node(m) else { return ([:], []) }
+        out[root.show.id] = root
+        let neighbours = edges(m)
+        for child in neighbours {
+            if let n = node(child), out[n.show.id] == nil { out[n.show.id] = n }
+        }
+        var nearby: [Int] = []
+        var seen = Set(out.keys)
+        for child in neighbours {
+            for far in edges(child) where seasonFormats.contains(far["format"] as? String ?? "") {
+                if let id = far["id"] as? Int, seen.insert(id).inserted { nearby.append(id) }
+            }
+        }
+        return (out, nearby)
+    }
+
+    /// Whether walking prequels or sequels from `start` reaches an entry that isn't in `known`.
+    static func chainContinues(from start: Node, known: [Int: Node]) -> Bool {
+        for forward in [false, true] {
+            var visited: Set<Int> = [start.show.id]
+            var current = start
+            while let id = forward ? current.sequel : current.prequel, visited.insert(id).inserted {
+                guard let n = known[id] else { return true }
+                current = n
+            }
+        }
+        return false
     }
 
     static func node(_ m: [String: Any]) -> Node? {
@@ -637,7 +764,7 @@ public final class ShowCatalog: @unchecked Sendable {
     func json(_ url: URL, accept: String = "application/vnd.api+json") async throws -> [String: Any] {
         var request = URLRequest(url: url, timeoutInterval: 10)
         request.setValue(accept, forHTTPHeaderField: "Accept")
-        let data = try await send(request)
+        let data = try await send(request, aniList: false)
         guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw CatalogError.unreadable }
         return root
     }
@@ -696,24 +823,34 @@ public final class ShowCatalog: @unchecked Sendable {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.httpBody = try JSONSerialization.data(withJSONObject: ["query": query, "variables": variables])
-        let data = try await send(request)
+        let data = try await send(request, aniList: true)
         guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let payload = root["data"] as? [String: Any] else { throw CatalogError.unreadable }
         return payload
     }
 
-    /// Sends a request, waiting out one rate limit response.
-    private func send(_ request: URLRequest) async throws -> Data {
+    /// Sends a request, waiting out one rate limit response. AniList requests go through its request budget:
+    /// background ones fail rather than wait.
+    private func send(_ request: URLRequest, aniList: Bool) async throws -> Data {
         var request = request
         request.setValue("TorrentStream/4 (iOS)", forHTTPHeaderField: "User-Agent")
+        let background = CatalogPriority.isBackground
         for attempt in 0..<2 {
-            let (data, response): (Data, URLResponse?) = try await withCheckedThrowingContinuation { cont in
-                session.dataTask(with: request) { data, response, error in
-                    if let error { cont.resume(throwing: error); return }
-                    cont.resume(returning: (data ?? Data(), response))
-                }.resume()
+            if aniList { try await AniListBudget.shared.admit(background: background) }
+            let data: Data, response: URLResponse?
+            do {
+                (data, response) = try await HTTP.data(session, for: request)
+            } catch {
+                if aniList { AniListBudget.shared.finished(nil) }
+                throw error
             }
+            if aniList { AniListBudget.shared.finished(response) }
             guard let http = response as? HTTPURLResponse else { return data }
+            if http.statusCode == 429, aniList {
+                // The budget now knows how long to hold off; the viewer's request waits for that once.
+                if attempt == 0 && !background { continue }
+                throw CatalogError.rateLimited
+            }
             if http.statusCode == 429, attempt == 0 {
                 let wait = Double(http.value(forHTTPHeaderField: "Retry-After") ?? "") ?? 5
                 try await Task.sleep(nanoseconds: UInt64(min(wait, 30) * 1_000_000_000))

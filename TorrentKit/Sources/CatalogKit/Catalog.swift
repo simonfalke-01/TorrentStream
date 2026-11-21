@@ -61,7 +61,11 @@ public struct CatalogQuery: Hashable, Sendable {
     public var isSearchable: Bool { ReleaseName.normalize(title).count >= 2 }
 }
 
-public enum CatalogError: Error { case http(Int), unreadable }
+public enum CatalogError: Error {
+    case http(Int), unreadable
+    /// AniList's request budget is spent; background work gives way instead of waiting.
+    case rateLimited
+}
 
 public final class CatalogClient: @unchecked Sendable {
     private let session: URLSession
@@ -93,7 +97,7 @@ public final class CatalogClient: @unchecked Sendable {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.httpBody = try JSONSerialization.data(withJSONObject: ["query": query, "variables": variables])
-        let data = try await send(request, accept: [200, 404])
+        let data = try await send(request, accept: [200, 404], aniList: true)
 
         guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let payload = root["data"] as? [String: Any] else { throw CatalogError.unreadable }
@@ -205,16 +209,20 @@ public final class CatalogClient: @unchecked Sendable {
 
     // MARK: helpers
 
-    private func send(_ request: URLRequest, accept: Set<Int>) async throws -> Data {
+    private func send(_ request: URLRequest, accept: Set<Int>, aniList: Bool = false) async throws -> Data {
         var request = request
         request.setValue("TorrentStream/3 (iOS)", forHTTPHeaderField: "User-Agent")
-        let (data, response): (Data, URLResponse?) = try await withCheckedThrowingContinuation { cont in
-            session.dataTask(with: request) { data, response, error in
-                if let error { cont.resume(throwing: error); return }
-                cont.resume(returning: (data ?? Data(), response))
-            }.resume()
+        if aniList { try await AniListBudget.shared.admit(background: CatalogPriority.isBackground) }
+        let data: Data, response: URLResponse?
+        do {
+            (data, response) = try await HTTP.data(session, for: request)
+        } catch {
+            if aniList { AniListBudget.shared.finished(nil) }
+            throw error
         }
+        if aniList { AniListBudget.shared.finished(response) }
         if let http = response as? HTTPURLResponse, !accept.contains(http.statusCode) {
+            if aniList, http.statusCode == 429 { throw CatalogError.rateLimited }
             throw CatalogError.http(http.statusCode)
         }
         return data

@@ -139,6 +139,15 @@ final class AppModel: ObservableObject {
     private var catalogMisses: Set<String> = []
     private var catalogPending: Set<String> = []
     private var releaseCache: [String: ReleaseInfo] = [:]
+    /// Episode sources from earlier launches that haven't been needed yet. They stay out of the engine (no tracker,
+    /// DHT or piece checking work at launch) until an episode asks for one.
+    private var dormant: [String: SavedEntry] = [:]
+    /// File lists of dormant sources, read from disk when asked for.
+    private var dormantInfo: [String: TorrentInfo] = [:]
+    /// .torrent files of releases found for episodes, by download URL.
+    let torrentFiles = TorrentFileStore(
+        directory: FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("TorrentFiles", isDirectory: true))
 
     private struct SavedEntry: Codable {
         let infoHash: String
@@ -169,8 +178,13 @@ final class AppModel: ObservableObject {
             useDHT: defaults.bool(forKey: SettingsKey.useDHT),
             extraTrackers: defaults.bool(forKey: SettingsKey.publicTrackers) ? TorrentClient.defaultTrackers : []
         )
+        PlaybackTrace.shared.launch("model init")
         restoreCatalog()
         restoreLibrary()
+        PlaybackTrace.shared.launch("library restored (\(client.torrents.count) in engine, \(dormant.count) dormant)")
+        // Connections to the hosts every play uses, so the first search or download doesn't pay DNS, TCP and TLS.
+        HTTP.preconnect([nyaa.baseURL.appendingPathComponent("static/favicon.png"),
+                         URL(string: "https://kitsu.app/api/edge")!, URL(string: "https://api.ani.zip/mappings")!])
         refresh()
         refreshStorage()
         trimCache()
@@ -271,19 +285,21 @@ final class AppModel: ObservableObject {
     /// Adds a release found for a catalog episode, or returns it when already added. The .torrent file is used
     /// when it can be fetched, since it carries the file list; otherwise the magnet link.
     func addSource(torrentURL: URL?, magnet: String?, infoHash: String?) async -> Torrent? {
-        if let h = infoHash?.lowercased(), let t = client.torrent(infoHashHex: h) {
+        if let h = infoHash?.lowercased(), let t = client.torrent(infoHashHex: h) ?? wakeSource(h) {
             if t.isPaused { t.resume() }
             return t
         }
         let fetchStart = Date()
         var fetched: Data?
         if let url = torrentURL {
-            fetched = try? await Self.fetch(url)
-            PlaybackTrace.shared.mark(String(format: "torrent file %@ in %.2fs", fetched == nil ? "failed" : "fetched",
+            let wasCached = await torrentFiles.cached(url) != nil
+            fetched = try? await torrentFiles.data(for: url)
+            PlaybackTrace.shared.mark(String(format: "torrent file %@ in %.2fs", fetched == nil ? "failed" : (wasCached ? "on disk" : "fetched"),
                                              Date().timeIntervalSince(fetchStart)))
         }
         if let data = fetched {
-            if let existing = (try? TorrentDescriptor.parse(torrentData: data)).flatMap({ client.torrent(infoHashHex: $0.infoHashHex) }) {
+            let hash = (try? TorrentDescriptor.parse(torrentData: data))?.infoHashHex
+            if let hash, let existing = client.torrent(infoHashHex: hash) ?? wakeSource(hash) {
                 if existing.isPaused { existing.resume() }
                 return existing
             }
@@ -315,21 +331,46 @@ final class AppModel: ObservableObject {
         persist()
     }
 
+    /// Adds a dormant source to the engine.
+    private func wakeSource(_ hash: String) -> Torrent? {
+        guard let e = dormant.removeValue(forKey: hash) else { return nil }
+        dormantInfo[hash] = nil
+        let t = add(e)
+        PlaybackTrace.shared.mark("woke source \(hash.prefix(8)) (\(t == nil ? "failed" : "added"))")
+        return t
+    }
+
+    /// The file list of an episode source, whether in the engine or dormant.
+    func sourceInfo(_ hash: String) -> TorrentInfo? {
+        if let t = client.torrent(infoHashHex: hash) { return t.torrentInfo }
+        guard let e = dormant[hash] else { return nil }
+        if let info = dormantInfo[hash] { return info }
+        var info: TorrentInfo?
+        if e.hasTorrentFile, let d = try? Data(contentsOf: torrentFileURL(hash)) {
+            info = (try? TorrentDescriptor.parse(torrentData: d))?.info
+        } else if let raw = try? Data(contentsOf: client.downloadDirectory.appendingPathComponent("\(hash)/info.bencode")) {
+            info = try? TorrentInfo(rawInfo: raw)
+        }
+        dormantInfo[hash] = info
+        return info
+    }
+
+    /// An episode source by info hash, woken if dormant.
+    func sourceTorrent(_ hash: String) -> Torrent? {
+        client.torrent(infoHashHex: hash) ?? wakeSource(hash)
+    }
+
     private func removeSource(_ hash: String) {
         if let t = client.torrent(infoHashHex: hash) { client.remove(t, deleteData: true) }
+        if dormant.removeValue(forKey: hash) != nil {
+            dormantInfo[hash] = nil
+            try? FileManager.default.removeItem(at: client.downloadDirectory.appendingPathComponent(hash, isDirectory: true))
+        }
         try? FileManager.default.removeItem(at: torrentFileURL(hash))
         sourceHashes.remove(hash)
         addedAt[hash] = nil
         defaults.removeObject(forKey: lastPlayedKey(hash))
         defaults.removeObject(forKey: watchedAtKey(hash))
-    }
-
-    private static func fetch(_ url: URL) async throws -> Data {
-        var request = URLRequest(url: url, timeoutInterval: 15)
-        request.setValue("TorrentStream/4 (iOS)", forHTTPHeaderField: "User-Agent")
-        let (data, response) = try await URLSession.shared.data(for: request)
-        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) { throw URLError(.badServerResponse) }
-        return data
     }
 
     // MARK: titles and artwork
@@ -528,14 +569,13 @@ final class AppModel: ObservableObject {
     func trimCache() {
         guard playing.isEmpty else { return }
         // Sources that were found but never played, beyond the most recent few, only take up slots.
-        let sources = client.torrents.filter { sourceHashes.contains($0.infoHashHex) }
-            .sorted { lastUse($0.infoHashHex) > lastUse($1.infoHashHex) }
+        let sources = (client.torrents.map(\.infoHashHex).filter { sourceHashes.contains($0) } + dormant.keys)
+            .sorted { lastUse($0) > lastUse($1) }
         if sources.count > AppModel.maxSources {
-            for t in sources[AppModel.maxSources...] { removeSource(t.infoHashHex) }
+            for hash in sources[AppModel.maxSources...] { removeSource(hash) }
             persist()
         }
-        let byLastUse = client.torrents.filter { $0.torrentInfo != nil }
-            .map(\.infoHashHex)
+        let byLastUse = (client.torrents.filter { $0.torrentInfo != nil }.map(\.infoHashHex) + dormant.keys)
             .sorted { lastUse($0) < lastUse($1) }
         guard !byLastUse.isEmpty else { return }
         let dir = client.downloadDirectory
@@ -562,7 +602,7 @@ final class AppModel: ObservableObject {
 
     /// Clears every title's cached video. My List and watch history are kept.
     func clearCache() {
-        evict(client.torrents.map(\.infoHashHex))
+        evict(client.torrents.map(\.infoHashHex) + dormant.keys)
     }
 
     private func lastUse(_ hash: String) -> Date {
@@ -873,7 +913,7 @@ final class AppModel: ObservableObject {
     private func torrentFileURL(_ hash: String) -> URL { baseURL.appendingPathComponent("torrents/\(hash).torrent") }
 
     private func persist() {
-        let entries = client.torrents.map { t -> SavedEntry in
+        let live = client.torrents.map { t -> SavedEntry in
             let status = t.status()
             let wanted = status.files.filter { $0.wanted }.map { $0.file.index }
             return SavedEntry(infoHash: t.infoHashHex, magnet: t.descriptor.magnetURI,
@@ -881,22 +921,38 @@ final class AppModel: ObservableObject {
                               paused: status.isPaused, addedAt: addedAt[t.infoHashHex],
                               isSource: sourceHashes.contains(t.infoHashHex) ? true : nil)
         }
-        if let data = try? JSONEncoder().encode(entries) { try? data.write(to: libraryURL, options: .atomic) }
+        let liveHashes = Set(live.map(\.infoHash))
+        let sleeping = dormant.values.filter { !liveHashes.contains($0.infoHash) }.map { e -> SavedEntry in
+            var e = e
+            e.addedAt = addedAt[e.infoHash] ?? e.addedAt
+            return e
+        }
+        if let data = try? JSONEncoder().encode(live + sleeping) { try? data.write(to: libraryURL, options: .atomic) }
+    }
+
+    private func add(_ e: SavedEntry) -> Torrent? {
+        if e.hasTorrentFile, let d = try? Data(contentsOf: torrentFileURL(e.infoHash)) {
+            return try? client.add(torrentData: d)
+        } else if let m = e.magnet {
+            return try? client.add(magnet: m)
+        }
+        return nil
     }
 
     private func restoreLibrary() {
         guard let data = try? Data(contentsOf: libraryURL),
               let entries = try? JSONDecoder().decode([SavedEntry].self, from: data) else { return }
         for (i, e) in entries.enumerated() {
-            var torrent: Torrent?
-            if e.hasTorrentFile, let d = try? Data(contentsOf: torrentFileURL(e.infoHash)) {
-                torrent = try? client.add(torrentData: d)
-            } else if let m = e.magnet {
-                torrent = try? client.add(magnet: m)
+            let added = e.addedAt ?? Date(timeIntervalSince1970: TimeInterval(entries.count - i))
+            if e.isSource == true {
+                // Woken when an episode needs it.
+                dormant[e.infoHash] = e
+                sourceHashes.insert(e.infoHash)
+                addedAt[e.infoHash] = added
+                continue
             }
-            guard let t = torrent else { continue }
-            if e.isSource == true { sourceHashes.insert(t.infoHashHex) }
-            addedAt[t.infoHashHex] = e.addedAt ?? Date(timeIntervalSince1970: TimeInterval(entries.count - i))
+            guard let t = add(e) else { continue }
+            addedAt[t.infoHashHex] = added
             // Idle titles stay off the network until played. Files wanted by older versions aren't fetched in full.
             if t.torrentInfo != nil { t.pause() }
         }

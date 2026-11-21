@@ -821,7 +821,7 @@ struct PlaybackLauncher: View {
         let trace = PlaybackTrace.shared
         trace.begin("Play \(launch.show.title)" + (launch.episode.map { " episode \($0)" } ?? ""))
         do {
-            let d = try await shows.loadDetails(launch.show)
+            let d = try await launchDetails()
             trace.mark("details loaded")
             let t = try pick(d)
             target = t
@@ -837,6 +837,17 @@ struct PlaybackLauncher: View {
             trace.mark("failed: \(error.localizedDescription)")
             failure = Self.message(for: error)
         }
+    }
+
+    /// The show's episodes. A copy on disk that has the chosen episode starts it without waiting on the catalog,
+    /// even when newer episodes have aired since; it is brought up to date alongside.
+    private func launchDetails() async throws -> ShowDetails {
+        if let id = launch.seasonID, let number = launch.episode, let d = shows.cachedDetails(launch.show),
+           d.season(id: id)?.episodes.contains(where: { $0.number == number && $0.isAired }) == true {
+            if ShowsModel.hasAiredSinceFetch(d) { shows.refreshDetails(launch.show) }
+            return d
+        }
+        return try await shows.loadDetails(launch.show)
     }
 
     private func pick(_ d: ShowDetails) throws -> EpisodeTarget {
