@@ -143,12 +143,16 @@ struct StreamScrubber: View {
             .overlay(alignment: .leading) {
                 if let s = scrub, duration > 0 {
                     bubble(s)
+                        // Its own size, not the bar's: offered only the bar's height, the card was squeezed, its
+                        // caption drawn over the picture and the rest spilled below the bar off the screen.
+                        .fixedSize()
                         .alignmentGuide(.leading) { d in
                             let x = width * s - d.width / 2
-                            return -min(max(x, 0), width - d.width)
+                            return -min(max(x, 0), max(width - d.width, 0))
                         }
                         // Bottom edge a fixed gap above the bar, however tall the bubble is.
                         .alignmentGuide(VerticalAlignment.center) { d in d.height + bubbleGap }
+                        .allowsHitTesting(false)
                 }
             }
             .frame(maxHeight: .infinity)
@@ -187,14 +191,14 @@ struct StreamScrubber: View {
             }
             .padding(Space.xs)
             .frame(width: previewWidth + Space.xs * 2)
-            .glassEffect(.regular, in: .rect(cornerRadius: Radius.small + Space.xs))
+            // Tinted so the title and buttons behind it don't read through the glass.
+            .glassEffect(.regular.tint(.black.opacity(0.45)), in: .rect(cornerRadius: Radius.small + Space.xs))
         } else {
             caption(s)
                 .padding(.horizontal, Space.m)
                 .padding(.vertical, Space.xs)
                 .frame(maxWidth: bubbleMaxWidth)
-                .glassEffect(.regular, in: .capsule)
-                .fixedSize()
+                .glassEffect(.regular.tint(.black.opacity(0.45)), in: .capsule)
         }
     }
 
@@ -222,6 +226,7 @@ struct StreamScrubber: View {
                     .font(.caption)
                     .foregroundStyle(.white.opacity(0.75))
                     .lineLimit(1)
+                    .frame(maxWidth: preview == nil ? bubbleMaxWidth - Space.m * 2 : previewWidth)
             }
         }
     }

@@ -95,6 +95,11 @@ private struct PlayerContainer: View {
             previews = SeekPreviews(torrent: request.torrent, fileIndex: request.file.index,
                                     fileLength: request.file.length, fileExtension: request.file.fileExtension)
             engine = e
+            // The stream's address follows the server if iOS took its socket while the app was away.
+            e.streamPort = { [client = model.client] in
+                client.ensureStreamingServer()
+                return client.streamingPort
+            }
             e.start()
             e.showOnTV(ExternalDisplay.shared.isConnected)
             secondary.prepare(request)
@@ -213,14 +218,21 @@ private struct PlayerChrome: View {
             let compact = geo.size.width < PlayerMetrics.compactWidth
             ZStack {
                 video
-                if let place = elsewhere, !controlsVisible { elsewhereNote(place).transition(.opacity) }
+                // Apple TV's player: the picture's place goes plain black while it plays elsewhere, with one quiet
+                // line in the middle. Put back without a fade, so the picture flying in from PiP lands on nothing.
+                if elsewhere != nil { Color.black.ignoresSafeArea().allowsHitTesting(false).transition(.identity) }
+                if let place = elsewhere, showsElsewhereNote(landscape: landscape) {
+                    elsewhereNote(place)
+                        .offset(y: controlsVisible ? -(PlayerMetrics.playGlyph + 2 * Space.xl) : 0)
+                        .transition(.opacity)
+                }
                 gestureLayer
 
                 if let flash = seekFlash {
                     SeekFeedbackView(flash: flash).id(flash.forward).transition(.opacity)
                 }
 
-                if engine.isBuffering && !showControls && engine.errorText == nil && !engine.didFinish {
+                if engine.isBuffering && !showControls && engine.errorText == nil && !engine.didFinish && elsewhere == nil {
                     ProgressView()
                         .controlSize(.large)
                         .tint(.white)
@@ -241,9 +253,9 @@ private struct PlayerChrome: View {
                     if controlsVisible {
                         topBar.transition(.opacity)
                     }
-                    secondSubtitle
+                    if elsewhere == nil { secondSubtitle }
                     Spacer(minLength: 0)
-                    momentRow
+                    if elsewhere == nil { momentRow }
                     if controlsVisible {
                         bottomBar(compact: compact)
                             .padding(.top, Space.l)
@@ -331,6 +343,8 @@ private struct PlayerChrome: View {
             PlaybackTrace.shared.mark(waiting ? "waiting for data" : "playing")
         }
         .onChange(of: Int(engine.currentTime * 4)) { secondary.update(time: engine.currentTime) }
+        // PiP shows only the video layer; the second line is drawn into its frames there.
+        .onChange(of: secondary.text, initial: true) { _, text in engine.output.setSecondarySubtitle(text) }
         .onChange(of: panel) { _, p in if p == nil { scheduleHide() } else { hideTask?.cancel() } }
         .sheet(item: $versions) { target in
             VersionsView(target: target, current: request.torrent.infoHashHex) { source in
@@ -355,6 +369,13 @@ private struct PlayerChrome: View {
         if engine.isOnTV { return ("Playing on TV", "tv") }
         if engine.isPictureInPicture { return ("Playing in Picture in Picture", "pip") }
         return nil
+    }
+
+    /// The note keeps to the middle while nothing else is there. With the controls up it moves above the play
+    /// button in portrait, and gives way in landscape, where there's no room above the button.
+    private func showsElsewhereNote(landscape: Bool) -> Bool {
+        guard panel == nil, !locked, engine.errorText == nil, !engine.didFinish else { return false }
+        return !controlsVisible || !landscape
     }
 
     private func elsewhereNote(_ place: (title: String, systemImage: String)) -> some View {
@@ -530,7 +551,7 @@ private struct PlayerChrome: View {
 
             Button { engine.togglePlay(); scheduleHide() } label: {
                 ZStack {
-                    if engine.isBuffering && engine.isPlaying {
+                    if engine.isBuffering && engine.isPlaying && elsewhere == nil {
                         ProgressView().controlSize(.large).tint(.white)
                     } else {
                         Image(systemName: engine.isPlaying ? "pause.fill" : "play.fill")
@@ -565,6 +586,10 @@ private struct PlayerChrome: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                 actionToolbar(compact: compact)
             }
+            // While scrubbing, the preview is the subject; what sits behind it steps back.
+            .opacity(scrub == nil ? 1 : 0)
+            .allowsHitTesting(scrub == nil)
+            .animation(Motion.role(Motion.fast, reduce: reduceMotion), value: scrub == nil)
 
             VStack(spacing: 0) {
                 StreamScrubber(progress: engine.duration > 0 ? engine.currentTime / engine.duration : 0,

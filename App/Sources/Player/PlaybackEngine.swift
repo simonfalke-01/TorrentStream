@@ -104,9 +104,14 @@ final class PlaybackEngine: ObservableObject {
     @Published private(set) var isOnTV = false
 
     let output: VideoOutput
+    /// The streaming server's port as it is now. iOS can take the server's socket while the app is away, and the
+    /// server may come back on another port; the stream's address follows it.
+    var streamPort: (() -> UInt16)?
     private let player: VLCMediaPlayer
-    private let url: URL
-    private let subtitleFiles: [URL]
+    private var url: URL
+    private var subtitleFiles: [URL]
+    /// Subtitle files the viewer added, added again whenever the stream is reopened.
+    private var importedSubtitles: [URL] = []
     private let memoryKey: String
     private let preferDub: Bool
     private var timer: Timer?
@@ -133,6 +138,28 @@ final class PlaybackEngine: ObservableObject {
     /// Where the viewer left off last time, checked once the picture is up.
     private let resumeAt: Double?
     private var resumeChecked = false
+    /// The reopened stream should stay paused (it opens paused, and is paused again if it starts anyway).
+    private var restartPaused = false
+    /// When the reopened media was handed to libVLC, and whether it has been seen opening since. libVLC stops
+    /// asynchronously and VLCKit's state follows events, so until then the state may still be the old stream's.
+    private var restartLoadedAt: Date?
+    private var restartSeenOpening = false
+    /// Delays to set again once a reopened stream is up; a new input starts without them.
+    private var reapplyDelays = false
+
+    /// A play the viewer asked for and libVLC hasn't yet shown, with the time it was asked at.
+    private var playRequest: (at: Date, time: Int32, fromForeground: Bool)?
+    private var playRetries = 0
+    /// A pause just asked for: libVLC pauses on its own queue, so its state lags for a moment.
+    private var pauseRequestedAt: Date?
+    private var foregroundAt = Date.distantPast
+    private var leftWhilePlaying = false
+    private var resumeAfterInterruption = false
+    private var interruptionObserver: NSObjectProtocol?
+    /// The decoder and display counters when last seen moving, and the media time then.
+    private var videoStats: (decoded: UInt64, displayed: UInt64, time: Int32)?
+    private var videoRepairs = 0
+    private var lastVideoRepair = Date.distantPast
 
     /// - Parameter memoryKey: what audio and subtitle choices are remembered under, usually the show.
     init(request: PlaybackRequest, memoryKey: String) {
@@ -154,11 +181,35 @@ final class PlaybackEngine: ObservableObject {
             MainActor.assumeIsolated { self?.canPictureInPicture = true }
         }
         output.onPiPChange = { [weak self] active in
-            MainActor.assumeIsolated { self?.isPictureInPicture = active }
+            MainActor.assumeIsolated { self?.pictureInPictureChanged(active) }
+        }
+        output.onPiPRestore = { [weak self] in
+            MainActor.assumeIsolated {
+                self?.restoringFromPiP = true
+                self?.isPictureInPicture = false
+            }
+        }
+        // PiP's own buttons go through play() and pause() like every other control.
+        output.onPlay = { [weak self] in
+            guard let self else { return }
+            PlaybackEngine.onMain { self.play() }
+        }
+        output.onPause = { [weak self] in
+            guard let self else { return }
+            PlaybackEngine.onMain { self.pause() }
         }
     }
 
-    private func load(from start: Double?) {
+    private nonisolated static func onMain(_ work: @escaping @MainActor () -> Void) {
+        if Thread.isMainThread {
+            MainActor.assumeIsolated { work() }
+        } else {
+            DispatchQueue.main.async { MainActor.assumeIsolated { work() } }
+        }
+    }
+
+    private func load(from start: Double?, paused: Bool = false) {
+        refreshStreamURL()
         guard let media = VLCMedia(url: url) else {
             errorText = "This video couldn’t be opened."
             return
@@ -170,12 +221,36 @@ final class PlaybackEngine: ObservableObject {
         media.addOption(preferDub ? ":audio-language=eng,en,jpn,ja" : ":audio-language=jpn,ja,eng,en")
         if !preferDub { media.addOption(":sub-language=eng,en,English") }
         if let start, start > 0 { media.addOption(":start-time=\(Int(start))") }
+        // Opens to the first picture and holds there (input.c MainLoop pauses before the first demux).
+        if paused { media.addOption(":start-paused") }
         player.media = media
+    }
+
+    /// Points the stream (and subtitle files from the torrent) at the server's current port; true if it moved.
+    @discardableResult
+    private func refreshStreamURL() -> Bool {
+        guard let port = streamPort?(), port > 0, let moved = Self.url(url, onPort: port) else { return false }
+        PlaybackTrace.shared.mark("stream server moved to port \(port)")
+        url = moved
+        subtitleFiles = subtitleFiles.map { Self.url($0, onPort: port) ?? $0 }
+        return true
+    }
+
+    /// `url` on `port` if it's a loopback address on another port, else nil.
+    private static func url(_ url: URL, onPort port: UInt16) -> URL? {
+        guard var parts = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              parts.host == "127.0.0.1" || parts.host == "localhost",
+              let old = parts.port, old != Int(port) else { return nil }
+        parts.port = Int(port)
+        return parts.url
     }
 
     /// Subtitle files beside the video, added once the picture is up: each is another read from the torrent, and
     /// at the start every read competes with the first frame.
     private func addSubtitleFiles() {
+        for s in importedSubtitles {
+            player.addPlaybackSlave(s, type: .subtitle, enforce: false)
+        }
         guard !subtitleFiles.isEmpty else { return }
         for s in subtitleFiles {
             player.addPlaybackSlave(s, type: .subtitle, enforce: false)
@@ -194,11 +269,27 @@ final class PlaybackEngine: ObservableObject {
         timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.poll() }
         }
+        // Posted on the main thread (AVAudioSession.interruptionNotification).
+        interruptionObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.interruptionNotification, object: AVAudioSession.sharedInstance(), queue: .main
+        ) { [weak self] note in
+            let type = (note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt)
+                .flatMap(AVAudioSession.InterruptionType.init(rawValue:))
+            let options = AVAudioSession.InterruptionOptions(
+                rawValue: note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0)
+            MainActor.assumeIsolated {
+                guard let self, let type else { return }
+                self.audioInterrupted(began: type == .began, shouldResume: options.contains(.shouldResume))
+            }
+        }
     }
 
     func shutdown() {
         timer?.invalidate()
         timer = nil
+        if let interruptionObserver { NotificationCenter.default.removeObserver(interruptionObserver) }
+        interruptionObserver = nil
+        output.shutdown()
         if isPictureInPicture { output.stopPictureInPicture() }
         if isOnTV { showOnTV(false) }
         let p = player
@@ -221,7 +312,24 @@ final class PlaybackEngine: ObservableObject {
             addSubtitleFiles()
         }
 
-        if state == .playing { hasPlayed = true; restarting = false }
+        if state == .playing { hasPlayed = true }
+        if restarting, let loaded = restartLoadedAt {
+            if state == .opening { restartSeenOpening = true }
+            let current = restartSeenOpening || Date().timeIntervalSince(loaded) > 2
+            // The viewer may have pressed play or pause while the stream was reopening.
+            if state == .paused && !restartPaused {
+                player.play()
+            } else if state == .playing && restartPaused {
+                player.pause()
+            } else if current && (state == .playing || state == .paused) {
+                restarting = false
+                if reapplyDelays {
+                    reapplyDelays = false
+                    player.currentVideoSubTitleDelay = Int(subtitleDelay * 1_000_000)
+                    player.currentAudioPlaybackDelay = Int(audioDelay * 1_000_000)
+                }
+            }
+        }
         if restarting, Date().timeIntervalSince(restartBegan) > 20 { restarting = false }
         if recoveries > 0, state == .playing, Date().timeIntervalSince(lastRecovery) > 60 { recoveries = 0 }
 
@@ -238,7 +346,7 @@ final class PlaybackEngine: ObservableObject {
                 PlaybackTrace.shared.mark(String(format: "stream \(state == .error ? "failed" : "ended early") at %.1fs of %.0fs; reopening (try %d)",
                                                  at, duration, recoveries))
                 isBuffering = true
-                restart(from: at, after: recoveries == 1 ? 0 : Double(recoveries))
+                restart(from: at, after: recoveries == 1 ? 0 : Double(recoveries), paused: !isPlaying)
                 return
             }
         }
@@ -259,13 +367,23 @@ final class PlaybackEngine: ObservableObject {
         }
 
         let playing = player.isPlaying
-        if playing != isPlaying {
-            isPlaying = playing
+        if checkPlayRequest(playing: playing, state: state, time: t) { return }
+        // What the controls show: what was asked for until libVLC catches up, else what libVLC reports.
+        var shown = playing
+        if restarting { shown = !restartPaused } else if playRequest != nil { shown = true }
+        if let asked = pauseRequestedAt {
+            if Date().timeIntervalSince(asked) < 1.5 { shown = false } else { pauseRequestedAt = nil }
+        }
+        if shown != isPlaying {
+            isPlaying = shown
             output.invalidatePlaybackState()
         }
+        let waitingForPlay = playRequest.map { !playing && Date().timeIntervalSince($0.at) > 0.5 } ?? false
         isBuffering = state == .opening
             || (!hasPlayed && state == .nothingSpecial)
             || (playing && idle > 1.25)
+            || (restarting && !restartPaused)
+            || waitingForPlay
 
         let len = player.media?.length.intValue ?? 0
         if len > 0 {
@@ -304,6 +422,107 @@ final class PlaybackEngine: ObservableObject {
 
         if ticks % 4 == 0 || !tracksSettled { refreshTracks() }
         if !chaptersLoaded, duration > 0 { loadChapters() }
+        if ticks % 4 == 0 {
+            output.reconcilePiP()
+            checkVideo()
+        }
+    }
+
+    /// Follows a play the viewer asked for. libVLC applies play on its input thread, and an input stuck on a
+    /// stream that went away while the app was in the background never does: the button flips straight back to
+    /// play and the picture stays black. Reopening the stream where it was gets it going. True if it reopened.
+    private func checkPlayRequest(playing: Bool, state: VLCMediaPlayerState, time t: Int32) -> Bool {
+        guard let request = playRequest, !restarting else { return false }
+        let waited = Date().timeIntervalSince(request.at)
+        if playing && t != request.time {
+            playRequest = nil
+            playRetries = 0
+        } else if !playing && state == .paused && waited > 3 {
+            playRequest = nil
+            guard playRetries < 2 else { return false }
+            playRetries += 1
+            PlaybackTrace.shared.mark(String(format: "play didn't take: still paused %.1fs later; reopening at %.1fs (try %d)",
+                                             waited, currentTime, playRetries))
+            restart(from: currentTime)
+            return true
+        } else if request.fromForeground && playing && waited > 10 {
+            // Playing in name only since coming back: the time hasn't moved at all.
+            playRequest = nil
+            guard playRetries < 1 else { return false }
+            playRetries += 1
+            PlaybackTrace.shared.mark(String(format: "playing but stuck at %.1fs since coming back; reopening", currentTime))
+            restart(from: currentTime)
+            return true
+        } else if waited > 15 {
+            playRequest = nil
+        }
+        return false
+    }
+
+    /// The picture can freeze while the sound plays on: the display layer fails (a failed layer drops every
+    /// frame libVLC gives it) or the decoder stops producing pictures. Checked about once a second while the
+    /// app is on screen and the video should be moving.
+    private func checkVideo() {
+        guard UIApplication.shared.applicationState == .active, hasPlayed, !restarting, !didFinish,
+              videoTrackAway == nil, !isPictureInPicture, !output.isPiPEngaged else {
+            videoStats = nil
+            return
+        }
+        switch output.checkDisplayLayer() {
+        case .fine:
+            break
+        case .flushed:
+            PlaybackTrace.shared.mark("video: display layer had lost its decoder; flushed it")
+        case .failed(let why):
+            PlaybackTrace.shared.mark("video: display layer failed (\(why))")
+            repairVideo()
+            return
+        }
+        guard player.isPlaying, videoSize.width > 0, seekStarted == nil, let media = player.media else {
+            videoStats = nil
+            return
+        }
+        let stats = media.statistics
+        let t = player.time.intValue
+        guard let last = videoStats, last.decoded > 0,
+              stats.decodedVideo == last.decoded, stats.displayedPictures == last.displayed else {
+            videoStats = (stats.decodedVideo, stats.displayedPictures, t)
+            return
+        }
+        // Counters still while the media time has moved on more than three seconds: the picture is frozen.
+        if t - last.time > 3000 {
+            PlaybackTrace.shared.mark(String(format: "video: no new pictures (decoded %llu, shown %llu) while time ran %.1fs",
+                                             stats.decodedVideo, stats.displayedPictures, Double(t - last.time) / 1000))
+            repairVideo()
+        } else if t < last.time {
+            videoStats = (stats.decodedVideo, stats.displayedPictures, t)
+        }
+    }
+
+    /// Rebuilds the picture: switching the video track off and on gives libVLC a new display and decoder. If that
+    /// doesn't hold, the stream is opened again where it was.
+    private func repairVideo() {
+        if Date().timeIntervalSince(lastVideoRepair) > 120 { videoRepairs = 0 }
+        videoRepairs += 1
+        lastVideoRepair = Date()
+        videoStats = nil
+        guard videoRepairs < 3, let track = player.videoTracks.first(where: { $0.isSelected }) else {
+            PlaybackTrace.shared.mark(String(format: "video: still frozen; reopening at %.1fs", currentTime))
+            restart(from: currentTime, paused: !isPlaying)
+            return
+        }
+        PlaybackTrace.shared.mark("video: frozen; rebuilding the picture (try \(videoRepairs))")
+        let id = track.trackId
+        videoTrackAway = id
+        player.deselectAllVideoTracks()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            MainActor.assumeIsolated {
+                // Gone to the background meanwhile: the picture comes back with the app.
+                guard let self, self.videoTrackAway == id, UIApplication.shared.applicationState != .background else { return }
+                self.videoTrackAway = nil
+                self.restoreVideoTrack(id)
+            }
+        }
     }
 
     private static func name(of state: VLCMediaPlayerState) -> String {
@@ -363,11 +582,28 @@ final class PlaybackEngine: ObservableObject {
 
     func play() {
         if didFinish { replay(); return }
+        activateAudioSession()
+        pauseRequestedAt = nil
+        resumeAfterInterruption = false
+        if restarting {
+            restartPaused = false
+        } else {
+            playRequest = (Date(), player.time.intValue, Date().timeIntervalSince(foregroundAt) < 30)
+        }
+        // Started from the Lock Screen: the picture stays off until the app is back, as when it left playing.
+        if UIApplication.shared.applicationState == .background { hideVideoWhileAway() }
         player.play()
         isPlaying = true
     }
 
-    func pause() { player.pause(); isPlaying = false }
+    func pause() {
+        playRequest = nil
+        resumeAfterInterruption = false
+        pauseRequestedAt = Date()
+        if restarting { restartPaused = true }
+        player.pause()
+        isPlaying = false
+    }
     func togglePlay() { isPlaying ? pause() : play() }
 
     /// - Parameter fast: land on the nearest keyframe instead of decoding up to the exact time. Right for a
@@ -430,11 +666,18 @@ final class PlaybackEngine: ObservableObject {
     }
 
     /// A stopped player can't seek; open the file again at `start`.
-    private func restart(from start: Double, after delay: Double = 0) {
+    /// - Parameter paused: open to the picture at `start` and wait there, rather than play.
+    private func restart(from start: Double, after delay: Double = 0, paused: Bool = false) {
         didFinish = false
         restarting = true
         restartBegan = Date()
+        restartPaused = paused
+        restartLoadedAt = nil
+        restartSeenOpening = false
+        reapplyDelays = subtitleDelay != 0 || audioDelay != 0
         tracksSettled = false
+        playRequest = nil
+        videoStats = nil
         markSeek(start)
         let p = player
         DispatchQueue.global(qos: .userInitiated).async {
@@ -442,14 +685,15 @@ final class PlaybackEngine: ObservableObject {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
                 MainActor.assumeIsolated {
                     guard let self else { return }
-                    self.load(from: start)
+                    self.load(from: start, paused: self.restartPaused)
                     self.addSubtitleFiles()
                     self.player.rate = self.rate
                     self.player.play()
+                    self.restartLoadedAt = Date()
                 }
             }
         }
-        isPlaying = true
+        isPlaying = !paused
     }
 
     func setRate(_ r: Float) { rate = r; player.rate = r }
@@ -472,14 +716,37 @@ final class PlaybackEngine: ObservableObject {
         }
     }
 
+    /// PiP is handing the picture back to the player screen, so the app is on its way to the foreground.
+    private var restoringFromPiP = false
+
+    private func pictureInPictureChanged(_ active: Bool) {
+        isPictureInPicture = active
+        // PiP closed while the app is away: the picture would otherwise go on drawing in the background.
+        if !active, !restoringFromPiP, isPlaying, UIApplication.shared.applicationState == .background {
+            hideVideoWhileAway()
+        }
+        restoringFromPiP = false
+    }
+
     // MARK: leaving the app
 
     private var videoTrackAway: String?
 
     /// iOS lets nothing draw while the app is in the background, and libVLC's picture can stall for good if it
     /// tries, leaving sound over a frozen frame. Sound carries on alone; the picture comes back with the app.
+    /// Paused, nothing draws, so the last frame stays: switching the track off then left a black screen to come
+    /// back to, and a video output that had to be rebuilt from the next keyframe while paused.
     func appDidEnterBackground() {
-        guard !isPictureInPicture, !isOnTV, videoTrackAway == nil,
+        leftWhilePlaying = isPlaying
+        guard isPlaying else {
+            PlaybackTrace.shared.mark("background: paused, picture kept")
+            return
+        }
+        hideVideoWhileAway()
+    }
+
+    private func hideVideoWhileAway() {
+        guard !isPictureInPicture, !output.isPiPEngaged, !isOnTV, videoTrackAway == nil,
               let track = player.videoTracks.first(where: { $0.isSelected }) else { return }
         PlaybackTrace.shared.mark("background: video off")
         videoTrackAway = track.trackId
@@ -487,14 +754,65 @@ final class PlaybackEngine: ObservableObject {
     }
 
     func appWillEnterForeground() {
+        foregroundAt = Date()
+        videoStats = nil
+        if isPlaying { activateAudioSession() }
+        // The server lost its socket while the app was away and came back elsewhere: the open stream is dead.
+        if refreshStreamURL(), hasPlayed, !didFinish {
+            PlaybackTrace.shared.mark(String(format: "foreground: stream moved; reopening at %.1fs", currentTime))
+            videoTrackAway = nil
+            restart(from: currentTime, paused: !isPlaying)
+            return
+        }
         guard let id = videoTrackAway else { return }
         videoTrackAway = nil
+        // Paused while away (Lock Screen, an interruption): a video output rebuilt while paused can stay black,
+        // so open the stream again to the picture where it stopped.
+        if !isPlaying, hasPlayed, !didFinish, !restarting {
+            PlaybackTrace.shared.mark(String(format: "foreground: paused with video off; reopening to the picture at %.1fs", currentTime))
+            restart(from: currentTime, paused: true)
+            return
+        }
         PlaybackTrace.shared.mark("foreground: video on")
+        restoreVideoTrack(id)
+    }
+
+    private func restoreVideoTrack(_ id: String) {
         player.videoTracks.first { $0.trackId == id }?.isSelectedExclusively = true
         // A track switched back on waits for the next keyframe; a seek to here shows the picture at once.
         if duration > 0, !didFinish {
             player.position = currentTime / duration
             markSeek(currentTime)
+        }
+    }
+
+    // MARK: audio session
+
+    /// Takes the audio back after another app or a call had it. Only when about to play: activating a playback
+    /// session stops other apps' audio.
+    private func activateAudioSession() {
+        do {
+            try AVAudioSession.sharedInstance().setActive(true)
+        } catch {
+            PlaybackTrace.shared.mark("audio session didn't activate: \(error.localizedDescription)")
+        }
+    }
+
+    /// A call, an alarm or another app's audio. libVLC only mutes itself (its audio output corks), so pause, and
+    /// carry on afterwards if iOS says to.
+    private func audioInterrupted(began: Bool, shouldResume: Bool) {
+        if began {
+            // iOS may deliver an interruption from while the app was suspended only once it's back.
+            let stale = !leftWhilePlaying && Date().timeIntervalSince(foregroundAt) < 3
+            guard isPlaying, !stale else { return }
+            PlaybackTrace.shared.mark("audio interrupted; pausing")
+            pause()
+            resumeAfterInterruption = true
+        } else {
+            let resume = resumeAfterInterruption && shouldResume
+            resumeAfterInterruption = false
+            PlaybackTrace.shared.mark("audio interruption ended\(resume ? "; resuming" : "")")
+            if resume { play() }
         }
     }
 
@@ -534,6 +852,7 @@ final class PlaybackEngine: ObservableObject {
     }
 
     func addSubtitleFile(_ url: URL) {
+        importedSubtitles.append(url)
         player.addPlaybackSlave(url, type: .subtitle, enforce: true)
     }
 
