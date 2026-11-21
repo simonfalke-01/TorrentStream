@@ -74,10 +74,11 @@ struct HomeView: View {
                 }
             }
             .task { await load() }
+            .onDisappear { shows.stopWarmingHome() }
             .sheet(isPresented: $showAdd) { AddLinkView() }
             .sheet(isPresented: $showSettings) { SettingsView() }
-            .fullScreenCover(item: $playing) { req in PlayerScreen(request: req) }
-            .fullScreenCover(item: $launch) { PlaybackLauncher(launch: $0) }
+            .fullScreenCover(item: $playing, onDismiss: { shows.warmHome() }) { req in PlayerScreen(request: req) }
+            .fullScreenCover(item: $launch, onDismiss: { shows.warmHome() }) { PlaybackLauncher(launch: $0) }
             .exportSheet($export)
             .removeTitleDialog(item: $pendingRemoval, export: $export)
         }
@@ -89,15 +90,15 @@ struct HomeView: View {
         let shows = self.shows
         let started = Date()
         PlaybackTrace.shared.launch("home shown (\(shows.rows.count) rows, \(shows.history.count) started on disk)")
-        // The show at the front of Continue Watching is the likeliest next play; have it ready.
-        warmFirst()
+        // The front of Continue Watching is the likeliest next play; have it ready.
+        shows.warmHome()
         prefetchArtwork()
         async let rows: Void = shows.loadRows(force: force)
         async let startedShows: Void = shows.refreshContinueWatching()
         _ = await (rows, startedShows)
         PlaybackTrace.shared.timing("home rows and Continue Watching up to date", since: started)
         PlaybackTrace.shared.launch("home up to date")
-        warmFirst()
+        shows.warmHome()
         prefetchArtwork()
         shows.planContinueWatching()
         // Shows likely to be opened next: the start of My List and of the first shelf.
@@ -105,12 +106,6 @@ struct HomeView: View {
         likely += shows.rows.first?.shows.prefix(4) ?? []
         shows.prefetchDetails(likely)
         await shows.adoptLinkedTitles()
-    }
-
-    private func warmFirst() {
-        if let first = shows.continueWatching.first, let d = shows.details[first.entry.show.id] {
-            shows.warm(d)
-        }
     }
 
     /// Downloads the hero and Continue Watching artwork, and decodes the posters of the first screen of each

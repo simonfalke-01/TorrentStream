@@ -78,7 +78,9 @@ struct ShowView: View {
         .task { await load() }
         .task { await shows.loadRecommendations(show) }
         .refreshable { await load(force: true) }
-        .fullScreenCover(item: $launch) { PlaybackLauncher(launch: $0) }
+        // What this page readied goes quiet once it's left; back from the player, it's readied again.
+        .onDisappear { if let d = details { shows.stopWarming(d) } }
+        .fullScreenCover(item: $launch, onDismiss: { if let d = details { shows.warm(d) } }) { PlaybackLauncher(launch: $0) }
         .sheet(item: $versions) { target in
             VersionsView(target: target, current: shows.savedSource(target.details, target.season, target.episode)?.infoHash) { source in
                 versions = nil
@@ -291,7 +293,8 @@ struct ShowView: View {
         } label: {
             ShowEpisodeRow(episode: e, minutes: s.media.duration, progress: p)
         }
-        .buttonStyle(.plain)
+        // The finger landing is a strong hint: start on that episode before the tap completes.
+        .buttonStyle(TouchDownButtonStyle { shows.warmTouched(d, s, e) })
         .disabled(!e.isAired)
         .contextMenu {
             if e.isAired {
@@ -518,7 +521,7 @@ struct ShowContinueCard: View {
             ContinueCardLabel(imageURL: still, title: d?.show.title ?? entry.show.title,
                               detail: Self.detail(entry: entry, next: next, details: d), progress: fraction)
         }
-        .buttonStyle(.plain)
+        .buttonStyle(TouchDownButtonStyle { shows.warmTouched(entry, next: next) })
         .accessibilityElement(children: .combine)
         .accessibilityHint(next?.resumeAt != nil ? "Resumes" : "Plays")
         .contextMenu {
@@ -701,6 +704,7 @@ struct PlaybackLauncher: View {
     @EnvironmentObject var model: AppModel
     @EnvironmentObject var shows: ShowsModel
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var request: PlaybackRequest?
     @State private var status = "Loading"
     @State private var failure: String?
@@ -721,52 +725,50 @@ struct PlaybackLauncher: View {
     }
 
     private var waiting: some View {
-        ZStack(alignment: .topLeading) {
-            Color.black.ignoresSafeArea()
-            VStack(spacing: Space.l) {
-                artwork
-                VStack(spacing: Space.xs) {
-                    Text(target?.details.show.title ?? launch.show.title)
-                        .font(.headline)
-                        .multilineTextAlignment(.center)
-                    if let label = episodeLabel {
-                        Text(label)
-                            .font(.subheadline)
-                            .foregroundStyle(.white.opacity(0.7))
-                            .multilineTextAlignment(.center)
-                    }
-                }
+        GeometryReader { geo in
+            let compact = geo.size.width < PlayerMetrics.compactWidth
+            ZStack {
+                // The same still the player holds until its first frame, in the same place, so opening is one
+                // continuous picture rather than a page, then black, then video.
+                PlaybackPoster(stillURL: target?.episode.thumbnailURL, posterURL: target?.details.show.posterURL ?? launch.show.posterURL)
+
                 if let failure {
                     failurePanel(failure)
+                        .padding(Space.xl)
+                        .frame(maxWidth: 420)
+                        .background(.black.opacity(0.55), in: .rect(cornerRadius: Radius.medium))
+                        .transition(.opacity)
                 } else {
-                    VStack(spacing: Space.s) {
-                        ProgressView().controlSize(.large).tint(.white)
-                        Text(status)
-                            .font(.footnote)
-                            .foregroundStyle(.white.opacity(0.7))
-                            .contentTransition(.opacity)
+                    // Most episodes open within a beat; only a longer wait says what it's doing.
+                    AfterDelay(delay: 0.4) {
+                        VStack(spacing: Space.s) {
+                            ProgressView().controlSize(.large).tint(.white)
+                            Text(status)
+                                .font(.footnote)
+                                .foregroundStyle(.white.opacity(0.8))
+                                .contentTransition(.opacity)
+                        }
+                        .shadow(color: .black.opacity(0.4), radius: PlayerMetrics.glyphShadow)
+                        .animation(Motion.role(Motion.standard, reduce: reduceMotion), value: status)
+                        .accessibilityElement(children: .combine)
                     }
-                    .animation(Motion.standard, value: status)
-                    .accessibilityElement(children: .combine)
+                    .id(attempt)
                 }
-            }
-            .padding(Space.xl)
-            .frame(maxWidth: 420)
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-            Button { dismiss() } label: {
-                Image(systemName: "xmark")
-                    .font(.body.weight(.semibold))
-                    .frame(width: Metrics.touchTarget, height: Metrics.touchTarget)
-                    .contentShape(.circle)
+                VStack(alignment: .leading, spacing: 0) {
+                    PlayerIconButton(systemImage: "xmark", label: "Close") { dismiss() }
+                    Spacer(minLength: 0)
+                    titleBlock
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, compact ? Space.l : PlayerMetrics.wideMargin)
+                .padding(.vertical, Space.s)
             }
-            .buttonStyle(.plain)
-            .glassEffect(.clear.interactive(), in: .circle)
-            .padding(Space.l)
-            .accessibilityLabel("Close")
+            .frame(width: geo.size.width, height: geo.size.height)
         }
         .foregroundStyle(.white)
         .preferredColorScheme(.dark)
+        .animation(Motion.role(Motion.standard, reduce: reduceMotion), value: failure)
         .sheet(item: $choosing) { t in
             VersionsView(target: t) { source in
                 choosing = nil
@@ -776,15 +778,24 @@ struct PlaybackLauncher: View {
         }
     }
 
-    @ViewBuilder
-    private var artwork: some View {
-        if let still = target?.episode.thumbnailURL {
-            PosterImage(url: still, title: "", showsTitle: false, cornerRadius: Radius.medium)
-                .frame(width: 280, height: 280 * 9 / 16)
-        } else {
-            PosterImage(url: launch.show.posterURL, title: launch.show.title, showsTitle: false, cornerRadius: Radius.medium)
-                .frame(width: Metrics.shelfPoster.width, height: Metrics.shelfPoster.height)
+    /// Where the player's title will be: the show over the episode.
+    private var titleBlock: some View {
+        VStack(alignment: .leading, spacing: Space.xxs) {
+            if let label = episodeLabel {
+                Text(target?.details.show.title ?? launch.show.title)
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(.white.opacity(0.7))
+                Text(label)
+                    .font(.headline)
+            } else {
+                Text(target?.details.show.title ?? launch.show.title)
+                    .font(.headline)
+            }
         }
+        .lineLimit(1)
+        .shadow(color: .black.opacity(0.4), radius: PlayerMetrics.glyphShadow)
+        .accessibilityElement(children: .combine)
+        .padding(.bottom, Space.l)
     }
 
     private var episodeLabel: String? {
@@ -818,6 +829,10 @@ struct PlaybackLauncher: View {
     private func start() async {
         failure = nil
         status = "Loading"
+        // Warm-ups being let go wait while this opens, so its torrent isn't paused under it.
+        shows.launchBegan()
+        defer { shows.launchEnded() }
+        PlaybackEngine.prepareLibrary()
         let trace = PlaybackTrace.shared
         trace.begin("Play \(launch.show.title)" + (launch.episode.map { " episode \($0)" } ?? ""))
         do {

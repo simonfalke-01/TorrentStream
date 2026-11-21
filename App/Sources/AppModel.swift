@@ -564,6 +564,13 @@ final class AppModel: ObservableObject {
 
     func isPlaying(_ torrent: Torrent) -> Bool { playing[torrent.infoHashHex] != nil }
 
+    /// A player is open.
+    var isPlayingAnything: Bool { !playing.isEmpty }
+
+    /// What getting likely episodes ready may load beyond the essentials (their head, index and resume point): a
+    /// twentieth of the cache, at least 64 MB.
+    var warmBudget: Int64 { max(64 << 20, cacheLimit / 20) }
+
     /// Keeps cached video within budget by dropping the data of the titles watched longest ago, the most recent
     /// one last. Titles stay in My List with their episodes and positions; they stream again when played.
     func trimCache() {

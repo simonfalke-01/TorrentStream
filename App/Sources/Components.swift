@@ -154,6 +154,41 @@ struct PrimaryPlayButtonStyle: ButtonStyle {
     }
 }
 
+/// Looks and behaves like `.plain`, and says when a finger comes down, so what the button starts can be got
+/// ready while it is still held.
+struct TouchDownButtonStyle: ButtonStyle {
+    let onTouchDown: () -> Void
+    @Environment(\.isEnabled) private var isEnabled
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .opacity(configuration.isPressed ? 0.6 : 1)
+            .onChange(of: configuration.isPressed) { _, pressed in
+                if pressed && isEnabled { onTouchDown() }
+            }
+    }
+}
+
+/// Shows its content only once `delay` has passed since it appeared, so work that finishes quickly never flashes
+/// a spinner.
+struct AfterDelay<Content: View>: View {
+    let delay: Double
+    @ViewBuilder let content: Content
+    @State private var shown = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        ZStack {
+            if shown { content.transition(.opacity) }
+        }
+        .task {
+            try? await Task.sleep(nanoseconds: UInt64(max(0, delay) * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            withAnimation(Motion.role(Motion.standard, reduce: reduceMotion)) { shown = true }
+        }
+    }
+}
+
 /// Outlined resolution tag: "4K", "1080p".
 struct QualityBadge: View {
     let resolution: String

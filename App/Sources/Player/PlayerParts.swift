@@ -76,6 +76,32 @@ struct PlayerToolbar<Content: View>: View {
     }
 }
 
+/// Stands in for the picture until the first frame: the episode's still where the video will appear, else the
+/// poster, softened. Opening an episode never shows a blank screen, and the still gives way to the same scene.
+struct PlaybackPoster: View {
+    let stillURL: URL?
+    let posterURL: URL?
+
+    var body: some View {
+        ZStack {
+            Color.black
+            if let stillURL {
+                PipelineImage(url: stillURL)
+                    .aspectRatio(16 / 9, contentMode: .fit)
+                    .clipped()
+            } else if let posterURL {
+                PipelineImage(url: posterURL)
+                    .blur(radius: 40)
+                    .opacity(0.5)
+                    .clipped()
+            }
+        }
+        .ignoresSafeArea()
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+}
+
 /// Seek bar showing what's loaded, chapter boundaries, and while dragging, the time and chapter under the finger.
 struct StreamScrubber: View {
     let progress: Double

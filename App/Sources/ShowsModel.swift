@@ -133,10 +133,10 @@ final class ShowsModel: ObservableObject {
     /// Shows whose episode names and stills were looked up this session, so a cached copy gets them once.
     private var enriched: Set<Int> = []
     private var prefetchTask: Task<Void, Never>?
-    private var warmTask: Task<Void, Never>?
-    /// Episode the running warm task is for.
-    private var warmKey: String?
-    private weak var warmed: Torrent?
+    /// Gets likely next episodes ready before Play is pressed.
+    private lazy var prewarmer = Prewarmer(app: app)
+    /// Warm-ups finding an episode's release, by episode key, so pressing Play joins them instead of searching again.
+    private var resolving: [String: Task<ResolvedEpisode?, Never>] = [:]
     /// Releases picked ahead of time, by episode key.
     private var planned: [String: PlannedSource] = [:]
     private var planTask: Task<Void, Never>?
@@ -497,6 +497,8 @@ final class ShowsModel: ObservableObject {
     // MARK: playback
 
     func playbackStarted(_ request: PlaybackRequest) {
+        // Every request for data now goes to what's on screen.
+        prewarmer.releaseAll()
         guard let ctx = request.show else { return }
         history.removeAll { $0.show.id == ctx.show.id }
         history.insert(WatchEntry(show: ctx.show, seasonID: ctx.seasonID, season: ctx.season, episode: ctx.episode,
@@ -515,36 +517,84 @@ final class ShowsModel: ObservableObject {
         save()
     }
 
+    // MARK: getting ready ahead of time
+
     /// Gets the episode the Play button would start ready while its page is open: finds the release, joins the
-    /// swarm and loads the opening seconds and the container index, so pressing Play starts at once. Only one
-    /// show is warmed at a time; the one before goes quiet.
+    /// swarm and loads the container's head and index and the opening seconds (or the resume point), so pressing
+    /// Play starts at once. The episode after it is readied too when its release is already known.
     func warm(_ d: ShowDetails) {
-        guard let next = upNext(d), next.episode.isAired else { return }
-        let key = Self.key(d.show.id, next.season.id, next.episode.number)
-        // Already on it.
-        if warmKey == key, warmTask != nil { return }
-        warmTask?.cancel()
-        warmKey = key
-        warmTask = Task {
-            defer { if warmKey == key { warmTask = nil; warmKey = nil } }
-            if prepared[key] == nil, let r = try? await resolve(d, next.season, next.episode, source: nil, status: { _ in }) {
-                prepared[key] = r
-            }
-            guard !Task.isCancelled, let r = prepared[key] else { return }
-            if let old = warmed, old !== r.torrent, !app.isPlaying(old) { old.pause() }
-            warmed = r.torrent
-            r.torrent.prefetch(fileIndex: r.file.index, bytes: Self.warmBytes)
-            // Resuming reads from where the viewer left off; estimate that spot by proportion.
-            if let at = next.resumeAt, let remaining = next.remaining, at + remaining > 0 {
-                let offset = Int64(Double(r.file.length) * at / (at + remaining))
-                let range = max(0, offset - (2 << 20))..<min(r.file.length, offset + (10 << 20))
-                r.torrent.want(fileIndex: r.file.index, ranges: [range], urgency: .soon, tag: "warm.resume")
-            }
+        guard let next = upNext(d) else { return }
+        var targets = [warmTarget(d, next.season, next.episode, reason: .primary, searching: true)]
+        if let after = d.episode(after: next.season, next.episode) {
+            targets.append(warmTarget(d, after.0, after.1, reason: .prominent, searching: false))
+        }
+        prewarmer.warm(targets.compactMap { $0 }, scope: Self.warmScope(d))
+    }
+
+    /// Readies the front of Continue Watching: the first show's next episode, then the next two shows' when their
+    /// releases are already known (played before or picked ahead).
+    func warmHome() {
+        let targets = continueWatching.prefix(3).enumerated().compactMap { i, c -> Prewarmer.Target? in
+            guard let next = c.next, let d = details[c.entry.show.id] else { return nil }
+            return warmTarget(d, next.season, next.episode, reason: i == 0 ? .primary : .likely, searching: i == 0)
+        }
+        prewarmer.warm(targets, scope: Self.homeScope)
+    }
+
+    /// A finger came down on an episode's row on its show page.
+    func warmTouched(_ d: ShowDetails, _ s: ShowSeason, _ e: ShowEpisode) {
+        guard let t = warmTarget(d, s, e, reason: .touch, searching: true) else { return }
+        prewarmer.warm([t], scope: Self.warmScope(d), lane: "touch")
+    }
+
+    /// A finger came down on a Continue Watching card.
+    func warmTouched(_ entry: WatchEntry, next: ShowUpNext?) {
+        guard let next, let d = details[entry.show.id],
+              let t = warmTarget(d, next.season, next.episode, reason: .touch, searching: true) else { return }
+        prewarmer.warm([t], scope: Self.homeScope, lane: "touch")
+    }
+
+    /// The show page closed: what it readied goes quiet after a short grace.
+    func stopWarming(_ d: ShowDetails) { prewarmer.release(scope: Self.warmScope(d)) }
+
+    func stopWarmingHome() { prewarmer.release(scope: Self.homeScope) }
+
+    /// An episode is being opened from the launcher; warm-ups being released wait for it.
+    func launchBegan() { prewarmer.beginLaunch() }
+
+    func launchEnded() { prewarmer.endLaunch() }
+
+    private static let homeScope = "home"
+    private static func warmScope(_ d: ShowDetails) -> String { "show.\(d.show.id)" }
+
+    private func warmTarget(_ d: ShowDetails, _ s: ShowSeason, _ e: ShowEpisode, reason: Prewarmer.Reason,
+                            searching: Bool) -> Prewarmer.Target? {
+        guard e.isAired else { return nil }
+        let key = Self.key(d.show.id, s.id, e.number)
+        let resume = defaults.bool(forKey: SettingsKey.resumePlayback)
+            ? progress[key].flatMap { $0.position > 20 && !$0.isWatched ? $0 : nil } : nil
+        return Prewarmer.Target(key: key, label: "\(d.show.title) \(Self.episodeLabel(d, s, e))",
+                                resumeAt: resume?.position,
+                                resumeFraction: resume.flatMap { $0.duration > 0 ? $0.position / $0.duration : nil },
+                                reason: reason) { [weak self] in
+            await self?.warmResolve(d, s, e, key: key, searching: searching)
         }
     }
 
-    /// Enough of the start for the first picture of a high-bitrate 1080p episode, with some margin.
-    private static let warmBytes: Int64 = 28 << 20
+    /// Finds the release for a warm-up, sharing the search with a Play pressed meanwhile.
+    private func warmResolve(_ d: ShowDetails, _ s: ShowSeason, _ e: ShowEpisode, key: String,
+                             searching: Bool) async -> ResolvedEpisode? {
+        if let job = resolving[key] { return await job.value }
+        let job = Task { [weak self] () -> ResolvedEpisode? in
+            guard let self else { return nil }
+            return try? await self.resolve(d, s, e, source: nil, searching: searching, status: { _ in })
+        }
+        resolving[key] = job
+        let r = await job.value
+        if resolving[key] == job { resolving[key] = nil }
+        if let r { prepared[key] = r }
+        return r
+    }
 
     /// Loads the start of the next episode once the current one's bitrate is known.
     func prefetchNext(after request: PlaybackRequest, duration: Double) {
@@ -624,8 +674,8 @@ final class ShowsModel: ObservableObject {
     }
 
     /// Finds a file that plays the episode: the one prepared ahead, the one played before, the next file of the
-    /// season pack being watched, else the best release found.
-    func resolve(_ d: ShowDetails, _ s: ShowSeason, _ e: ShowEpisode, source: EpisodeSource?,
+    /// season pack being watched, else the best release found (unless `searching` is false).
+    func resolve(_ d: ShowDetails, _ s: ShowSeason, _ e: ShowEpisode, source: EpisodeSource?, searching: Bool = true,
                  status: @escaping (String) -> Void) async throws -> ResolvedEpisode {
         guard e.isAired else { throw ShowError.notAired }
         let key = Self.key(d.show.id, s.id, e.number)
@@ -661,6 +711,7 @@ final class ShowsModel: ObservableObject {
             }
         }
 
+        guard searching || source != nil else { throw ShowError.noSources }
         status("Finding the best version")
         PlaybackTrace.shared.mark("resolve: searching Nyaa")
         let candidates: [EpisodeSource]
@@ -695,8 +746,13 @@ final class ShowsModel: ObservableObject {
     /// A ready-to-play request for an episode, resuming where the viewer stopped unless told otherwise.
     func request(_ d: ShowDetails, _ s: ShowSeason, _ e: ShowEpisode, source: EpisodeSource?, resumeAt: Double?,
                  status: @escaping (String) -> Void) async throws -> PlaybackRequest {
-        let r = try await resolve(d, s, e, source: source, status: status)
         let key = Self.key(d.show.id, s.id, e.number)
+        if source == nil, let job = resolving[key] {
+            PlaybackTrace.shared.mark("resolve: joining the warm-up already finding it")
+            _ = await job.value
+        }
+        let r = try await resolve(d, s, e, source: source, status: status)
+        prewarmer.launching(r.torrent)
         let p = progress[key]
         let saved = defaults.bool(forKey: SettingsKey.resumePlayback)
             ? p.flatMap { $0.position > 20 && !$0.isWatched ? $0.position : nil } : nil
@@ -739,6 +795,8 @@ final class ShowsModel: ObservableObject {
                 guard !Task.isCancelled else { return }
                 await plan(d, s, e)
             }
+            // Releases just picked can be readied now, if Home is still showing.
+            if !Task.isCancelled, prewarmer.holds(lane: Self.homeScope) { warmHome() }
         }
     }
 

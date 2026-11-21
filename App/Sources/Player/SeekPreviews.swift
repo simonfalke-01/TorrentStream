@@ -72,24 +72,75 @@ final class SeekPreviews: ObservableObject {
             return
         }
         let torrent = self.torrent, fileIndex = self.fileIndex, length = fileLength
+        // Read ahead while the episode was being got ready, or when it played before.
+        let cached = KeyframeIndexCache.shared.index(torrent, fileIndex: fileIndex)
         loadTask = Task.detached(priority: .utility) { [weak self] in
-            let read = Self.reader(torrent: torrent, fileIndex: fileIndex, urgency: .soon, tag: Tag.index, timeout: 60)
-            var loaded: (any KeyframeIndex)?
-            for attempt in 0..<6 {
-                do {
-                    loaded = try await MediaIndex.load(fileLength: length, read: read)
-                    break
-                } catch MediaIndexError.dataUnavailable {
-                    if Task.isCancelled { break }
-                    try? await Task.sleep(nanoseconds: UInt64(5 + attempt * 5) * 1_000_000_000)
-                } catch {
-                    break
+            var loaded = cached
+            if loaded == nil {
+                loaded = await KeyframeIndexCache.read(torrent: torrent, fileIndex: fileIndex, fileLength: length,
+                                                       urgency: .soon, tag: Tag.index, timeout: 60, attempts: 6)
+                torrent.clearWants(tag: Tag.index)
+                if let found = loaded {
+                    await KeyframeIndexCache.shared.store(found, torrent: torrent, fileIndex: fileIndex)
                 }
             }
-            torrent.clearWants(tag: Tag.index)
             let decoder = loaded.flatMap { PreviewDecoder(track: $0.video, width: Self.width) }
             await self?.loaded(loaded, decoder: decoder, duration: duration)
         }
+    }
+
+    /// Keyframe nearest `seconds`, if one is within `within` seconds. Uses the index read ahead of playback until
+    /// this file's own is loaded.
+    func keyframeTime(near seconds: Double, within: Double) -> Double? {
+        guard let k = keyframes, let i = KeyframeIndexCache.lastIndex(k, atOrBefore: seconds) else { return nil }
+        let candidates = [k[i].time] + (i + 1 < k.count ? [k[i + 1].time] : [])
+        guard let best = candidates.min(by: { abs($0 - seconds) < abs($1 - seconds) }), abs(best - seconds) <= within else { return nil }
+        return best
+    }
+
+    /// First keyframe at or after `seconds`, if one is within `within` seconds: where a skip should land so nothing
+    /// before its end shows.
+    func keyframeTime(after seconds: Double, within: Double) -> Double? {
+        guard let k = keyframes, let i = KeyframeIndexCache.lastIndex(k, atOrBefore: seconds) else { return nil }
+        let j = k[i].time >= seconds ? i : i + 1
+        guard j < k.count, k[j].time - seconds <= within else { return nil }
+        return k[j].time
+    }
+
+    /// The previewed keyframe nearest `seconds`, if one is within `within` seconds. A scrub landing there shows the
+    /// picture the bar just showed, from bytes already fetched for it.
+    func previewedKeyframeTime(near seconds: Double, within: Double) -> Double? {
+        guard let best = times.min(by: { abs($0.time - seconds) < abs($1.time - seconds) }),
+              abs(best.time - seconds) <= within else { return nil }
+        return best.time
+    }
+
+    /// Keyframe times at roughly every `spacing` seconds, plus those starting `extra` spots, with the byte range
+    /// playing from each reads first (the keyframe and about `seconds` after it). Nil until an index is known.
+    func seekPoints(every spacing: Double, extra: [Double], seconds: Double, limit: Int) -> [Range<Int64>]? {
+        guard let k = keyframes, !k.isEmpty, let index = index ?? KeyframeIndexCache.shared.index(torrent, fileIndex: fileIndex)
+        else { return nil }
+        var keys = Set<Int>()
+        let last = k[k.count - 1].time
+        for t in extra { if let i = KeyframeIndexCache.lastIndex(k, atOrBefore: t + 0.5) { keys.insert(i) } }
+        if spacing > 0 {
+            for t in stride(from: spacing, to: last, by: spacing) {
+                guard keys.count < limit, let i = index.nearestKeyframe(to: t) else { break }
+                keys.insert(i)
+            }
+        }
+        return keys.sorted().prefix(limit).map { i in
+            let start = min(k[i].clusterOffset, fileLength)
+            var j = i + 1
+            while j < k.count, k[j].time < k[i].time + seconds { j += 1 }
+            let end = j < k.count ? k[j].clusterOffset : fileLength
+            return start..<min(fileLength, max(end, start + (512 << 10)), start + (8 << 20))
+        }
+    }
+
+    private var keyframes: [Keyframe]? {
+        let k = (index ?? KeyframeIndexCache.shared.index(torrent, fileIndex: fileIndex))?.keyframes
+        return k?.isEmpty == false ? k : nil
     }
 
     /// The bytes playing from `seconds` reads first: from the keyframe at or before it, two keyframes on (at least
@@ -107,8 +158,9 @@ final class SeekPreviews: ObservableObject {
         return start..<min(fileLength, max(next, start + 4 << 20))
     }
 
-    /// The preview nearest `seconds`, if one is close enough to stand for that spot.
-    func image(at seconds: Double) -> UIImage? {
+    /// The preview nearest `seconds`, if one is close enough to stand for that spot: within `tolerance` seconds,
+    /// or by default half the spacing previews have filled in to (at least 15 s).
+    func image(at seconds: Double, tolerance: Double? = nil) -> UIImage? {
         guard !times.isEmpty else { return nil }
         var lo = 0, hi = times.count
         while lo < hi {
@@ -117,7 +169,7 @@ final class SeekPreviews: ObservableObject {
         }
         var best = min(lo, times.count - 1)
         if lo > 0, lo == times.count || seconds - times[lo - 1].time <= times[lo].time - seconds { best = lo - 1 }
-        let tolerance = max(15, (spacing.isFinite ? spacing : 0) / 2)
+        let tolerance = tolerance ?? max(15, (spacing.isFinite ? spacing : 0) / 2)
         guard abs(times[best].time - seconds) <= tolerance else { return nil }
         return images[times[best].key]
     }

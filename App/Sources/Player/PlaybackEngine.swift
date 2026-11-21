@@ -102,6 +102,17 @@ final class PlaybackEngine: ObservableObject {
     @Published private(set) var isPictureInPicture = false
     /// The video is showing on a TV rather than the phone.
     @Published private(set) var isOnTV = false
+    /// libVLC has drawn its first picture (or, for a file without video, started playing). Until then the player
+    /// shows the episode's artwork where the video goes.
+    @Published private(set) var hasFirstFrame = false
+    /// A seek the picture hasn't caught up with yet, in seconds: the player shows that spot's preview over the
+    /// old frame until libVLC draws the new one.
+    @Published private(set) var seekPending: Double?
+
+    /// The keyframe nearest a time, within a distance (both in seconds), when the file's index is known. Seeks and
+    /// skips land on keyframes when one is close: libVLC then decodes nothing before the spot, and the bytes there
+    /// are the ones fetched ahead.
+    var keyframeNear: ((Double, Double) -> Double?)?
 
     let output: VideoOutput
     /// The streaming server's port as it is now. iOS can take the server's socket while the app is away, and the
@@ -149,6 +160,22 @@ final class PlaybackEngine: ObservableObject {
     private var restartSeenOpening = false
     /// Delays to set again once a reopened stream is up; a new input starts without them.
     private var reapplyDelays = false
+    /// Where the current input was opened with `:start-time`. libVLC adds it to every later seek and takes it off
+    /// the length it reports (input.c ControlSetTime/ControlSetPosition, input_GetItemDuration), so seeks and the
+    /// duration are converted through it.
+    private var clipStart: Double = 0
+    private let fileExtension: String
+    private var mediaSetAt = Date()
+    private var tracedFirstBytes = false
+    /// The first time libVLC reported, before the first picture.
+    private var timeSeen: Double?
+    /// Pictures shown when the pending seek was asked for; a higher count is the new spot's picture.
+    private var seekBaseline: UInt64 = 0
+    private var seekAskedAt = Date()
+    /// How far from the target libVLC may land and still count as there.
+    private var seekTolerance = 2.5
+    /// Polls libVLC's picture counters quickly while the first picture or a seek's picture is awaited.
+    private var frameTimer: Timer?
 
     /// A play the viewer asked for and libVLC hasn't yet shown, with the time it was asked at.
     private var playRequest: (at: Date, time: Int32, fromForeground: Bool)?
@@ -175,10 +202,14 @@ final class PlaybackEngine: ObservableObject {
         self.memoryKey = memoryKey
         preferDub = UserDefaults.standard.bool(forKey: SettingsKey.preferDub)
         resumeAt = request.resumeAt.flatMap { $0 > 0 ? $0 : nil }
+        fileExtension = request.fileExtension
 
         player.drawable = output
-        load(from: request.resumeAt)
-        if let r = request.resumeAt, r > 0 { currentTime = r }
+        // Open on the keyframe at or before the resume point when the index was read ahead: nothing before the
+        // spot has to be decoded, and the bytes there are the ones the warm-up fetched.
+        let start = resumeAt.map { r in KeyframeIndexCache.shared.keyframeTime(atOrBefore: r, for: request, within: 10) ?? r }
+        load(from: start, initial: true)
+        if let r = resumeAt { currentTime = start ?? r }
 
         output.onPiPReady = { [weak self] in
             MainActor.assumeIsolated { self?.canPictureInPicture = true }
@@ -211,7 +242,16 @@ final class PlaybackEngine: ObservableObject {
         }
     }
 
-    private func load(from start: Double?, paused: Bool = false) {
+    /// Keeps libVLC's plugin list loaded between players, so opening one doesn't build it again (module_InitBank
+    /// rebuilds it whenever the last libVLC instance has gone). Cheap after the first call.
+    nonisolated static func prepareLibrary() {
+        DispatchQueue.global(qos: .utility).async { _ = VLCLibrary.shared() }
+    }
+
+    /// - Parameter initial: the first open. Its input exists as soon as the media is set, so the resume point is
+    ///   a seek queued before it starts rather than `:start-time` (see `clipStart`). A reopened stream's input is
+    ///   created only once the old one has stopped, so it uses `:start-time`.
+    private func load(from start: Double?, paused: Bool = false, initial: Bool = false) {
         refreshStreamURL()
         guard let media = VLCMedia(url: url) else {
             errorText = "This video couldn’t be opened."
@@ -220,14 +260,46 @@ final class PlaybackEngine: ObservableObject {
         // VLC buffers this much media at start and after every seek before showing a frame. The torrent engine
         // does the buffering, so VLC's own only adds delay.
         media.addOption(":network-caching=400")
+        // A stall (a slow peer) makes libVLC raise its buffering by up to clock-jitter for the rest of the input,
+        // so every later start and seek would wait longer. The torrent engine absorbs stalls; keep VLC's at 400 ms.
+        media.addOption(":clock-jitter=0")
+        // The stream's URL has no file name, so VLC would probe demuxers by priority (MP4 first, then the rest
+        // reading the head each time). Name the right one, with any other as fallback.
+        if let demux = Self.demuxer(forExtension: fileExtension) { media.addOption(":demux=\(demux),any") }
+        // Picture counters (first frame, a seek's new frame) refresh every 50 ms instead of 250 ms.
+        media.addOption(":stats-min-report-interval=50")
         media.addOption(":http-reconnect")
         media.addOption(preferDub ? ":audio-language=eng,en,jpn,ja" : ":audio-language=jpn,ja,eng,en")
         if !preferDub { media.addOption(":sub-language=eng,en,English") }
-        if let start, start > 0 { media.addOption(":start-time=\(Int(start))") }
+        let at = start.flatMap { $0 > 0 ? $0 : nil }
+        let queueSeek = initial && at != nil && Self.setTimeSymbol != nil && libVLCPlayer() != nil
+        clipStart = 0
+        if let at, !queueSeek {
+            media.addOption(":start-time=\(Int(at))")
+            clipStart = Double(Int(at))
+        }
         // Opens to the first picture and holds there (input.c MainLoop pauses before the first demux).
         if paused { media.addOption(":start-paused") }
         openedGeneration = streamGeneration?() ?? 0
         player.media = media
+        mediaSetAt = Date()
+        // A new input's counters start from nothing.
+        seekBaseline = 0
+        if initial { PlaybackTrace.shared.mark("player: media set") }
+        if queueSeek, let at {
+            // Applied by the input before its first frame, like :start-time, but on the nearest keyframe. Should it
+            // not take, the resume check in poll() seeks there once playing.
+            if setTime(at, fast: true) { PlaybackTrace.shared.mark(String(format: "player: opening at %.1fs", at)) }
+        }
+        watchFrames()
+    }
+
+    private static func demuxer(forExtension ext: String) -> String? {
+        switch ext.lowercased() {
+        case "mkv", "webm", "mk3d", "mka": return "mkv"
+        case "mp4", "m4v", "mov": return "mp4"
+        default: return nil
+        }
     }
 
     /// Points the stream (and subtitle files from the torrent) at the server's current port; true if it moved.
@@ -291,6 +363,8 @@ final class PlaybackEngine: ObservableObject {
     func shutdown() {
         timer?.invalidate()
         timer = nil
+        frameTimer?.invalidate()
+        frameTimer = nil
         if let interruptionObserver { NotificationCenter.default.removeObserver(interruptionObserver) }
         interruptionObserver = nil
         output.shutdown()
@@ -390,8 +464,10 @@ final class PlaybackEngine: ObservableObject {
             || waitingForPlay
 
         let len = player.media?.length.intValue ?? 0
-        if len > 0 {
-            let d = Double(len) / 1000
+        // A stream reopened with :start-time reports its length less the start; the length doesn't change, so
+        // keep the one known.
+        if len > 0, clipStart == 0 || duration == 0 {
+            let d = Double(len) / 1000 + clipStart
             if d != duration {
                 if duration == 0 { PlaybackTrace.shared.mark(String(format: "duration %.0fs", d)) }
                 duration = d
@@ -416,7 +492,7 @@ final class PlaybackEngine: ObservableObject {
             resumeChecked = true
             if r > 15, now < r - 15, r < duration - 5 {
                 PlaybackTrace.shared.mark(String(format: "started at %.1fs instead of %.1fs; seeking there", now, r))
-                player.position = r / duration
+                move(to: r, fast: false)
                 markSeek(r)
             }
         }
@@ -611,33 +687,118 @@ final class PlaybackEngine: ObservableObject {
     func togglePlay() { isPlaying ? pause() : play() }
 
     /// - Parameter fast: land on the nearest keyframe instead of decoding up to the exact time. Right for a
-    ///   scrub, where the viewer picked a rough spot; wrong for skipping an intro or opening a chapter.
+    ///   scrub, where the viewer picked a rough spot; wrong for skipping an intro or opening a chapter, unless a
+    ///   keyframe is a fraction of a second away.
     func seek(to seconds: Double, fast: Bool = false) {
         guard duration > 0 else { return }
-        let target = max(0, min(seconds, duration - 1))
+        var target = max(0, min(seconds, duration - 1))
         if didFinish {
             restart(from: target)
             return
         }
-        PlaybackTrace.shared.mark(String(format: "seek to %.1fs%@ from %.1fs", target, fast ? " (keyframe)" : "", currentTime))
-        if !(fast && setTimeFast(target)) {
-            player.position = target / duration
+        // On a keyframe, nothing before the spot is decoded and the bytes are the ones fetched ahead.
+        var keyed = fast
+        if let k = keyframeNear?(target, fast ? 6 : 0.75) {
+            target = k
+            keyed = true
         }
-        markSeek(target)
+        PlaybackTrace.shared.mark(String(format: "seek to %.1fs%@ from %.1fs", target, keyed ? " (keyframe)" : "", currentTime))
+        move(to: target, fast: keyed)
+        markSeek(target, tolerance: fast && target == seconds ? 10 : 2.5)
     }
 
+    /// Skips from where playback is (or is going), as one absolute seek: libVLC's relative jumps are applied from
+    /// the input's own clock and land wrong after a reopen. Lands on a keyframe when one is near the spot.
     func skip(by seconds: Double) {
         PlaybackTrace.shared.mark(String(format: "skip %+.0fs from %.1fs", seconds, currentTime))
-        if seconds > 0 { player.jumpForward(seconds) } else { player.jumpBackward(-seconds) }
-        markSeek(max(0, duration > 0 ? min(currentTime + seconds, duration) : currentTime + seconds))
+        guard duration > 0, !didFinish else {
+            if seconds > 0 { player.jumpForward(seconds) } else { player.jumpBackward(-seconds) }
+            markSeek(max(0, currentTime + seconds))
+            return
+        }
+        let from = seekTarget ?? currentTime
+        let target = max(0, min(from + seconds, duration - 1))
+        if let k = keyframeNear?(target, 2.5), abs(k - from) >= 5, (k - from) * seconds > 0 {
+            move(to: k, fast: true)
+            markSeek(k)
+        } else {
+            move(to: target, fast: false)
+            markSeek(target)
+        }
     }
 
-    private func markSeek(_ target: Double) {
+    /// Sends libVLC to `target` seconds into the file. A time before where the input was opened can't be
+    /// reached in it (libVLC adds the start to every seek), so the stream is opened again there.
+    private func move(to target: Double, fast: Bool) {
+        if target < clipStart - 0.5 {
+            restart(from: target, paused: !isPlaying)
+            return
+        }
+        if setTime(target - clipStart, fast: fast) { return }
+        let span = duration - clipStart
+        if span > 0 { player.position = (target - clipStart) / span }
+    }
+
+    private func markSeek(_ target: Double, tolerance: Double = 2.5) {
         seekTarget = target
         seekDeadline = Date().addingTimeInterval(4)
         seekStarted = Date()
         currentTime = target
         lastChange = Date()
+        seekPending = target
+        seekTolerance = tolerance
+        seekAskedAt = Date()
+        seekBaseline = player.media?.statistics.displayedPictures ?? 0
+        watchFrames()
+    }
+
+    // MARK: pictures
+
+    private func watchFrames() {
+        guard frameTimer == nil, !hasFirstFrame || seekPending != nil else { return }
+        frameTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.checkFrames() }
+        }
+    }
+
+    /// Notices the first picture and a seek's first new picture within a frame or two, from libVLC's counters.
+    private func checkFrames() {
+        guard let media = player.media else { return }
+        let stats = media.statistics
+        let t = Double(player.time.intValue) / 1000
+        if !hasFirstFrame {
+            if !tracedFirstBytes, stats.readBytes > 0 {
+                tracedFirstBytes = true
+                PlaybackTrace.shared.mark(String(format: "player: first bytes read %.2fs after media set",
+                                                 Date().timeIntervalSince(mediaSetAt)))
+            }
+            // A file without video counts once it plays; so does one whose counters never move, once its clock has
+            // run a while, so the artwork can't stay over a playing picture.
+            if timeSeen == nil, t > 0 { timeSeen = t }
+            let ranOn = timeSeen.map { t - $0 > 1.5 } ?? false
+            let audioOnly = t > 0 && Date().timeIntervalSince(mediaSetAt) > 1.5 && stats.decodedVideo == 0
+            if stats.displayedPictures > 0 || audioOnly || ranOn {
+                hasFirstFrame = true
+                PlaybackTrace.shared.mark(String(format: "player: first frame %.2fs after media set",
+                                                 Date().timeIntervalSince(mediaSetAt)))
+            }
+        }
+        if let target = seekPending {
+            let waited = Date().timeIntervalSince(seekAskedAt)
+            let there = abs(t - target) < seekTolerance
+            // Paused, libVLC's counters don't move; the time reaching the spot is the sign.
+            let paused = !player.isPlaying && !isPlaying
+            // Pictures from before the jump may still be counted until the input gets there.
+            if !there { seekBaseline = max(seekBaseline, stats.displayedPictures) }
+            if (there && stats.displayedPictures > seekBaseline) || (paused && (there || waited > 1.5)) || waited > 8 {
+                seekPending = nil
+                PlaybackTrace.shared.mark(String(format: "seek: new picture at %.1fs after %.2fs", t, waited))
+            }
+        }
+        if hasFirstFrame && seekPending == nil {
+            frameTimer?.invalidate()
+            frameTimer = nil
+        }
     }
 
     private typealias SetTime = @convention(c) (UnsafeMutableRawPointer, Int64, Bool) -> Int32
@@ -649,14 +810,17 @@ final class PlaybackEngine: ObservableObject {
         return unsafeBitCast(sym, to: SetTime.self)
     }()
 
-    private func setTimeFast(_ seconds: Double) -> Bool {
-        guard let setTime = Self.setTimeSymbol else { return false }
+    private func libVLCPlayer() -> UnsafeMutableRawPointer? {
         let selector = NSSelectorFromString("libVLCMediaPlayer")
-        guard player.responds(to: selector), let imp = player.method(for: selector) else { return false }
-        let getter = unsafeBitCast(imp, to: InstanceGetter.self)
-        guard let instance = getter(player, selector) else { return false }
-        // libVLC 4 counts in microseconds.
-        return setTime(instance, Int64(seconds * 1_000_000), true) == 0
+        guard player.responds(to: selector), let imp = player.method(for: selector) else { return nil }
+        return unsafeBitCast(imp, to: InstanceGetter.self)(player, selector)
+    }
+
+    /// libvlc_media_player_set_time in the current input's own time (see `clipStart`); false if unavailable.
+    private func setTime(_ seconds: Double, fast: Bool) -> Bool {
+        guard let setTime = Self.setTimeSymbol, let instance = libVLCPlayer() else { return false }
+        // libVLC 4 counts in microseconds (lib/libvlc_internal.h vlc_tick_from_libvlc_time).
+        return setTime(instance, Int64(max(0, seconds) * 1_000_000), fast) == 0
     }
 
     func replay() { restart(from: 0) }
@@ -787,7 +951,7 @@ final class PlaybackEngine: ObservableObject {
         player.videoTracks.first { $0.trackId == id }?.isSelectedExclusively = true
         // A track switched back on waits for the next keyframe; a seek to here shows the picture at once.
         if duration > 0, !didFinish {
-            player.position = currentTime / duration
+            move(to: currentTime, fast: false)
             markSeek(currentTime)
         }
     }

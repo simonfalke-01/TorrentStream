@@ -83,6 +83,8 @@ private struct PlayerContainer: View {
             if let engine, let previews {
                 PlayerChrome(request: request, engine: engine, stats: stats, secondary: secondary, previews: previews,
                              onNext: onNext)
+            } else {
+                PlaybackPoster(stillURL: request.show?.thumbnailURL, posterURL: request.show?.show.posterURL)
             }
         }
         .onAppear {
@@ -92,9 +94,17 @@ private struct PlayerContainer: View {
             shows.playbackStarted(request)
             let key = request.show.map { "show.\($0.show.id)" } ?? "torrent.\(request.torrent.infoHashHex)"
             let e = PlaybackEngine(request: request, memoryKey: key)
-            previews = SeekPreviews(torrent: request.torrent, fileIndex: request.file.index,
-                                    fileLength: request.file.length, fileExtension: request.file.fileExtension)
+            let p = SeekPreviews(torrent: request.torrent, fileIndex: request.file.index,
+                                 fileLength: request.file.length, fileExtension: request.file.fileExtension)
+            previews = p
             engine = e
+            // Seeks land on keyframes: a scrub on one already previewed (its bytes are here and its picture was
+            // just on the bar), anything else on the nearest the index knows.
+            e.keyframeNear = { [weak p] t, within in
+                guard let p else { return nil }
+                return (within >= 5 ? p.previewedKeyframeTime(near: t, within: within) : nil)
+                    ?? p.keyframeTime(near: t, within: within)
+            }
             // The stream's address follows the server if iOS took its socket while the app was away.
             e.streamPort = { [client = model.client] in
                 client.ensureStreamingServer()
@@ -202,6 +212,8 @@ private struct PlayerChrome: View {
 
     /// Seconds played without stalling; the next episode is fetched only once playback has settled.
     @State private var steadySeconds = 0
+    /// The player has been waiting for data for more than a beat.
+    @State private var showsSpinner = false
     @State private var seekWantTask: Task<Void, Never>?
     @State private var scrubRestTask: Task<Void, Never>?
     private static let steadyBeforePrefetch = 20
@@ -233,7 +245,7 @@ private struct PlayerChrome: View {
                     SeekFeedbackView(flash: flash).id(flash.forward).transition(.opacity)
                 }
 
-                if engine.isBuffering && !showControls && engine.errorText == nil && !engine.didFinish && elsewhere == nil {
+                if showsSpinner && !showControls && engine.errorText == nil && !engine.didFinish && elsewhere == nil {
                     ProgressView()
                         .controlSize(.large)
                         .tint(.white)
@@ -288,6 +300,13 @@ private struct PlayerChrome: View {
         .animation(Motion.role(Motion.standard, reduce: reduceMotion), value: momentID)
         .animation(Motion.role(Motion.standard, reduce: reduceMotion), value: showResumed)
         .animation(Motion.role(Motion.fast, reduce: reduceMotion), value: engine.isBuffering)
+        .animation(Motion.role(Motion.standard, reduce: reduceMotion), value: showsSpinner)
+        // A wait shorter than a beat (most seeks into loaded data) never shows a spinner.
+        .task(id: engine.isBuffering) {
+            guard engine.isBuffering else { showsSpinner = false; return }
+            try? await Task.sleep(for: .milliseconds(400))
+            if !Task.isCancelled && engine.isBuffering { showsSpinner = true }
+        }
         .statusBarHidden(!controlsVisible)
         .persistentSystemOverlays(.hidden)
         .onAppear {
@@ -301,6 +320,7 @@ private struct PlayerChrome: View {
             scrubRestTask?.cancel()
             request.torrent.clearWants(tag: Self.seekTag)
             request.torrent.clearWants(tag: Self.skipsTag)
+            request.torrent.clearWants(tag: Self.jumpsTag)
             contentSkips.stop()
             countdownTask?.cancel()
             hideTask?.cancel()
@@ -331,6 +351,7 @@ private struct PlayerChrome: View {
             if steadySeconds == Self.steadyBeforePrefetch {
                 model.playbackSteady(request, seconds: engine.duration)
                 shows.prefetchNext(after: request, duration: engine.duration)
+                prefetchJumpTargets()
             }
         }
         .onChange(of: engine.chapters) {
@@ -399,15 +420,37 @@ private struct PlayerChrome: View {
         GeometryReader { geo in
             let size = geo.size
             let zoom = fillZoom(screen: size)
-            VideoSurface(output: engine.output)
-                .scaleEffect(zoom)
-                .frame(width: size.width, height: size.height)
-                // Clip to the full screen here; clipping after ignoresSafeArea would cut the picture to the safe
-                // area and leave a black strip over the home indicator.
-                .clipped()
-                .animation(Motion.role(Motion.standard, reduce: reduceMotion), value: zoom)
+            ZStack {
+                VideoSurface(output: engine.output)
+                // Until a seek's first new picture, the bar's preview of the spot stands in for the old one, so
+                // the jump shows at once. Only past a beat: a seek answered at once shows no stand-in.
+                if let target = engine.seekPending, let still = previews.image(at: target, tolerance: 10) {
+                    AfterDelay(delay: 0.12) {
+                        Image(uiImage: still)
+                            .resizable()
+                            .scaledToFit()
+                    }
+                    .id(target)
+                    .transition(.opacity)
+                }
+            }
+            .scaleEffect(zoom)
+            .frame(width: size.width, height: size.height)
+            // Clip to the full screen here; clipping after ignoresSafeArea would cut the picture to the safe
+            // area and leave a black strip over the home indicator.
+            .clipped()
+            .animation(Motion.role(Motion.standard, reduce: reduceMotion), value: zoom)
+            .animation(Motion.role(Motion.fast, reduce: reduceMotion), value: engine.seekPending == nil)
         }
         .ignoresSafeArea()
+        .overlay {
+            // The episode's still holds the screen until the first frame, then gives way to it.
+            if !engine.hasFirstFrame {
+                PlaybackPoster(stillURL: request.show?.thumbnailURL, posterURL: request.show?.show.posterURL)
+                    .transition(.opacity)
+            }
+        }
+        .animation(Motion.role(Motion.standard, reduce: reduceMotion), value: engine.hasFirstFrame)
         .accessibilityHidden(true)
     }
 
@@ -552,7 +595,7 @@ private struct PlayerChrome: View {
 
             Button { engine.togglePlay(); scheduleHide() } label: {
                 ZStack {
-                    if engine.isBuffering && engine.isPlaying && elsewhere == nil {
+                    if showsSpinner && engine.isPlaying && elsewhere == nil {
                         ProgressView().controlSize(.large).tint(.white)
                     } else {
                         Image(systemName: engine.isPlaying ? "pause.fill" : "play.fill")
@@ -852,7 +895,8 @@ private struct PlayerChrome: View {
             .transition(.opacity.combined(with: .offset(y: Space.s)))
         } else if showsSkip, let s = activeSkip {
             SkipButton(title: skipTitle(s.kind)) {
-                engine.seek(to: s.end)
+                // On the first keyframe after the end: nothing of the skipped part shows, nothing is decoded first.
+                engine.seek(to: previews.keyframeTime(after: s.end, within: 1.5) ?? s.end)
                 scheduleHide()
             }
             .transition(.opacity.combined(with: .offset(y: Space.s)))
@@ -893,6 +937,19 @@ private struct PlayerChrome: View {
 
     private static let seekTag = "player.seek"
     private static let skipsTag = "player.skips"
+    private static let jumpsTag = "player.jumps"
+
+    /// Once playback has settled: the opening seconds of every chapter and of the ending, below read-ahead, so
+    /// opening a chapter or jumping to the credits finds its bytes here.
+    private func prefetchJumpTargets() {
+        let now = engine.currentTime
+        var spots = engine.chapters.map(\.start)
+        if let c = creditsStart { spots.append(c) }
+        spots = spots.filter { $0 > now + 30 && $0 < engine.duration - 5 }
+        guard !spots.isEmpty,
+              let ranges = previews.seekPoints(every: 0, extra: spots, seconds: 3, limit: 24), !ranges.isEmpty else { return }
+        request.torrent.want(fileIndex: request.file.index, ranges: ranges, urgency: .background, tag: Self.jumpsTag)
+    }
 
     /// What a seek to `seconds` reads first: from the keyframe before it on, by the file's index when it's loaded,
     /// else by proportion with a margin either side.
@@ -949,7 +1006,7 @@ private struct PlayerChrome: View {
                 case .chapters:
                     PlayerPanelFrame(title: "Chapters", isLandscape: landscape, onClose: { panel = nil }) {
                         ChaptersPanel(chapters: engine.chapters, current: chapter(at: engine.currentTime)?.id) { c in
-                            engine.seek(to: c.start)
+                            engine.seek(to: previews.keyframeTime(after: c.start, within: 0.5) ?? c.start)
                             panel = nil
                         }
                     }
