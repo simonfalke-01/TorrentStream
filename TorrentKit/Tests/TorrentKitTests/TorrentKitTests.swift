@@ -318,8 +318,8 @@ final class TorrentKitTests: XCTestCase {
     }
 
     /// After a seek, the new position is requested before what the previous (still waiting) reader needs.
-    /// Pieces are 256 KB (16 blocks); a peer of unknown speed gets its slow-start window (32) of the blocks the player
-    /// waits on.
+    /// Pieces are 256 KB (16 blocks); a peer that hasn't delivered anything yet gets 8 of the blocks the player waits
+    /// on (most connections of a large swarm are slow or never unchoke).
     func testSeekRequestsNewPositionFirst() throws {
         let (data, _) = makeTorrent(files: [("a.mkv", 32 * 262_144)], pieceLength: 262_144)
         let (client, torrent, dir) = try makeIdleTorrent(data)
@@ -327,40 +327,92 @@ final class TorrentKitTests: XCTestCase {
         let old = UUID(), new = UUID()
         try registerReader(torrent, old, piece: 20)
         let a = actions(torrent, unchokedPeer(torrent, port: 1))
-        XCTAssertEqual(names(a.requests), names(blocks(20, Array(0..<16)) + blocks(21, Array(0..<16))))
+        XCTAssertEqual(names(a.requests), names(blocks(20, Array(0..<8))))
 
         try registerReader(torrent, new, piece: 8, extra: 1000)
         try registerReader(torrent, old, piece: 20)
         let b = actions(torrent, unchokedPeer(torrent, port: 2))
         // The old reader's first blocks are raced too (raced blocks may exceed the share).
-        XCTAssertEqual(names(b.requests), names(blocks(8, Array(0..<16)) + blocks(9, Array(0..<16)) + blocks(20, [0, 1])))
+        XCTAssertEqual(names(b.requests), names(blocks(8, Array(0..<8)) + blocks(20, [0, 1])))
+    }
+
+    /// A player that read much more than playback consumed since it started has plenty buffered: its next bytes are
+    /// needed soon, not now, so they aren't raced between peers. A new reader (a seek) is urgent, and so is the old
+    /// one again once playback may have caught up.
+    func testSettledReaderIsNotRaced() throws {
+        let (data, _) = makeTorrent(files: [("a.mkv", 32 * 262_144)], pieceLength: 262_144)
+        let (client, torrent, dir) = try makeIdleTorrent(data)
+        defer { client.shutdown(); try? FileManager.default.removeItem(at: dir) }
+        var st = ContainerState()
+        st.passthrough = true
+        st.layout.duration = 80 // ~100 KB/s
+        torrent.lock.lock()
+        torrent.containers[0] = st
+        torrent.lock.unlock()
+        let info = try XCTUnwrap(torrent.torrentInfo)
+        func spans() -> [Span] {
+            torrent.lock.lock(); defer { torrent.lock.unlock() }
+            torrent.rebuildOrder(info)
+            return torrent.spans
+        }
+        let reader = UUID()
+        try registerReader(torrent, reader, piece: 0)
+        XCTAssertEqual(spans().first { $0.piece == 0 }?.priority, Span.now)
+
+        // It read 5 MB (over 50 s of video) right away.
+        try registerReader(torrent, reader, piece: 20)
+        var s = spans()
+        XCTAssertEqual(s.first { $0.piece == 20 }?.priority, Span.soon)
+        XCTAssertFalse(s.contains { $0.priority == Span.now })
+        torrent.lock.lock()
+        let until = torrent.readers[reader]?.settledUntil ?? 0
+        torrent.lock.unlock()
+        XCTAssertGreaterThan(until, Date.timeIntervalSinceReferenceDate + 20)
+        let a = actions(torrent, unchokedPeer(torrent, port: 1)), b = actions(torrent, unchokedPeer(torrent, port: 2))
+        XCTAssertEqual(a.requests.first, BlockRequest(piece: 20, offset: 0, length: 16384))
+        XCTAssertTrue(Set(a.requests).isDisjoint(with: b.requests), "\(names(a.requests)) \(names(b.requests))")
+
+        // A seek.
+        try registerReader(torrent, UUID(), piece: 8)
+        s = spans()
+        XCTAssertEqual(s.first.map { [$0.piece, $0.priority] }, [8, Span.now])
+        XCTAssertEqual(s.first { $0.piece == 20 }?.priority, Span.soon)
+
+        // A minute later, playback may have caught up with what the old reader read.
+        torrent.lock.lock()
+        torrent.readers[reader]?.startedAt -= 60
+        torrent.lock.unlock()
+        XCTAssertEqual(spans().first { $0.piece == 20 }?.priority, Span.now)
     }
 
     /// A peer whose pipeline is full of less urgent requests cancels them (keeping ~0.15 s of its rate that is likely
     /// on the wire) when the player waits on new blocks; blocks that were urgent before the seek lose their priority.
     func testSeekCancelsQueuedBackgroundRequests() throws {
-        let (data, _) = makeTorrent(files: [("a.mkv", 32 * 262_144)], pieceLength: 262_144)
+        let (data, _) = makeTorrent(files: [("a.mp4", 32 * 262_144)], pieceLength: 262_144)
         let (client, torrent, dir) = try makeIdleTorrent(data)
         defer { client.shutdown(); try? FileManager.default.removeItem(at: dir) }
-        try registerReader(torrent, UUID(), piece: 31)
-        // 1 MB/s: a share of 0.5 s (32 urgent blocks), a queue of rate × (rtt + 0.3 s) + 8 = 46 blocks.
+        let old = UUID()
+        try registerReader(torrent, old, piece: 31)
         let peer = unchokedPeer(torrent, port: 1, rate: 1_048_576)
-        // The reader's (last) piece, then the container index at the end of the file.
+        peer.downloadedBytes = 4 << 20
+        // 1 MB/s: a queue of rate × (rtt + 0.15 s) + 8 = 24 blocks: the reader's (last) piece, then the file's tail.
         let a = actions(torrent, peer)
-        XCTAssertEqual(a.requests.count, 46)
+        XCTAssertEqual(a.requests.count, 24)
         XCTAssertEqual(Array(a.requests.prefix(16)), blocks(31, Array(0..<16)))
-        XCTAssertEqual(Set(a.requests.map(\.piece)), [31, 24, 25])
+        XCTAssertEqual(Set(a.requests.map(\.piece)), [31, 24])
 
-        // The block the new reader is blocked on comes after 0.15 s of the queue (9 blocks); 32 urgent ones follow.
+        // The player seeks: its old connection closes, a new one waits at piece 8. The block it is blocked on comes
+        // after 0.15 s of the queue (9 blocks); 32 urgent ones follow.
+        torrent.removeReader(old)
         try registerReader(torrent, UUID(), piece: 8)
         let b = actions(torrent, peer)
         XCTAssertEqual(b.requests.count, 32)
         XCTAssertEqual(b.requests.first, BlockRequest(piece: 8, offset: 0, length: 16384))
         XCTAssertEqual(Set(b.requests.map(\.piece)), [8, 9], "\(names(b.requests))")
-        XCTAssertEqual(b.cancels.count, 46 - 9)
-        XCTAssertTrue(b.cancels.allSatisfy { [31, 24, 25].contains($0.piece) })
+        XCTAssertEqual(b.cancels.count, 24 - 9)
+        XCTAssertTrue(b.cancels.allSatisfy { [31, 24].contains($0.piece) })
         XCTAssertEqual(peer.pending.count, 9 + 32)
-        XCTAssertEqual(peer.cancelled.count, 37, "cancelled requests aren't asked of this peer again until answered")
+        XCTAssertEqual(peer.cancelled.count, 15, "cancelled requests aren't asked of this peer again until answered")
     }
 
     /// The first blocks at a new position go to several peers at once; blocks the player waits on that a peer is
@@ -371,10 +423,10 @@ final class TorrentKitTests: XCTestCase {
         defer { client.shutdown(); try? FileManager.default.removeItem(at: dir) }
         try registerReader(torrent, UUID(), piece: 31)
         let slow = unchokedPeer(torrent, port: 1), other = unchokedPeer(torrent, port: 2)
-        XCTAssertEqual(names(Array(actions(torrent, slow).requests.prefix(16))), names(blocks(31, Array(0..<16))))
+        XCTAssertEqual(names(actions(torrent, slow).requests), names(blocks(31, Array(0..<8))))
         // Only the head is raced while the rest isn't late.
         let second = actions(torrent, other).requests
-        XCTAssertEqual(names(second.filter { $0.piece == 31 }), names(blocks(31, [0, 1])))
+        XCTAssertEqual(names(second.filter { $0.piece == 31 }), names(blocks(31, [0, 1] + Array(8..<14))))
 
         // Two seconds later nothing has arrived.
         torrent.lock.lock()
@@ -391,25 +443,126 @@ final class TorrentKitTests: XCTestCase {
         XCTAssertEqual(names(Array(late.requests.prefix(16))), names(blocks(31, Array(0..<16))))
     }
 
-    /// A peer gets about half a second's worth of the blocks the player waits on (its slow-start window while its
-    /// speed is being found out) and nothing behind them while some are still unassigned, so slow peers can't hold
-    /// much and fast peers take most.
+    /// A peer gets about half a second's worth of the blocks the player waits on (8 until it has delivered something,
+    /// its slow-start window while its speed is being found out) and nothing behind them while some are still
+    /// unassigned, so slow peers can't hold much and fast peers take most.
     func testCriticalBlocksAreSharedByPeerSpeed() throws {
         let (data, _) = makeTorrent(files: [("a.mkv", 32 * 262_144)], pieceLength: 262_144)
         let (client, torrent, dir) = try makeIdleTorrent(data)
         defer { client.shutdown(); try? FileManager.default.removeItem(at: dir) }
         try registerReader(torrent, UUID(), piece: 8)
         let unknown = actions(torrent, unchokedPeer(torrent, port: 1))
-        XCTAssertEqual(names(unknown.requests), names(blocks(8, Array(0..<16)) + blocks(9, Array(0..<16))))
+        XCTAssertEqual(names(unknown.requests), names(blocks(8, Array(0..<8))))
         let slowPeer = unchokedPeer(torrent, port: 2, rate: 20_000)
         slowPeer.windowGrowing = false
+        slowPeer.downloadedBytes = 1 << 20
         let slow = actions(torrent, slowPeer)
-        XCTAssertEqual(names(slow.requests), names(blocks(8, [0, 1]) + blocks(10, Array(0..<6))))
-        // The rest of the 2 MB window (pieces 8-15); nothing less urgent while the player waits.
-        let fast = actions(torrent, unchokedPeer(torrent, port: 3, rate: 4_000_000))
-        XCTAssertEqual(names(Array(fast.requests.prefix(4))), names(blocks(8, [0, 1]) + blocks(10, [6, 7])))
-        XCTAssertEqual(fast.requests.count, 2 + 128 - 32 - 6)
-        XCTAssertTrue(fast.requests.allSatisfy { (8...15).contains($0.piece) })
+        XCTAssertEqual(names(slow.requests), names(blocks(8, [0, 1] + Array(8..<14))))
+        // The rest of the 2 MB window (pieces 8-15), then the Matroska head and tail a player reads first, up to its
+        // share (0.5 s at 4 MB/s: 122 blocks); nothing less urgent while the player waits.
+        let fastPeer = unchokedPeer(torrent, port: 3, rate: 4_000_000)
+        fastPeer.downloadedBytes = 1 << 20
+        let fast = actions(torrent, fastPeer)
+        XCTAssertEqual(names(Array(fast.requests.prefix(4))), names(blocks(8, [0, 1, 14, 15])))
+        XCTAssertEqual(fast.requests.count, 122)
+        XCTAssertTrue(fast.requests.prefix(2 + 128 - 8 - 6).allSatisfy { (8...15).contains($0.piece) })
+        XCTAssertEqual(names(Array(fast.requests.dropFirst(2 + 128 - 8 - 6))), names(blocks(0, [0, 1, 2, 3]) + blocks(31, [12, 13])))
+    }
+
+    /// A new connection asks for the first blocks the player waits on with its handshake (a few per span), before
+    /// the peer's bitfield or unchoke; those it can't serve are released for others.
+    func testEarlyRequestsGoOutWithTheHandshake() throws {
+        let (data, _) = makeTorrent(files: [("a.mp4", 32 * 262_144)], pieceLength: 262_144)
+        let (client, torrent, dir) = try makeIdleTorrent(data)
+        defer { client.shutdown(); try? FileManager.default.removeItem(at: dir) }
+        let peer = PeerConnection(address: PeerAddress(ip: 0x7f00_0001, port: 1), torrent: torrent)
+        XCTAssertEqual(torrent.earlyRequests(for: peer), [], "nothing is waited on")
+        try registerReader(torrent, UUID(), piece: 8)
+        let early = torrent.earlyRequests(for: peer)
+        XCTAssertEqual(names(early), names(blocks(8, [0, 1, 2, 3]) + blocks(9, [0, 1, 2, 3])))
+        XCTAssertEqual(early.count, Torrent.earlyRequestBlocks)
+        XCTAssertEqual(peer.early, Set(early))
+        XCTAssertTrue(peer.amInterested)
+
+        torrent.lock.lock()
+        torrent.peersByID[ObjectIdentifier(peer)] = peer
+        let me = ObjectIdentifier(peer)
+        XCTAssertEqual(torrent.inProgress[9]?.requesters[0], [me])
+        // Its bitfield lacks piece 9; then it rejects 8/0 (choked).
+        var bits = [UInt8](repeating: 0xFF, count: 4)
+        bits[1] &= ~0x40
+        torrent.peerBitfieldLocked(peer, data: Data(bits))
+        torrent.requestRejectedLocked(peer, early[0])
+        let p8 = torrent.inProgress[8], p9 = torrent.inProgress[9]
+        torrent.lock.unlock()
+        XCTAssertEqual(peer.early, Set(blocks(8, [1, 2, 3])))
+        XCTAssertEqual(Set(peer.pending.keys), Set(blocks(8, [1, 2, 3])))
+        XCTAssertEqual(p9?.requesters[0], [])
+        XCTAssertEqual(p8?.requesters[0], [])
+        XCTAssertEqual(p8?.requesters[1], [me])
+        XCTAssertNil(peer.cancelled[early[0]], "a rejected early request may be asked of it again once it unchokes")
+    }
+
+    /// A peer with the fast extension answers a cancel with the block or a reject: until then the block stays
+    /// assigned to it (asking another peer would likely fetch it twice); a reject or a choke frees it. Since a cancel
+    /// then costs nothing, all but two of its queued blocks are cancelled when the player waits elsewhere.
+    func testCancelledBlocksStayAssignedUntilTheFastPeerAnswers() throws {
+        let (data, _) = makeTorrent(files: [("a.mp4", 32 * 262_144)], pieceLength: 262_144)
+        let (client, torrent, dir) = try makeIdleTorrent(data)
+        defer { client.shutdown(); try? FileManager.default.removeItem(at: dir) }
+        let old = UUID()
+        try registerReader(torrent, old, piece: 31)
+        let peer = unchokedPeer(torrent, port: 1, rate: 1_048_576)
+        peer.downloadedBytes = 4 << 20
+        peer.supportsFast = true
+        XCTAssertEqual(actions(torrent, peer).requests.count, 24)
+        torrent.removeReader(old)
+        try registerReader(torrent, UUID(), piece: 8)
+        let cancels = actions(torrent, peer).cancels
+        XCTAssertEqual(cancels.count, 24 - 2)
+        XCTAssertEqual(peer.cancelHeld, Set(cancels))
+        let me = ObjectIdentifier(peer)
+        torrent.lock.lock()
+        func requesters(_ r: BlockRequest) -> [ObjectIdentifier] { torrent.inProgress[r.piece]?.requesters[r.offset / 16384] ?? [] }
+        XCTAssertTrue(cancels.allSatisfy { requesters($0) == [me] })
+        torrent.requestRejectedLocked(peer, cancels[0])
+        XCTAssertEqual(requesters(cancels[0]), [])
+        XCTAssertNil(peer.cancelled[cancels[0]])
+        XCTAssertEqual(peer.cancelHeld.count, 24 - 2 - 1)
+        torrent.peerChokedLocked(peer)
+        XCTAssertTrue(cancels.allSatisfy { requesters($0).isEmpty })
+        torrent.lock.unlock()
+        XCTAssertTrue(peer.cancelHeld.isEmpty)
+    }
+
+    /// `extraRequests` counts the requests beyond the first for each block (the races `maxHedgedBlocks` bounds),
+    /// through races and releases.
+    func testRaceAccounting() throws {
+        let (data, _) = makeTorrent(files: [("a.mp4", 32 * 262_144)], pieceLength: 262_144)
+        let (client, torrent, dir) = try makeIdleTorrent(data)
+        defer { client.shutdown(); try? FileManager.default.removeItem(at: dir) }
+        try registerReader(torrent, UUID(), piece: 31)
+        let peers = (1...3).map { unchokedPeer(torrent, port: UInt16($0)) }
+        func check(_ expected: Int, line: UInt = #line) {
+            torrent.lock.lock(); defer { torrent.lock.unlock() }
+            guard let pp = torrent.inProgress[31] else { return XCTFail("no progress", line: line) }
+            XCTAssertEqual(pp.extraRequests, pp.requesters.reduce(0) { $0 + max(0, $1.count - 1) }, line: line)
+            XCTAssertEqual(pp.extraRequests, expected, line: line)
+        }
+        _ = actions(torrent, peers[0])
+        check(0)
+        _ = actions(torrent, peers[1])
+        check(2)
+        _ = actions(torrent, peers[2])
+        check(4)
+        torrent.lock.lock()
+        torrent.peerChokedLocked(peers[0])
+        torrent.lock.unlock()
+        check(2)
+        torrent.lock.lock()
+        for p in peers { torrent.releaseRequestsLocked(p) }
+        torrent.lock.unlock()
+        check(0)
     }
 
     /// `want` ranges are ranked by urgency: `.now` with what the player waits on, `.soon` before read-ahead,
@@ -536,7 +689,8 @@ final class TorrentKitTests: XCTestCase {
         XCTAssertEqual(try torrent.readData(fileIndex: 0, offset: 2 * 32768 + 100, length: 20_000),
                        content.subdata(in: 2 * 32768 + 100 ..< 2 * 32768 + 20_100))
         XCTAssertFalse(try torrent.waitForData(fileIndex: 0, offset: 0, length: 100, readerID: UUID(), timeout: 0.5))
-        XCTAssertEqual(seeder.refusedRequests, 0)
+        // Only the requests sent with the handshake, before its choke was seen, are refused; none are asked again.
+        XCTAssertLessThanOrEqual(seeder.refusedRequests, Torrent.earlyRequestBlocks)
     }
 
     /// A rejected request (BEP 6) is asked again and the data still arrives.

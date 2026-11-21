@@ -27,6 +27,16 @@ public final class TorrentClient {
     private var starvingTorrents = Set<ObjectIdentifier>()
     /// Single network thread shared by every torrent's peer connections.
     let loop = EventLoop()
+    private var skipsAttachments = true
+
+    /// When a player opens a Matroska file whose attachments (embedded subtitle fonts, often several megabytes before
+    /// the first video frame) haven't been downloaded yet, they are served as an EBML Void element instead of being
+    /// waited for: the first frame comes seconds sooner, but styled subtitles of that playback use fallback fonts.
+    /// Attachments already on disk (a prefetched episode, a replay after 30 s) are served as they are. Default true.
+    public var skipsUndownloadedAttachments: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return skipsAttachments }
+        set { lock.lock(); skipsAttachments = newValue; lock.unlock() }
+    }
 
     public init(downloadDirectory: URL, useDHT: Bool = true, extraTrackers: [String] = TorrentClient.defaultTrackers,
                 streamingPort: UInt16 = 0) {

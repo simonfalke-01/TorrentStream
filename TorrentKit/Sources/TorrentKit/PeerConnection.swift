@@ -25,6 +25,9 @@ struct PendingRequest {
     var queuedAhead = 0
     /// Position in the order requests were sent to the peer.
     var seq = 0
+    /// Bytes between the reader position (or the start of the want) and the block when it was requested: how long
+    /// the player could wait for it. `Int64.max` for blocks nobody reads soon.
+    var distance: Int64 = .max
 }
 
 /// What the scheduler wants sent to a peer.
@@ -51,6 +54,8 @@ final class PeerConnection: LoopHandler {
     private var inLen = 0
     private var outbuf: [UInt8] = []
     private var outStart = 0
+    /// Our bitfield went out with the handshake (ahead of early requests).
+    private var sentBitfield = false
     private(set) var lastSendAt = Date.timeIntervalSinceReferenceDate
 
     // torrent lock
@@ -61,11 +66,17 @@ final class PeerConnection: LoopHandler {
     var pendingHaveAll = false
     var pendingHaves: [Int] = []
     var pending: [BlockRequest: PendingRequest] = [:]
+    /// Requests sent with our handshake, before knowing whether the peer has the pieces or unchokes us (see
+    /// `Torrent.earlyRequestsLocked`): a reject or a missing piece just releases them.
+    var early = Set<BlockRequest>()
     /// Requests we cancelled and the peer hasn't answered yet (with the fast extension it answers each with the
     /// block or a reject). Not re-requested from this peer meanwhile: libtorrent ignores a request that duplicates one
     /// still queued, and the reject for the cancel would otherwise be taken for a reject of the new request.
     /// Also holds requests the peer rejected, so they go to other peers for a while.
     var cancelled: [BlockRequest: TimeInterval] = [:]
+    /// Cancelled requests a peer with the fast extension may have sent already: the block stays assigned to it until
+    /// it arrives or the peer rejects the request, so it isn't downloaded twice.
+    var cancelHeld = Set<BlockRequest>()
     var lastBlockAt = Date.timeIntervalSinceReferenceDate
     var downloadedBytes: Int64 = 0
     /// Recent peak download rate from this peer in bytes/s, decaying while it is slow.
@@ -81,6 +92,10 @@ final class PeerConnection: LoopHandler {
     var requestSeq = 0
     /// Connect round trip, a floor for how soon a request can be answered.
     var rtt: TimeInterval = 0.3
+    /// How soon the peer answers a request once the blocks before it are sent: round trip plus its disk, without
+    /// the queues on the way (lowest recent value). Its queue only needs to cover that at its rate; more waits in
+    /// buffers in front of the next urgent block. Nil until measured.
+    var answerTime: TimeInterval?
     var supportsExtensions = false
     var supportsFast = false
     var utMetadataID: Int?
@@ -163,6 +178,22 @@ final class PeerConnection: LoopHandler {
         hs.append(contentsOf: torrent.infoHash)
         hs.append(contentsOf: torrent.peerID)
         enqueue(hs)
+        // Requests for what the player waits on go out with the handshake, a round trip before the peer's bitfield
+        // and unchoke would allow them: peers that unchoke right away (most seeders) answer them at once. Our
+        // bitfield has to come first.
+        let early = torrent.earlyRequests(for: self)
+        if !early.isEmpty, let bitfield = torrent.ourBitfieldMessage(orEmpty: true) {
+            sentBitfield = true
+            enqueue([UInt8](bitfield))
+            var out: [UInt8] = [0, 0, 0, 1, 2]
+            for r in early {
+                out.append(contentsOf: [0, 0, 0, 13, 6])
+                for v in [r.piece, r.offset, r.length] {
+                    out.append(contentsOf: [UInt8(truncatingIfNeeded: v >> 24), UInt8(truncatingIfNeeded: v >> 16), UInt8(truncatingIfNeeded: v >> 8), UInt8(truncatingIfNeeded: v)])
+                }
+            }
+            enqueue(out)
+        }
         flush()
     }
 
@@ -207,7 +238,8 @@ final class PeerConnection: LoopHandler {
             guard torrent.peerConnected(self) else { close(reason: "not accepted"); return }
             phase = .active
             if supportsExtensions { sendExtendedHandshake(torrent: torrent) }
-            if let bf = torrent.ourBitfieldMessage() { enqueue([UInt8](bf)) }
+            if sentBitfield {}
+            else if let bf = torrent.ourBitfieldMessage() { enqueue([UInt8](bf)) }
             else if supportsFast { enqueueMessage([0x0F]) } // have_none
         }
         guard phase == .active else { return }

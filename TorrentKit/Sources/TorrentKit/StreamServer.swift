@@ -256,22 +256,22 @@ final class StreamServer {
             // Send whatever has arrived as soon as it lands, block by block (pieces needn't be complete or verified):
             // with 16 MB pieces, waiting for whole pieces costs seconds after every seek. Wake often to notice the
             // player giving up on this request (it does on every seek), so a stale reader doesn't keep its priority.
-            var n: Int64 = 0
+            var chunk: Data?
             var waits = 0
             while true {
-                n = try torrent.waitForAvailable(fileIndex: fileIndex, offset: pos, maxLength: min(end - pos + 1, 1 << 20),
-                                                 readerID: readerID, timeout: 0.25)
-                if n > 0 { break }
+                chunk = try torrent.nextChunk(fileIndex: fileIndex, offset: pos, maxLength: min(end - pos + 1, 1 << 20),
+                                              readerID: readerID, timeout: 0.25)
+                if chunk != nil { break }
                 if sock.isPeerClosed() { return false }
                 waits += 1
                 if waits % 4 == 0 && TorrentLog.enabled { log("http stalled \(waits / 4)s at \(pos): " + torrent.blockDebugDescription(fileIndex: fileIndex, offset: pos)) }
             }
-            let data = try torrent.readData(fileIndex: fileIndex, offset: pos, length: Int(n))
+            guard let data = chunk, !data.isEmpty else { throw TorrentError.io("empty read at \(pos)") }
             // A player that stopped reading (paused, app suspended) gets the rest when it reads again: the response
             // is never cut short while the torrent is there.
             try sock.send(data, keepWaiting: { !torrent.isStopped })
             if !firstByteLogged { firstByteLogged = true; log("http first byte \(pos) after " + String(format: "%.2fs", Date().timeIntervalSince(began))) }
-            pos += n
+            pos += Int64(data.count)
         }
         return true
     }
