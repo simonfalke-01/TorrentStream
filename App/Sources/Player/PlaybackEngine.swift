@@ -272,7 +272,6 @@ final class PlaybackEngine: ObservableObject {
         case .stopped: return "stopped"
         case .stopping: return "stopping"
         case .opening: return "opening"
-        case .buffering: return "buffering"
         case .error: return "error"
         case .playing: return "playing"
         case .paused: return "paused"
