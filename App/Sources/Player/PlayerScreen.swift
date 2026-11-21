@@ -2,6 +2,7 @@ import SwiftUI
 import TorrentKit
 import CatalogKit
 import SourceKit
+import SkipKit
 
 /// Full-screen player. Owns the request playing now so the next episode, another episode or another version
 /// can take its place without leaving.
@@ -41,10 +42,18 @@ final class StreamStatsModel: ObservableObject {
         }
     }
 
+    /// The player is waiting for data; the swarm is written to the playback log meanwhile.
+    var isWaiting = false
+
     func update() {
         guard let torrent else { return }
-        let complete = torrent.status().files.first { $0.file.index == fileIndex }?.isComplete ?? false
+        let status = torrent.status()
+        let complete = status.files.first { $0.file.index == fileIndex }?.isComplete ?? false
         availability = complete ? [1] : torrent.availability(fileIndex: fileIndex, buckets: 160)
+        if isWaiting {
+            PlaybackTrace.shared.mark(String(format: "waiting: %d peers of %d known, %.0f KB/s",
+                                             status.connectedPeers, status.knownPeers, status.downloadRate / 1024))
+        }
     }
 
     func stop() { timer?.invalidate(); timer = nil }
@@ -61,13 +70,17 @@ private struct PlayerContainer: View {
     @StateObject private var stats = StreamStatsModel()
     @StateObject private var secondary = SecondarySubtitles()
     @State private var engine: PlaybackEngine?
+    @State private var previews: SeekPreviews?
     @State private var nowPlaying = NowPlaying()
+    @State private var backgroundTask: Task<Void, Never>?
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-            if let engine {
-                PlayerChrome(request: request, engine: engine, stats: stats, secondary: secondary, onNext: onNext)
+            if let engine, let previews {
+                PlayerChrome(request: request, engine: engine, stats: stats, secondary: secondary, previews: previews,
+                             onNext: onNext)
             }
         }
         .onAppear {
@@ -77,6 +90,8 @@ private struct PlayerContainer: View {
             shows.playbackStarted(request)
             let key = request.show.map { "show.\($0.show.id)" } ?? "torrent.\(request.torrent.infoHashHex)"
             let e = PlaybackEngine(request: request, memoryKey: key)
+            previews = SeekPreviews(torrent: request.torrent, fileIndex: request.file.index,
+                                    fileLength: request.file.length, fileExtension: request.file.fileExtension)
             engine = e
             e.start()
             e.showOnTV(ExternalDisplay.shared.isConnected)
@@ -86,7 +101,25 @@ private struct PlayerContainer: View {
         .onReceive(ExternalDisplay.shared.$isConnected.dropFirst()) { connected in
             engine?.showOnTV(connected)
         }
+        .onChange(of: scenePhase) { _, phase in
+            backgroundTask?.cancel()
+            switch phase {
+            case .background:
+                // Picture in Picture starts as the app leaves; give it a moment to say so.
+                backgroundTask = Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(400))
+                    guard !Task.isCancelled else { return }
+                    engine?.appDidEnterBackground()
+                }
+            case .active:
+                engine?.appWillEnterForeground()
+            default:
+                break
+            }
+        }
         .onDisappear {
+            backgroundTask?.cancel()
+            previews?.stop()
             stats.stop()
             secondary.shutdown()
             nowPlaying.deactivate()
@@ -110,6 +143,7 @@ private struct PlayerChrome: View {
     @ObservedObject var engine: PlaybackEngine
     @ObservedObject var stats: StreamStatsModel
     @ObservedObject var secondary: SecondarySubtitles
+    @ObservedObject var previews: SeekPreviews
     let onNext: (PlaybackRequest) -> Void
 
     @EnvironmentObject private var model: AppModel
@@ -142,6 +176,14 @@ private struct PlayerChrome: View {
 
     @State private var skips: [SkipSegment] = []
     @State private var catalogSkips: [SkipSegment] = []
+    /// The opening and ending found in the episode's audio.
+    @StateObject private var contentSkips = ContentSkipsModel()
+
+    /// Seconds played without stalling; the next episode is fetched only once playback has settled.
+    @State private var steadySeconds = 0
+    @State private var seekWantTask: Task<Void, Never>?
+    @State private var scrubRestTask: Task<Void, Never>?
+    private static let steadyBeforePrefetch = 20
 
     @State private var sleep: SleepTimer = .off
     @State private var sleepTask: Task<Void, Never>?
@@ -160,7 +202,7 @@ private struct PlayerChrome: View {
                 gestureLayer
 
                 if let flash = seekFlash {
-                    SeekFeedbackView(flash: flash).transition(.opacity)
+                    SeekFeedbackView(flash: flash).id(flash.forward).transition(.opacity)
                 }
 
                 if engine.isBuffering && !showControls && engine.errorText == nil && !engine.didFinish {
@@ -224,8 +266,14 @@ private struct PlayerChrome: View {
             if request.resumeAt != nil { flashResumed() }
             upNext = nextItem()
             scheduleHide()
+            contentSkips.start(request) { [shows, request] in shows.preparedNext(after: request) }
         }
         .onDisappear {
+            seekWantTask?.cancel()
+            scrubRestTask?.cancel()
+            request.torrent.clearWants(tag: Self.seekTag)
+            request.torrent.clearWants(tag: Self.skipsTag)
+            contentSkips.stop()
             countdownTask?.cancel()
             hideTask?.cancel()
             sleepTask?.cancel()
@@ -241,10 +289,27 @@ private struct PlayerChrome: View {
         .onChange(of: engine.duration > 0, initial: true) { _, known in
             guard known else { return }
             model.durationKnown(request, seconds: engine.duration)
-            shows.prefetchNext(after: request, duration: engine.duration)
+            previews.start(duration: engine.duration)
             loadSkips()
         }
-        .onChange(of: engine.chapters) { updateSkips() }
+        .onChange(of: Int(engine.currentTime)) {
+            guard engine.isPlaying, !engine.isBuffering, engine.duration > 0 else { return }
+            steadySeconds += 1
+            if steadySeconds == Self.steadyBeforePrefetch {
+                model.playbackSteady(request, seconds: engine.duration)
+                shows.prefetchNext(after: request, duration: engine.duration)
+            }
+        }
+        .onChange(of: engine.chapters) {
+            updateSkips()
+            contentSkips.setChapters(engine.chapters.map { (name: $0.name, start: $0.start, end: $0.end) },
+                                     duration: engine.duration)
+        }
+        .onChange(of: contentSkips.content) { updateSkips() }
+        .onChange(of: engine.isBuffering, initial: true) { _, waiting in
+            stats.isWaiting = waiting
+            PlaybackTrace.shared.mark(waiting ? "waiting for data" : "playing")
+        }
         .onChange(of: Int(engine.currentTime * 4)) { secondary.update(time: engine.currentTime) }
         .onChange(of: panel) { _, p in if p == nil { scheduleHide() } else { hideTask?.cancel() } }
         .sheet(item: $versions) { target in
@@ -362,7 +427,7 @@ private struct PlayerChrome: View {
         if canSeek && (continuesRun || isDouble) {
             singleTapTask?.cancel()
             lastTap = nil
-            addSeek(forward: forward, at: location)
+            addSeek(forward: forward)
             return
         }
 
@@ -378,7 +443,7 @@ private struct PlayerChrome: View {
 
     /// Each tap adds ten seconds on its side. The picture answers at once; the player is asked once the taps stop,
     /// so a run of five taps is one seek rather than five.
-    private func addSeek(forward: Bool, at point: CGPoint) {
+    private func addSeek(forward: Bool) {
         if let f = seekFlash, f.forward != forward {
             commitSeek()
             seekFlash = nil
@@ -388,12 +453,9 @@ private struct PlayerChrome: View {
         var flash = seekFlash ?? SeekFlash(forward: forward)
         flash.seconds += 10
         flash.taps += 1
-        if !reduceMotion {
-            flash.ripples.append(SeekFlash.Ripple(point: point))
-            flash.ripples = Array(flash.ripples.suffix(4))
-        }
         withAnimation(Motion.role(Motion.fast, reduce: reduceMotion)) { seekFlash = flash }
         pendingSeek += forward ? 10 : -10
+        prefetchSeek(to: engine.currentTime + pendingSeek)
 
         flashTask?.cancel()
         flashTask = Task { @MainActor in
@@ -490,11 +552,27 @@ private struct PlayerChrome: View {
                                duration: engine.duration,
                                marks: engine.duration > 0 ? engine.chapters.map { $0.start / engine.duration } : [],
                                chapterName: { f in chapter(at: f * engine.duration)?.name },
+                               preview: previews.isSupported ? { t in previews.image(at: t) } : nil,
+                               previewAspect: engine.videoSize.width > 0 ? engine.videoSize.height / engine.videoSize.width : 9 / 16,
                                scrub: $scrub) { fraction in
-                    engine.seek(to: fraction * engine.duration)
+                    previews.endFocus()
+                    scrubRestTask?.cancel()
+                    prefetchSeek(to: fraction * engine.duration)
+                    engine.seek(to: fraction * engine.duration, fast: true)
                     scheduleHide()
                 }
                 .onChange(of: scrub != nil) { _, dragging in if dragging { hideTask?.cancel() } }
+                .onChange(of: scrub) { _, s in
+                    guard let s, engine.duration > 0 else { return }
+                    previews.focus(at: s * engine.duration)
+                    // Only where the finger rests: a sweep across the bar shouldn't pull bytes from every spot.
+                    scrubRestTask?.cancel()
+                    scrubRestTask = Task { @MainActor in
+                        try? await Task.sleep(for: .milliseconds(150))
+                        guard !Task.isCancelled, scrub != nil else { return }
+                        prefetchSeek(to: s * engine.duration)
+                    }
+                }
 
                 HStack {
                     Text(Format.seconds(displayedTime))
@@ -690,11 +768,9 @@ private struct PlayerChrome: View {
         }
     }
 
-    /// Where the end credits start, else the last 40 seconds.
+    /// Where the ending starts, once it's known; until then the card waits for the end of the episode.
     private var creditsStart: Double? {
-        guard engine.duration > 120 else { return nil }
-        if let c = skips.first(where: { $0.kind == .credits && $0.start > engine.duration * 0.5 }) { return c.start }
-        return engine.duration - 40
+        SkipResolver.nextEpisodeCue(skips, duration: engine.duration)
     }
 
     /// While the controls are up, the toolbar's Next button stands in for the card, which would otherwise crowd
@@ -755,11 +831,46 @@ private struct PlayerChrome: View {
         }
     }
 
-    /// The file's own chapter names first, then the catalog's times, lined up with the chapters where they're close.
+    /// The file's own chapter names first, then the opening and ending found in its audio, then the catalog's times;
+    /// lined up with the chapters where they're close.
     private func updateSkips() {
         let chapters = engine.duration > 0
             ? engine.chapters.map { (name: $0.name, start: $0.start, end: $0.end) } : []
-        skips = ChapterSkips.merged(catalog: catalogSkips, chapters: chapters, duration: engine.duration)
+        skips = SkipResolver.segments(catalog: catalogSkips, content: contentSkips.content,
+                                      chapters: chapters, duration: engine.duration)
+        // Skipping lands where each segment ends; have those bytes before the button is pressed.
+        let ends = skips.map(\.end).filter { $0 > engine.currentTime && $0 < engine.duration - 1 }
+        request.torrent.want(fileIndex: request.file.index, ranges: ends.map(seekRange), urgency: .soon, tag: Self.skipsTag)
+    }
+
+    // MARK: seeking ahead of the player
+
+    private static let seekTag = "player.seek"
+    private static let skipsTag = "player.skips"
+
+    /// What a seek to `seconds` reads first: from the keyframe before it on, by the file's index when it's loaded,
+    /// else by proportion with a margin either side.
+    private func seekRange(_ seconds: Double) -> Range<Int64> {
+        let length = request.file.length
+        if let r = previews.playbackRange(at: seconds) { return r }
+        let fraction = engine.duration > 0 ? min(max(seconds / engine.duration, 0), 1) : 0
+        let at = Int64(Double(length) * fraction)
+        return max(0, at - (2 << 20))..<min(length, at + (6 << 20))
+    }
+
+    /// Asks the swarm for a seek target while the finger is still moving or the taps are still coming, so the
+    /// player finds the data there when it's asked to go. Forgotten after a while; by then the player reads it
+    /// itself or never will.
+    private func prefetchSeek(to seconds: Double) {
+        guard engine.duration > 0, request.file.length > 0 else { return }
+        let torrent = request.torrent
+        torrent.want(fileIndex: request.file.index, ranges: [seekRange(seconds)], urgency: .now, tag: Self.seekTag)
+        seekWantTask?.cancel()
+        seekWantTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(20))
+            guard !Task.isCancelled else { return }
+            torrent.clearWants(tag: Self.seekTag)
+        }
     }
 
     // MARK: chapters

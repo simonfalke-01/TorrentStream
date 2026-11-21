@@ -1,24 +1,34 @@
 import Foundation
 
-/// In-memory assembly buffer for a piece that is being downloaded.
+/// Download state of a piece that isn't verified yet. Blocks are written to disk as they arrive, so readers can use
+/// them before the whole piece is in; the piece is hashed from disk once its last block landed.
 final class PieceProgress {
     let index: Int
     let size: Int
     let blockCount: Int
-    var buffer: Data
     var received: [Bool]
     var receivedCount = 0
     var requesters: [[ObjectIdentifier]]
     var requestedAt: [TimeInterval]
+    /// When the earliest outstanding request for each block should have been answered.
+    var eta: [TimeInterval]
+    /// Peers that delivered blocks of this piece, blamed if it fails the hash check.
+    var sources = Set<PeerAddress>()
+    var blockSources: [PeerAddress?]
+    /// After a failed check with blocks from several peers, the next attempt comes from one peer: it either passes
+    /// (and the bad block's sender is found by comparison) or that peer alone is to blame.
+    var owner: ObjectIdentifier?
+    var verifying = false
 
     init(index: Int, size: Int) {
         self.index = index
         self.size = size
         blockCount = (size + blockSize - 1) / blockSize
-        buffer = Data(count: size)
         received = Array(repeating: false, count: blockCount)
+        blockSources = Array(repeating: nil, count: blockCount)
         requesters = Array(repeating: [], count: blockCount)
         requestedAt = Array(repeating: 0, count: blockCount)
+        eta = Array(repeating: 0, count: blockCount)
     }
 
     func blockLength(_ b: Int) -> Int { min(blockSize, size - b * blockSize) }
@@ -75,79 +85,139 @@ public struct StreamStatus {
     public let connectedPeers: Int
 }
 
-/// A single torrent: peer swarm, piece selection tuned for streaming, storage and blocking reads.
+/// A single torrent: peer swarm, block scheduling tuned for streaming, storage and blocking reads.
 public final class Torrent {
+    /// How badly a byte range is needed (see `want`).
+    public enum RangeUrgency: Int, Sendable, Comparable {
+        case background, soon, now
+        public static func < (a: RangeUrgency, b: RangeUrgency) -> Bool { a.rawValue < b.rawValue }
+    }
+
     public let infoHash: Data
     public var infoHashHex: String { infoHash.hexString }
     public let descriptor: TorrentDescriptor
     let peerID: Data
     let directory: URL
-    private weak var client: TorrentClient?
+    weak var client: TorrentClient?
+    let loop: EventLoop
 
     let lock = NSCondition()
 
     // MARK: state guarded by `lock`
     private(set) var info: TorrentInfo?
-    private var storage: Storage?
-    private var have: [Bool] = []
-    private var haveCount = 0
-    private var inProgress: [Int: PieceProgress] = [:]
-    private var verifying = Set<Int>()
-    private var wantedFiles = Set<Int>()
-    private var streamingFiles = Set<Int>()
+    var storage: Storage?
+    var have: [Bool] = []
+    var haveCount = 0
+    var inProgress: [Int: PieceProgress] = [:]
+    var wantedFiles = Set<Int>()
+    var streamingFiles = Set<Int>()
     /// Bytes fetched past each reader of a file, beyond the urgent window. Missing = `defaultReadahead`.
-    private var readahead: [Int: Int64] = [:]
+    var readahead: [Int: Int64] = [:]
     /// File whose start (and container index at the end) is loaded ahead of playback, and how many bytes of it.
-    private var prefetchTarget: (fileIndex: Int, bytes: Int64)?
+    var prefetchTarget: (fileIndex: Int, bytes: Int64)?
 
-    /// `updated` is when the reader started or last moved to another piece, so the latest seek ranks first.
-    private struct Reader { var fileIndex: Int; var offset: Int64; var piece: Int; var updated: Date }
-    private var readers: [UUID: Reader] = [:]
+    /// `updated` is when the reader started or last moved, so the latest seek ranks first.
+    struct Reader { var fileIndex: Int; var offset: Int64; var updated: TimeInterval; var orderedAt: Int64 }
+    var readers: [UUID: Reader] = [:]
 
-    private var priorityOrder: [Int] = []
-    private var urgentPieces = Set<Int>()
-    /// The pieces right at each reader: what the player is blocked on.
-    private var criticalPieces = Set<Int>()
-    private var orderDirty = true
+    struct Want { let fileIndex: Int; let ranges: [Range<Int64>]; let urgency: RangeUrgency; let seq: Int }
+    var wants: [String: Want] = [:]
+    var wantSeq = 0
 
-    private var peers: [PeerAddress: PeerConnection] = [:]
-    private var handshaked = Set<ObjectIdentifier>()
-    private var connectedAt: [ObjectIdentifier: Date] = [:]
-    private var knownPeers = Set<PeerAddress>()
-    private var peerQueue: [PeerAddress] = []
-    private var retryAfter: [PeerAddress: Date] = [:]
+    /// Byte ranges to fetch, most urgent first (see `rebuildOrder`).
+    var spans: [Span] = []
+    var orderDirty = true
+    /// Requests were released, so span cursors may have skipped blocks that are free again.
+    var cursorsStale = false
+    var starving = false
 
-    private var metadataSize: Int?
-    private var metadataPieces: [Data?] = []
-    private var metadataRequestedAt: [Int: Date] = [:]
+    final class BlockWaiter {
+        let start: Int64
+        let end: Int64
+        let fileIndex: Int
+        let fileOffset: Int64
+        var continuation: CheckedContinuation<Data?, Never>?
+        init(start: Int64, end: Int64, fileIndex: Int, fileOffset: Int64) {
+            self.start = start; self.end = end; self.fileIndex = fileIndex; self.fileOffset = fileOffset
+        }
+    }
+    var blockWaiters: [ObjectIdentifier: BlockWaiter] = [:]
 
-    private var downloadedTotal: Int64 = 0
-    private var bytesSinceTick = 0
-    private var rateMeter = RateMeter()
-    private var currentRate: Double = 0
-    private var failure: String?
-    private var stopped = false
-    private var paused = false
-    private var resumeDirty = false
-    private var lastResumeSave = Date()
-    private var lastDHTLookup = Date.distantPast
-    private var trackers: [TrackerAnnouncer] = []
+    var peers: [PeerAddress: PeerConnection] = [:]
+    var peersByID: [ObjectIdentifier: PeerConnection] = [:]
+    var handshaked = Set<ObjectIdentifier>()
+    var knownPeers = Set<PeerAddress>()
+    var peerQueue: [PeerAddress] = []
+    var retryAfter: [PeerAddress: TimeInterval] = [:]
+    var banned = Set<PeerAddress>()
+    /// Per-block hashes and senders of failed attempts at pieces, compared with the good data once a piece passes to
+    /// find who sent the bad block when several peers contributed.
+    var failedAttempts: [Int: [[(PeerAddress?, Data)]]] = [:]
+    /// Loop thread: closes requested while the lock was held.
+    var deferredCloses: [(PeerConnection, String)] = []
+    var rescheduleQueued = false
+    var connectQueued = false
 
-    let maxPeers = 60
+    var metadataSize: Int?
+    var metadataPieces: [Data?] = []
+    var metadataRequestedAt: [Int: Date] = [:]
+
+    var downloadedTotal: Int64 = 0
+    var bytesSinceTick = 0
+    var rateMeter = RateMeter()
+    var currentRate: Double = 0
+    var failure: String?
+    var stopped = false
+    var paused = false
+    var resumeDirty = false
+    var lastResumeSave = Date()
+    var lastDHTLookup = Date.distantPast
+    var lastSlowTick: TimeInterval = 0
+    var lastRateSample: TimeInterval = 0
+    var trackers: [TrackerAnnouncer] = []
+    let hashQueue: DispatchQueue
+
+    // Milestones, for diagnostics.
+    let createdAt = Date.timeIntervalSinceReferenceDate
+    var firstConnectAt: TimeInterval?
+    var firstUnchokeAt: TimeInterval?
+    var firstBlockAt: TimeInterval?
+
+    /// Connected peers. A loop thread multiplexes them, so this costs memory, not threads.
+    var maxPeers = 110
     /// Tracker lists are mostly unreachable peers, so many connection attempts run at once.
-    let maxConnecting = 40
-    /// Bytes past a reader (capped by its urgent window) that are fetched before anything else, and raced between
-    /// peers early.
-    static let criticalBytes: Int64 = 2 * 1024 * 1024
-    /// A block of a critical piece is re-requested from another peer when it hasn't arrived after this long.
-    static let criticalRaceAfter: TimeInterval = 0.5
+    var maxConnecting = 50
+    static let connectTimeout: TimeInterval = 3.5
+    static let handshakeTimeout: TimeInterval = 6
+    /// Bytes past a reader that are fetched before anything else, block by block, and raced between peers early.
+    var criticalBytes: Int64 = 2 * 1024 * 1024
+    /// Past the critical bytes, this much more of each reader is fetched next (also at block level).
+    var soonBytes: Int64 = 16 * 1024 * 1024
+    /// End of a media file fetched early: MKV cues and MP4 moov atoms usually live there.
+    static let indexTailBytes: Int64 = 2 * 1024 * 1024
+    /// A block the player waits on is requested again from another peer when it hasn't arrived this long after it
+    /// should have.
+    static let criticalRaceAfter: TimeInterval = 0.35
+    /// Blocks at the start of a jump that go to several peers right away (see `Span.raceHead`).
+    static let raceHeadBlocks = 2
+    /// Most peers asked for the same urgent block.
+    static let maxRacers = 3
+    /// Peers asked at once for the block a reader is blocked on.
+    static let maxHeadRacers = 6
+    /// Scheduler tuning, in seconds of a peer's (or the swarm's) download rate: urgent blocks one peer holds, its queue
+    /// past the round trip, and everything requested from all peers.
+    static let urgentShareSeconds = 0.5
+    static let queueSeconds = 0.5
+    static let inFlightSeconds = 1.5
 
     init(descriptor: TorrentDescriptor, client: TorrentClient, directory: URL, peerID: Data) {
         self.descriptor = descriptor
         infoHash = descriptor.infoHash
         self.client = client
+        self.loop = client.loop
         self.directory = directory
         self.peerID = peerID
+        hashQueue = DispatchQueue(label: "torrent-hash", qos: .userInitiated)
     }
 
     var isStopped: Bool { lock.lock(); defer { lock.unlock() }; return stopped }
@@ -158,19 +228,21 @@ public final class Torrent {
         lock.lock()
         guard !paused else { lock.unlock(); return }
         paused = true
-        let ps = Array(peers.values)
         saveResumeLocked()
         lock.unlock()
-        ps.forEach { $0.close() }
+        loop.post { [self] in closeAllPeers(reason: "paused") }
     }
 
     public func resume() {
         lock.lock()
         let was = paused
         paused = false
-        if was { retryAfter.removeAll() }
+        if was { retryAfter.removeAll(); requeueKnownPeersLocked() }
         lock.unlock()
-        if was { trackers.forEach { $0.poke() } }
+        if was {
+            trackers.forEach { $0.poke() }
+            requestConnect()
+        }
     }
 
     private var dataDirectory: URL { directory.appendingPathComponent("data", isDirectory: true) }
@@ -194,24 +266,32 @@ public final class Torrent {
 
         trackers.forEach { $0.start() }
         if useDHT { lookupDHT() }
-        let t = Thread { [weak self] in
-            while let s = self, s.tick() { Thread.sleep(forTimeInterval: 1) }
-        }
-        t.name = "torrent \(infoHashHex.prefix(8))"
-        t.start()
+        loop.addTicker(owner: self, interval: 0.1) { [weak self] in self?.tick() ?? false }
     }
 
     func stop() {
         lock.lock()
         guard !stopped else { lock.unlock(); return }
         stopped = true
-        let ps = Array(peers.values)
         saveResumeLocked()
+        let waiters = Array(blockWaiters.values)
+        blockWaiters.removeAll()
         lock.broadcast()
         lock.unlock()
+        for w in waiters { w.continuation?.resume(returning: nil); w.continuation = nil }
         trackers.forEach { $0.stop() }
-        ps.forEach { $0.close() }
-        storage?.closeAll()
+        loop.post { [self] in
+            closeAllPeers(reason: "stopped")
+            storage?.closeAll()
+        }
+    }
+
+    /// Loop thread.
+    private func closeAllPeers(reason: String) {
+        lock.lock()
+        let ps = Array(peers.values)
+        lock.unlock()
+        ps.forEach { $0.close(reason: reason) }
     }
 
     private func lookupDHT() {
@@ -220,149 +300,331 @@ public final class Torrent {
         dht.findPeers(infoHash: infoHash) { [weak self] peers in self?.addPeers(peers, source: "dht") }
     }
 
-    /// Periodic maintenance. Returns false once stopped.
+    /// Periodic maintenance on the loop thread. Returns false once stopped.
     private func tick() -> Bool {
+        let now = Date.timeIntervalSinceReferenceDate
         lock.lock()
         if stopped { lock.unlock(); return false }
-        rateMeter.add(bytesSinceTick)
-        bytesSinceTick = 0
-        currentRate = rateMeter.rate()
         if paused {
             if resumeDirty { saveResumeLocked() }
             lock.unlock()
             return true
         }
-
-        let now = Date()
-        let toStart = dequeuePeersLocked(now: now)
+        var toClose: [(PeerConnection, String)] = []
+        var keepAlive: [PeerConnection] = []
+        let sampleRates = now - lastRateSample >= 0.5
+        let dt = now - lastRateSample
+        if sampleRates { lastRateSample = now }
         for p in peers.values {
-            // An idle peer gives no evidence about its speed, so its estimate only decays while it has work.
-            let delta = Double(p.downloadedBytes - p.bytesAtLastTick)
-            if delta > 0 || !p.pending.isEmpty { p.capacity = max(p.capacity * 0.95, delta) }
-            p.bytesAtLastTick = p.downloadedBytes
+            switch p.phase {
+            case .connecting where now - p.startedAt > Torrent.connectTimeout:
+                toClose.append((p, "connect timeout"))
+            case .handshaking where now - p.startedAt > Torrent.handshakeTimeout:
+                toClose.append((p, "handshake timeout"))
+            case .active:
+                if sampleRates {
+                    let delta = Double(p.downloadedBytes - p.bytesAtLastSample)
+                    p.bytesAtLastSample = p.downloadedBytes
+                    // An idle peer gives no evidence about its speed, so its estimate only decays while it has work.
+                    if delta > 0 || !p.pending.isEmpty {
+                        let inst = delta / max(dt, 0.1)
+                        p.rate = inst >= p.rate ? inst : p.rate * 0.85 + inst * 0.15
+                    }
+                }
+                if !p.pending.isEmpty {
+                    let silent = now - p.lastBlockAt
+                    if silent > 30 { toClose.append((p, "snubbed")) }
+                    else if silent > 5 && !p.snubbed {
+                        // Hand its work to others; it may still recover.
+                        p.snubbed = true
+                        releaseRequestsLocked(p)
+                    }
+                }
+                if !p.cancelled.isEmpty && sampleRates {
+                    // Peers without the fast extension never answer a cancel.
+                    p.cancelled = p.cancelled.filter { now - $0.value < 5 }
+                }
+                if now - p.lastSendAt > 90 { keepAlive.append(p) }
+            default: break
+            }
         }
 
-        if resumeDirty && now.timeIntervalSince(lastResumeSave) > 5 { saveResumeLocked() }
-
-        let starving = handshaked.count < 8
-        let dhtInterval: TimeInterval = starving ? 30 : 300
-        let doDHT = client?.useDHT == true && now.timeIntervalSince(lastDHTLookup) > dhtInterval
-        if doDHT { lastDHTLookup = now }
-        let poke = starving && peerQueue.isEmpty
+        var doDHT = false, poke = false
+        if now - lastSlowTick >= 1 {
+            lastSlowTick = now
+            rateMeter.add(bytesSinceTick)
+            bytesSinceTick = 0
+            currentRate = rateMeter.rate()
+            if resumeDirty && Date().timeIntervalSince(lastResumeSave) > 5 { saveResumeLocked() }
+            toClose += peersToReplaceLocked(now: now)
+            let starvingForPeers = handshaked.count < 8
+            let dhtInterval: TimeInterval = starvingForPeers ? 30 : 300
+            doDHT = client?.useDHT == true && Date().timeIntervalSince(lastDHTLookup) > dhtInterval
+            if doDHT { lastDHTLookup = Date() }
+            poke = starvingForPeers && peerQueue.isEmpty
+            updateStarvingLocked()
+        }
+        let toStart = dequeuePeersLocked(now: now)
+        // Blocks become overdue without any event, so the urgent ones are reconsidered often.
+        let reschedule = orderDirty || spans.first?.priority == Span.now || now - lastSlowTick < 0.1
+        if reschedule {
+            // Without metadata, this retries timed-out metadata requests.
+            if info != nil || now - lastSlowTick < 0.1 { rescheduleAllLocked() }
+        }
         lock.unlock()
 
-        toStart.forEach { $0.start() }
+        for (p, reason) in toClose { p.close(reason: reason) }
+        for p in keepAlive { p.enqueueKeepAlive() }
+        runDeferredCloses()
+        toStart.forEach { $0.startConnect(loop: loop) }
         if doDHT { lookupDHT() }
         if poke { trackers.forEach { $0.poke() } }
         return true
     }
 
+    /// When every slot is taken and there are untried peers, peers that kept us choked for a while (or have nothing
+    /// we need) make room: seeders unchoke a handful of peers at a time, so a fresh connection is often the faster
+    /// way to an unchoke.
+    private func peersToReplaceLocked(now: TimeInterval) -> [(PeerConnection, String)] {
+        guard peers.count >= maxPeers - 2 else { return [] }
+        let candidates = peerQueue.filter { (retryAfter[$0] ?? 0) <= now && peers[$0] == nil }.count
+        guard candidates > 0 else { return [] }
+        let stale = peers.values.filter { p in
+            p.isActive && p.allowedFast.isEmpty && ((p.peerChoking && now - p.chokedSince > 30) ||
+                (!p.amInterested && now - (p.connectedAt ?? now) > 20))
+        }.sorted { $0.chokedSince < $1.chokedSince }
+        return stale.prefix(min(4, candidates)).map { ($0, "replaced (choked or useless)") }
+    }
+
+    /// Loop thread, lock not held.
+    func runDeferredCloses() {
+        lock.lock()
+        let list = deferredCloses
+        deferredCloses.removeAll()
+        lock.unlock()
+        for (p, reason) in list { p.close(reason: reason) }
+    }
+
+    /// Lock held.
+    func deferClose(_ peer: PeerConnection, reason: String) {
+        deferredCloses.append((peer, reason))
+    }
+
+    /// Loop thread, after a peer's input was processed.
+    func flushPeersAfterEvent() {
+        runDeferredCloses()
+    }
+
+    /// Asks the loop to recompute every peer's requests now (a reader moved, a want changed).
+    func requestReschedule() {
+        lock.lock()
+        requestRescheduleLocked()
+        lock.unlock()
+    }
+
+    func requestRescheduleLocked() {
+        guard !rescheduleQueued else { return }
+        rescheduleQueued = true
+        loop.post { [weak self] in self?.rescheduleAll() }
+    }
+
+    private func rescheduleAll() {
+        lock.lock()
+        rescheduleQueued = false
+        if !stopped && !paused && info != nil { rescheduleAllLocked() }
+        lock.unlock()
+        runDeferredCloses()
+    }
+
+    /// Lock held: whether the player is (or may soon be) waiting on blocks that haven't arrived.
+    func updateStarvingLocked() {
+        let was = starving
+        if orderDirty, let info = info { rebuildOrder(info) }
+        starving = spans.contains { s in
+            guard s.priority <= Span.soon else { return false }
+            guard let pp = inProgress[s.piece] else { return !have[s.piece] }
+            return (s.start..<s.end).contains { !pp.received[$0] }
+        }
+        if was != starving { client?.setStarving(self, starving) }
+    }
+
+    /// Whether the torrent serves a reader or urgent wants (and so may take bandwidth from torrents that don't).
+    var isForegroundLocked: Bool { !readers.isEmpty || wants.values.contains { $0.urgency >= .soon } }
+
+    // MARK: peers
+
     /// Connection slots free right now.
     private func freeSlotsLocked() -> Int {
         guard !stopped, !paused else { return 0 }
-        let connecting = peers.values.filter { !handshaked.contains(ObjectIdentifier($0)) }.count
+        let connecting = peers.values.filter { $0.phase == .connecting || $0.phase == .idle }.count
         return max(0, min(maxPeers - peers.count, maxConnecting - connecting))
     }
 
-    private func connectLocked(_ addr: PeerAddress, now: Date) -> PeerConnection {
+    private func connectLocked(_ addr: PeerAddress) -> PeerConnection {
         let conn = PeerConnection(address: addr, torrent: self)
         peers[addr] = conn
-        connectedAt[ObjectIdentifier(conn)] = now
+        peersByID[ObjectIdentifier(conn)] = conn
         return conn
     }
 
     /// Creates connections for queued peers while there are free slots. The caller starts them after unlocking.
-    private func dequeuePeersLocked(now: Date) -> [PeerConnection] {
+    private func dequeuePeersLocked(now: TimeInterval) -> [PeerConnection] {
         var toStart: [PeerConnection] = []
         var budget = freeSlotsLocked()
+        guard budget > 0 else { return [] }
         var scanned = 0
         let queueCount = peerQueue.count
-        while budget > 0 && !peerQueue.isEmpty && scanned < queueCount {
+        var deferred: [PeerAddress] = []
+        while budget > 0 && scanned < queueCount && !peerQueue.isEmpty {
             let addr = peerQueue.removeFirst()
             scanned += 1
-            if let r = retryAfter[addr], r > now { peerQueue.append(addr); continue }
-            if peers[addr] != nil { continue }
-            toStart.append(connectLocked(addr, now: now))
+            if let r = retryAfter[addr], r > now { deferred.append(addr); continue }
+            if peers[addr] != nil || banned.contains(addr) { continue }
+            toStart.append(connectLocked(addr))
             budget -= 1
         }
+        peerQueue.append(contentsOf: deferred)
         return toStart
     }
 
-    // MARK: peers
+    private func requeueKnownPeersLocked() {
+        let queued = Set(peerQueue)
+        for p in knownPeers.shuffled() where peers[p] == nil && !queued.contains(p) { peerQueue.append(p) }
+    }
 
-    /// Queues peers and connects to a few of them right away. Each list only gets a share of the free slots and the
-    /// rest is shuffled into the queue, since one stale tracker list (common) would otherwise hold every slot until
-    /// its connections time out. Peers learned from other peers are live, so they go first.
+    /// Loop thread: starts connections for free slots.
+    private func connectMore() {
+        lock.lock()
+        connectQueued = false
+        let toStart = dequeuePeersLocked(now: Date.timeIntervalSinceReferenceDate)
+        lock.unlock()
+        toStart.forEach { $0.startConnect(loop: loop) }
+    }
+
+    func requestConnect() {
+        lock.lock()
+        let queued = connectQueued
+        connectQueued = true
+        lock.unlock()
+        if !queued { loop.post { [weak self] in self?.connectMore() } }
+    }
+
+    /// Queues peers and connects right away while there are free slots. Lists are shuffled, since one stale tracker
+    /// list (common) would otherwise hold every slot until its connections time out. Peers learned from other peers
+    /// are live, so they go first.
     public func addPeers(_ list: [PeerAddress], source: String) {
         lock.lock()
         var fresh: [PeerAddress] = []
-        for p in list where !p.isPrivateOrInvalid && knownPeers.count < 3000 {
-            if knownPeers.insert(p).inserted { fresh.append(p) }
+        for p in list where !p.isPrivateOrInvalid || source == "test" {
+            if knownPeers.count < 4000, knownPeers.insert(p).inserted { fresh.append(p) }
         }
         fresh.shuffle()
-        let now = Date()
-        let immediate = min(fresh.count, freeSlotsLocked(), maxConnecting / 4)
-        let toStart = fresh.prefix(immediate).map { connectLocked($0, now: now) }
-        for p in fresh.dropFirst(immediate) {
-            peerQueue.insert(p, at: source == "pex" ? 0 : Int.random(in: 0...peerQueue.count))
+        if source == "pex" || source == "test" { peerQueue.insert(contentsOf: fresh, at: 0) }
+        else {
+            // Interleave with what's queued so every source gets early attempts.
+            for (i, p) in fresh.enumerated() { peerQueue.insert(p, at: min(peerQueue.count, i * 2)) }
         }
         lock.unlock()
-        toStart.forEach { $0.start() }
-        if !fresh.isEmpty { log("\(infoHashHex.prefix(8)): +\(fresh.count) peers from \(source)") }
+        if !fresh.isEmpty {
+            log("\(infoHashHex.prefix(8)): +\(fresh.count) peers from \(source)")
+            requestConnect()
+        }
+    }
+
+    /// Lock held (loop thread, from PEX).
+    func queuePexPeers(_ list: [PeerAddress]) {
+        var fresh: [PeerAddress] = []
+        for p in list where !p.isPrivateOrInvalid {
+            if knownPeers.count < 4000, knownPeers.insert(p).inserted { fresh.append(p) }
+        }
+        guard !fresh.isEmpty else { return }
+        peerQueue.insert(contentsOf: fresh.shuffled(), at: 0)
+        if !connectQueued {
+            connectQueued = true
+            loop.post { [weak self] in self?.connectMore() }
+        }
     }
 
     func peerConnected(_ peer: PeerConnection) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        guard !stopped else { return false }
+        guard !stopped, !paused, peers[peer.address] === peer else { return false }
+        let now = Date.timeIntervalSinceReferenceDate
         handshaked.insert(ObjectIdentifier(peer))
-        connectedAt[ObjectIdentifier(peer)] = Date()
+        peer.connectedAt = now
+        peer.chokedSince = now
+        peer.lastBlockAt = now
+        if firstConnectAt == nil {
+            firstConnectAt = now
+            log("\(infoHashHex.prefix(8)): first peer after \(String(format: "%.2f", now - createdAt))s")
+        }
         if let info = info { peer.bitfield = Array(repeating: false, count: info.pieceCount) }
         return true
     }
 
+    /// Loop thread, lock not held.
     func peerDisconnected(_ peer: PeerConnection) {
         lock.lock()
-        peerDisconnectedLocked(peer)
-        let toStart = dequeuePeersLocked(now: Date())
-        lock.unlock()
-        toStart.forEach { $0.start() }
-    }
-
-    private func peerDisconnectedLocked(_ peer: PeerConnection) {
         let id = ObjectIdentifier(peer)
         peer.closed = true
         releaseRequestsLocked(peer)
         if peers[peer.address] === peer { peers[peer.address] = nil }
+        peersByID[id] = nil
         let wasConnected = handshaked.remove(id) != nil
-        connectedAt[id] = nil
         for (piece, _) in peer.metadataRequestedAt { metadataRequestedAt[piece] = nil }
-        if !stopped {
+        if !stopped && !paused && !banned.contains(peer.address) {
             // Useful peers are retried soon; dead ones much later.
-            retryAfter[peer.address] = Date().addingTimeInterval(peer.downloadedBytes > 0 ? 15 : (wasConnected ? 120 : 600))
+            let delay: TimeInterval = peer.downloadedBytes > 0 ? 10 : (wasConnected ? 90 : 600)
+            retryAfter[peer.address] = Date.timeIntervalSinceReferenceDate + delay
             peerQueue.append(peer.address)
+        }
+        lock.unlock()
+        requestConnect()
+    }
+
+    func releaseRequestsLocked(_ peer: PeerConnection) {
+        guard !peer.pending.isEmpty else { return }
+        let id = ObjectIdentifier(peer)
+        for r in peer.pending.keys { inProgress[r.piece]?.release(r.offset / blockSize, peer: id) }
+        peer.pending.removeAll()
+        cursorsStale = true
+    }
+
+    func peerChokedLocked(_ peer: PeerConnection) {
+        if !peer.peerChoking { peer.chokedSince = Date.timeIntervalSinceReferenceDate }
+        peer.peerChoking = true
+        // Choking drops queued requests (with the fast extension they are rejected one by one, except allowed-fast).
+        let id = ObjectIdentifier(peer)
+        peer.cancelled.removeAll()
+        for r in peer.pending.keys where !peer.allowedFast.contains(r.piece) {
+            peer.pending[r] = nil
+            inProgress[r.piece]?.release(r.offset / blockSize, peer: id)
+        }
+        cursorsStale = true
+    }
+
+    func peerUnchokedLocked(_ peer: PeerConnection) {
+        let now = Date.timeIntervalSinceReferenceDate
+        peer.peerChoking = false
+        peer.lastBlockAt = now
+        if peer.firstUnchokeAt == nil { peer.firstUnchokeAt = now }
+        if firstUnchokeAt == nil {
+            firstUnchokeAt = now
+            log("\(infoHashHex.prefix(8)): first unchoke after \(String(format: "%.2f", now - createdAt))s")
         }
     }
 
-    private func releaseRequestsLocked(_ peer: PeerConnection) {
-        let id = ObjectIdentifier(peer)
-        for r in peer.pending { inProgress[r.piece]?.release(r.offset / blockSize, peer: id) }
-        peer.pending.removeAll()
+    func requestRejectedLocked(_ peer: PeerConnection, _ r: BlockRequest) {
+        // The answer to a cancel, not to a live request.
+        if peer.cancelled.removeValue(forKey: r) != nil { return }
+        guard peer.pending.removeValue(forKey: r) != nil else { return }
+        inProgress[r.piece]?.release(r.offset / blockSize, peer: ObjectIdentifier(peer))
+        // Not asked of this peer again for a second or two (it may not have the block after all, or its queue is
+        // full); others pick it up. Entries expire 5 s after their time.
+        peer.cancelled[r] = Date.timeIntervalSinceReferenceDate - 3.5
+        cursorsStale = true
     }
 
-    func peerChoked(_ peer: PeerConnection) {
-        lock.lock(); defer { lock.unlock() }
-        peer.peerChoking = true
-        releaseRequestsLocked(peer)
-    }
-
-    func peerUnchoked(_ peer: PeerConnection) {
-        lock.lock(); defer { lock.unlock() }
-        peer.peerChoking = false
-        peer.lastBlockAt = Date()
-    }
-
-    func peerHave(_ peer: PeerConnection, piece: Int) {
-        lock.lock(); defer { lock.unlock() }
+    func peerHaveLocked(_ peer: PeerConnection, piece: Int) {
         if info != nil {
             if piece >= 0 && piece < peer.bitfield.count { peer.bitfield[piece] = true }
         } else {
@@ -370,8 +632,11 @@ public final class Torrent {
         }
     }
 
-    func peerBitfield(_ peer: PeerConnection, data: Data) {
-        lock.lock(); defer { lock.unlock() }
+    func peerHaveAllLocked(_ peer: PeerConnection) {
+        if let info = info { peer.bitfield = Array(repeating: true, count: info.pieceCount) } else { peer.pendingHaveAll = true }
+    }
+
+    func peerBitfieldLocked(_ peer: PeerConnection, data: Data) {
         if let info = info { peer.bitfield = Torrent.decodeBitfield(data, count: info.pieceCount) }
         else { peer.rawBitfield = data }
     }
@@ -403,15 +668,13 @@ public final class Torrent {
 
     var metadataSizeIfKnown: Int? { lock.lock(); defer { lock.unlock() }; return info?.rawInfo.count }
 
-    func peerReportedMetadataSize(_ peer: PeerConnection, size: Int) {
-        lock.lock(); defer { lock.unlock() }
+    func peerReportedMetadataSizeLocked(_ peer: PeerConnection, size: Int) {
         guard info == nil, metadataSize == nil, size > 0, size < 32 * 1024 * 1024 else { return }
         metadataSize = size
         metadataPieces = Array(repeating: nil, count: (size + 16383) / 16384)
     }
 
-    func metadataPieceReply(_ piece: Int) -> Data? {
-        lock.lock(); defer { lock.unlock() }
+    func metadataPieceReplyLocked(_ piece: Int) -> Data? {
         guard let raw = info?.rawInfo else { return nil }
         let start = piece * 16384
         guard start >= 0 && start < raw.count else { return nil }
@@ -420,14 +683,12 @@ public final class Torrent {
         return reply
     }
 
-    func metadataPieceRejected(_ peer: PeerConnection, piece: Int) {
-        lock.lock(); defer { lock.unlock() }
+    func metadataPieceRejectedLocked(_ peer: PeerConnection, piece: Int) {
         metadataRequestedAt[piece] = nil
         peer.metadataRequestedAt[piece] = nil
     }
 
-    func metadataPieceReceived(_ peer: PeerConnection, piece: Int, data: Data) {
-        lock.lock(); defer { lock.unlock() }
+    func metadataPieceReceivedLocked(_ peer: PeerConnection, piece: Int, data: Data) {
         peer.metadataRequestedAt[piece] = nil
         guard info == nil, piece >= 0, piece < metadataPieces.count, metadataPieces[piece] == nil else { return }
         metadataPieces[piece] = data
@@ -438,6 +699,7 @@ public final class Torrent {
             log("\(infoHashHex.prefix(8)): metadata received (\(parsed.files.count) files)")
             try? raw.write(to: infoFile)
             setInfo(parsed)
+            requestRescheduleLocked()
         } else {
             log("\(infoHashHex.prefix(8)): metadata hash mismatch, retrying")
             metadataPieces = Array(repeating: nil, count: metadataPieces.count)
@@ -451,30 +713,38 @@ public final class Torrent {
         have = Array(repeating: false, count: info.pieceCount)
         storage = Storage(root: dataDirectory, info: info)
         for p in peers.values {
-            if let raw = p.rawBitfield { p.bitfield = Torrent.decodeBitfield(raw, count: info.pieceCount) }
+            if p.pendingHaveAll { p.bitfield = Array(repeating: true, count: info.pieceCount) }
+            else if let raw = p.rawBitfield { p.bitfield = Torrent.decodeBitfield(raw, count: info.pieceCount) }
             else if p.bitfield.count != info.pieceCount { p.bitfield = Array(repeating: false, count: info.pieceCount) }
             for h in p.pendingHaves where h >= 0 && h < info.pieceCount { p.bitfield[h] = true }
             p.rawBitfield = nil
             p.pendingHaves = []
+            p.pendingHaveAll = false
         }
         orderDirty = true
         lock.broadcast()
         // Re-check pieces recorded in the resume file in the background.
         if let resume = try? Data(contentsOf: resumeFile), resume.count == info.pieceCount {
             let candidates = resume.enumerated().filter { $0.element == 1 }.map { $0.offset }
-            verifying.formUnion(candidates)
+            for idx in candidates {
+                let pp = PieceProgress(index: idx, size: info.pieceSize(idx))
+                pp.verifying = true
+                inProgress[idx] = pp
+            }
             let storage = self.storage!
             Thread.detachNewThread { [weak self] in
                 for idx in candidates {
                     guard let self = self, !self.isStopped else { return }
                     let ok = (try? storage.readPiece(idx)).map { SHA1.hash($0) == info.pieceHashes[idx] } ?? false
                     self.lock.lock()
-                    self.verifying.remove(idx)
+                    if let pp = self.inProgress[idx], pp.verifying, pp.receivedCount == 0 { self.inProgress[idx] = nil }
                     if ok && !self.have[idx] { self.have[idx] = true; self.haveCount += 1 }
                     self.orderDirty = true
+                    self.notifyBlockWaitersLocked()
                     self.lock.broadcast()
                     self.lock.unlock()
                 }
+                self?.requestReschedule()
             }
         }
     }
@@ -486,255 +756,148 @@ public final class Torrent {
         lastResumeSave = Date()
     }
 
-    // MARK: piece download
+    // MARK: blocks
 
-    func nextActions(for peer: PeerConnection, pipelineDepth: Int) -> PeerActions {
-        lock.lock(); defer { lock.unlock() }
-        var actions = PeerActions()
-        if stopped { actions.disconnectReason = "stopped"; return actions }
-        if paused { actions.disconnectReason = "paused"; return actions }
-        let now = Date()
-
-        guard let info = info else {
-            // Fetch metadata from peers supporting ut_metadata.
-            if let id = peer.utMetadataID, !metadataPieces.isEmpty, peer.metadataRequestedAt.count < 2 {
-                for i in 0..<metadataPieces.count where metadataPieces[i] == nil {
-                    if let t = metadataRequestedAt[i], now.timeIntervalSince(t) < 8 { continue }
-                    metadataRequestedAt[i] = now
-                    peer.metadataRequestedAt[i] = now
-                    actions.metadataRequests.append((i, id))
-                    if peer.metadataRequestedAt.count >= 2 { break }
-                }
-            }
-            return actions
-        }
-
-        let peerHasWanted = peer.bitfield.count == info.pieceCount
-        if !peer.amInterested && peerHasWanted && peer.bitfield.contains(true) {
-            peer.amInterested = true
-            actions.sendInterested = true
-        }
-
-        if !peer.pending.isEmpty && now.timeIntervalSince(peer.lastBlockAt) > 25 {
-            actions.disconnectReason = "snubbed"
-            return actions
-        }
-        if peer.peerChoking, let since = connectedAt[ObjectIdentifier(peer)], now.timeIntervalSince(since) > 120,
-           peers.count >= maxPeers - 5 {
-            actions.disconnectReason = "choked for too long"
-            return actions
-        }
-
-        if !peer.peerChoking {
-            if needsCriticalBlocks(from: peer, info: info, now: now) {
-                // The player waits on blocks this peer could fetch (right after a seek, or a straggler worth racing):
-                // drop its other requests so they are served next instead of after its whole queue.
-                let me = ObjectIdentifier(peer)
-                let stale = peer.pending.filter { !criticalPieces.contains($0.piece) }
-                for r in stale {
-                    peer.pending.remove(r)
-                    inProgress[r.piece]?.release(r.offset / blockSize, peer: me)
-                }
-                actions.cancels = Array(stale)
-            }
-            if peer.pending.count < pipelineDepth / 2 {
-                let wasIdle = peer.pending.isEmpty
-                actions.requests = pickBlocks(for: peer, count: pipelineDepth - peer.pending.count, info: info, now: now)
-                if wasIdle && !actions.requests.isEmpty { peer.lastBlockAt = now }
-            }
-        }
-        return actions
-    }
-
-    /// Whether the peer has a block of a critical piece that nobody has been asked for, or that is overdue and
-    /// may be raced by this peer, and the peer is below its share of critical blocks.
-    private func needsCriticalBlocks(from peer: PeerConnection, info: TorrentInfo, now: Date) -> Bool {
-        if orderDirty { rebuildOrder(info) }
-        guard !criticalPieces.isEmpty,
-              peer.pending.filter({ criticalPieces.contains($0.piece) }).count < criticalShareLocked(peer: peer) else { return false }
-        let me = ObjectIdentifier(peer)
-        let nowT = now.timeIntervalSinceReferenceDate
-        for piece in criticalPieces where !have[piece] && !verifying.contains(piece) && piece < peer.bitfield.count && peer.bitfield[piece] {
-            guard let pp = inProgress[piece] else { return true }
-            for b in 0..<pp.blockCount where !pp.received[b] {
-                let reqs = pp.requesters[b]
-                if reqs.isEmpty { return true }
-                if reqs.count < 3 && !reqs.contains(me) && nowT - pp.requestedAt[b] > Torrent.criticalRaceAfter { return true }
-            }
-        }
-        return false
-    }
-
-    private func rebuildOrder(_ info: TorrentInfo) {
-        orderDirty = false
-        var order: [Int] = []
-        var seen = Set<Int>()
-        urgentPieces.removeAll()
-        criticalPieces.removeAll()
-        let window = max(4, min(64, (16 * 1024 * 1024) / info.pieceLength))
-
-        func add(_ p: Int, urgent: Bool, critical: Bool = false) {
-            guard p >= 0 && p < info.pieceCount, !have[p] else { return }
-            if urgent { urgentPieces.insert(p) }
-            if critical { criticalPieces.insert(p) }
-            if seen.insert(p).inserted { order.append(p) }
-        }
-
-        let activeReaders = readers.values.sorted { $0.updated > $1.updated }
-        // First what the player is blocked on, the latest seek first.
-        for r in activeReaders {
-            let file = info.files[r.fileIndex]
-            let start = file.offset + r.offset
-            let end = min(file.offset + file.length, start + Torrent.criticalBytes)
-            guard end > start else { continue }
-            for p in info.pieces(from: start, to: end) where p < r.piece + window { add(p, urgent: true, critical: true) }
-        }
-        // Container indexes live at the start/end of media files (MP4 moov, MKV cues): fetch them early.
-        for fi in streamingFiles {
-            let f = info.files[fi]
-            let range = info.pieces(for: f)
-            add(range.lowerBound, urgent: true)
-            let tailStart = max(f.offset, f.offset + f.length - 2 * 1024 * 1024)
-            for p in info.pieces(from: tailStart, to: f.offset + f.length) { add(p, urgent: true) }
-        }
-        for r in activeReaders {
-            let file = info.files[r.fileIndex]
-            let last = info.pieces(for: file).upperBound
-            var p = r.piece
-            while p <= min(last, r.piece + window - 1) { add(p, urgent: true); p += 1 }
-        }
-        // Then a bounded readahead past each reader, so playback survives slow patches without fetching the whole file.
-        for r in activeReaders {
-            let file = info.files[r.fileIndex]
-            let ahead = readahead[r.fileIndex] ?? Torrent.defaultReadahead
-            let end = min(file.offset + file.length, file.offset + r.offset + ahead)
-            guard end > file.offset + r.offset else { continue }
-            for p in info.pieces(from: file.offset + r.offset, to: end) { add(p, urgent: false) }
-        }
-        // Then the start of the file expected to play next, so it starts instantly.
-        if let target = prefetchTarget, target.fileIndex < info.files.count {
-            let f = info.files[target.fileIndex]
-            if f.length > 0 {
-                for p in info.pieces(from: f.offset, to: f.offset + min(f.length, max(1, target.bytes))) { add(p, urgent: false) }
-                let tailStart = max(f.offset, f.offset + f.length - 2 * 1024 * 1024)
-                for p in info.pieces(from: tailStart, to: f.offset + f.length) { add(p, urgent: false) }
-            }
-        }
-        // Then the rest of each wanted file, sequentially from the reader position.
-        let files = wantedFiles.sorted { a, b in
-            let sa = streamingFiles.contains(a), sb = streamingFiles.contains(b)
-            return sa != sb ? sa : a < b
-        }
-        for fi in files {
-            let range = info.pieces(for: info.files[fi])
-            let start = activeReaders.first(where: { $0.fileIndex == fi })?.piece ?? range.lowerBound
-            for p in start...range.upperBound { add(p, urgent: false) }
-            for p in range.lowerBound..<start { add(p, urgent: false) }
-        }
-        priorityOrder = order
-    }
-
-    /// Most blocks of critical pieces this peer may have outstanding: what it can deliver in half a second at its
-    /// recent peak rate (a few while that's unknown). Fast peers take most of what the player waits on, slow or
-    /// stalled ones can't hold much of it, and every peer comes back for more as it delivers.
-    private func criticalShareLocked(peer: PeerConnection) -> Int {
-        peer.capacity > 0 ? max(1, Int(peer.capacity / 2) / blockSize) : 4
-    }
-
-    private func pickBlocks(for peer: PeerConnection, count: Int, info: TorrentInfo, now: Date) -> [BlockRequest] {
-        if orderDirty { rebuildOrder(info) }
-        let me = ObjectIdentifier(peer)
-        let nowT = now.timeIntervalSinceReferenceDate
-        let maxInProgress = max(6, min(handshaked.count + 6, (128 * 1024 * 1024) / info.pieceLength))
-        var criticalHeld = 0
-        var criticalShare = Int.max
-        if !criticalPieces.isEmpty {
-            criticalHeld = peer.pending.filter { criticalPieces.contains($0.piece) }.count
-            criticalShare = criticalShareLocked(peer: peer)
-        }
-        var out: [BlockRequest] = []
-        for piece in priorityOrder {
-            if out.count >= count { break }
-            if have[piece] || verifying.contains(piece) || !peer.bitfield[piece] { continue }
-            let urgent = urgentPieces.contains(piece)
-            let critical = criticalPieces.contains(piece)
-            // Blocks the player waits on are raced against a second peer sooner.
-            let raceAfter: TimeInterval = critical ? Torrent.criticalRaceAfter : 3
-            let pp: PieceProgress
-            if let existing = inProgress[piece] {
-                pp = existing
-            } else {
-                if !urgent && inProgress.count >= maxInProgress { continue }
-                pp = PieceProgress(index: piece, size: info.pieceSize(piece))
-                inProgress[piece] = pp
-            }
-            for b in 0..<pp.blockCount where out.count < count && !pp.received[b] {
-                if critical && criticalHeld >= criticalShare { break }
-                let reqs = pp.requesters[b]
-                if reqs.contains(me) { continue }
-                if !reqs.isEmpty {
-                    // Near the playhead, race a slow block against another peer.
-                    guard urgent, reqs.count < 3, nowT - pp.requestedAt[b] > raceAfter else { continue }
-                }
-                pp.requesters[b].append(me)
-                pp.requestedAt[b] = nowT
-                let r = BlockRequest(piece: piece, offset: b * blockSize, length: pp.blockLength(b))
-                peer.pending.insert(r)
-                out.append(r)
-                if critical { criticalHeld += 1 }
-            }
-            // Peers serve requests in order: while critical blocks are unassigned, keep this peer's queue short so
-            // it takes more of them as soon as it has room.
-            if critical && criticalHeld >= criticalShare,
-               (0..<pp.blockCount).contains(where: { !pp.received[$0] && pp.requesters[$0].isEmpty }) { break }
-        }
-        return out
-    }
-
-    func blockReceived(_ peer: PeerConnection, piece: Int, offset: Int, data: Data) {
-        lock.lock()
-        peer.pending.remove(BlockRequest(piece: piece, offset: offset, length: data.count))
-        peer.lastBlockAt = Date()
+    /// Loop thread, lock held: a block arrived. It goes to disk right away and is readable from then on.
+    func blockReceivedLocked(_ peer: PeerConnection, piece: Int, offset: Int, data: UnsafeRawBufferPointer) {
+        let now = Date.timeIntervalSinceReferenceDate
+        let r = BlockRequest(piece: piece, offset: offset, length: data.count)
+        peer.pending.removeValue(forKey: r)
+        if !peer.cancelled.isEmpty { peer.cancelled.removeValue(forKey: r) }
+        peer.lastBlockAt = now
+        peer.snubbed = false
         peer.downloadedBytes += Int64(data.count)
         bytesSinceTick += data.count
         downloadedTotal += Int64(data.count)
-        guard let pp = inProgress[piece], offset % blockSize == 0 else { lock.unlock(); return }
+        if firstBlockAt == nil {
+            firstBlockAt = now
+            log("\(infoHashHex.prefix(8)): first block after \(String(format: "%.2f", now - createdAt))s")
+        }
+        guard let info = info, let storage = storage, piece >= 0, piece < info.pieceCount, !have[piece],
+              offset % blockSize == 0 else { return }
+        let pp: PieceProgress
+        if let existing = inProgress[piece] { pp = existing } else {
+            pp = PieceProgress(index: piece, size: info.pieceSize(piece))
+            inProgress[piece] = pp
+        }
         let b = offset / blockSize
-        guard b < pp.blockCount, data.count == pp.blockLength(b), !pp.received[b] else { lock.unlock(); return }
-        pp.buffer.replaceSubrange(offset ..< offset + data.count, with: data)
+        guard b < pp.blockCount, data.count == pp.blockLength(b), !pp.received[b], !pp.verifying else { return }
+        do {
+            try storage.write(offset: Int64(piece) * Int64(info.pieceLength) + Int64(offset), bytes: data)
+        } catch {
+            failure = "Disk write failed: \(error)"
+            lock.broadcast()
+            return
+        }
         pp.received[b] = true
         pp.receivedCount += 1
+        pp.sources.insert(peer.address)
+        pp.blockSources[b] = peer.address
+        let me = ObjectIdentifier(peer)
+        for other in pp.requesters[b] where other != me {
+            // A raced duplicate lost; take it off the other peer's queue.
+            if let o = peersByID[other], o.pending.removeValue(forKey: r) != nil {
+                o.cancelled[r] = now
+                o.enqueueCancel(r)
+            }
+        }
         pp.requesters[b] = []
-        let complete = pp.receivedCount == pp.blockCount
-        if complete {
-            inProgress[piece] = nil
-            verifying.insert(piece)
-        }
-        let storage = self.storage
-        let expected = info?.pieceHashes[piece]
-        lock.unlock()
-
-        guard complete, let storage = storage, let expected = expected else { return }
-        let ok = SHA1.hash(pp.buffer) == expected
-        var writeError: String?
-        if ok {
-            do { try storage.writePiece(piece, data: pp.buffer) } catch { writeError = "\(error)" }
-        }
-        lock.lock()
-        verifying.remove(piece)
-        if ok && writeError == nil && !have[piece] {
-            have[piece] = true
-            haveCount += 1
-            resumeDirty = true
-            if urgentPieces.contains(piece) || priorityOrder.first == piece { orderDirty = true }
-        } else if let e = writeError {
-            failure = "Disk write failed: \(e)"
-        } else if !ok {
-            log("piece \(piece) failed hash check")
-        }
-        orderDirty = orderDirty || !ok
+        notifyBlockWaitersLocked()
         lock.broadcast()
-        lock.unlock()
+        if pp.receivedCount == pp.blockCount { verifyLocked(pp, info: info, storage: storage) }
+    }
+
+    private func verifyLocked(_ pp: PieceProgress, info: TorrentInfo, storage: Storage) {
+        pp.verifying = true
+        let piece = pp.index
+        let expected = info.pieceHashes[piece]
+        hashQueue.async { [weak self] in
+            let data = try? storage.readPiece(piece)
+            let ok = data.map { SHA1.hash($0) == expected } ?? false
+            func blockHashes(_ d: Data) -> [Data] {
+                stride(from: 0, to: d.count, by: blockSize).map { SHA1.hash(d.subdata(in: d.startIndex + $0 ..< d.startIndex + min(d.count, $0 + blockSize))) }
+            }
+            guard let self = self else { return }
+            self.lock.lock()
+            var culprits = Set<PeerAddress>()
+            if ok {
+                if !self.have[piece] {
+                    self.have[piece] = true
+                    self.haveCount += 1
+                    self.resumeDirty = true
+                }
+                self.inProgress[piece] = nil
+                if let attempts = self.failedAttempts.removeValue(forKey: piece), let good = data.map(blockHashes) {
+                    for attempt in attempts {
+                        for (b, (source, hash)) in attempt.enumerated() where b < good.count && good[b] != hash {
+                            if let s = source { culprits.insert(s) }
+                        }
+                    }
+                }
+            } else {
+                log("piece \(piece) failed hash check (sources \(pp.sources.count))")
+                if pp.sources.count == 1 {
+                    culprits = pp.sources
+                } else if let d = data {
+                    // Several peers sent blocks: find the bad one once the piece passes.
+                    let hashes = blockHashes(d)
+                    let attempt = hashes.indices.map { (pp.blockSources.indices.contains($0) ? pp.blockSources[$0] : nil, hashes[$0]) }
+                    self.failedAttempts[piece, default: []].append(attempt)
+                }
+                self.inProgress[piece] = PieceProgress(index: piece, size: pp.size)
+                self.cursorsStale = true
+            }
+            for a in culprits {
+                self.banned.insert(a)
+                if let p = self.peers[a] { self.deferClose(p, reason: "sent corrupt data") }
+            }
+            self.orderDirty = true
+            self.lock.broadcast()
+            self.lock.unlock()
+            self.loop.post { [weak self] in self?.runDeferredCloses() }
+            self.requestReschedule()
+        }
+    }
+
+    /// Lock held: whether every block covering the absolute range has arrived (verified or not).
+    func rangeAvailableLocked(_ start: Int64, _ end: Int64) -> Bool {
+        guard end > start else { return true }
+        return availablePrefixLocked(start, maxLength: end - start) >= end - start
+    }
+
+    /// Lock held: how many contiguous bytes from `start` (absolute) have arrived, up to `maxLength`.
+    func availablePrefixLocked(_ start: Int64, maxLength: Int64) -> Int64 {
+        guard let info = info, maxLength > 0 else { return 0 }
+        let pl = Int64(info.pieceLength)
+        let limit = min(info.totalLength, start + maxLength)
+        var pos = start
+        while pos < limit {
+            let piece = Int(pos / pl)
+            let pieceStart = Int64(piece) * pl
+            let pieceEnd = pieceStart + Int64(info.pieceSize(piece))
+            if have[piece] { pos = pieceEnd; continue }
+            guard let pp = inProgress[piece], !(pp.verifying && pp.receivedCount == 0) else { break }
+            var b = Int((pos - pieceStart) / Int64(blockSize))
+            while b < pp.blockCount && pp.received[b] { b += 1 }
+            let reached = min(pieceEnd, pieceStart + Int64(b) * Int64(blockSize))
+            if reached <= pos { break }
+            pos = reached
+            if b < pp.blockCount { break }
+        }
+        return max(0, min(pos, limit) - start)
+    }
+
+    /// Lock held: wakes async waiters whose range is complete.
+    func notifyBlockWaitersLocked() {
+        guard !blockWaiters.isEmpty, let storage = storage else { return }
+        for (id, w) in blockWaiters where rangeAvailableLocked(w.start, w.end) {
+            blockWaiters[id] = nil
+            if let c = w.continuation {
+                w.continuation = nil
+                let start = w.start, count = Int(w.end - w.start)
+                DispatchQueue.global(qos: .userInitiated).async { c.resume(returning: try? storage.read(offset: start, length: count)) }
+            }
+        }
     }
 
     // MARK: public API
@@ -745,9 +908,11 @@ public final class Torrent {
     /// How far past the playback position a file is loaded in the background (`nil` restores the default).
     /// Only applies while the file is being read; nothing beyond it is fetched.
     public func setReadahead(_ bytes: Int64?, fileIndex: Int) {
-        lock.lock(); defer { lock.unlock() }
+        lock.lock()
         readahead[fileIndex] = bytes.map { max(0, $0) }
         orderDirty = true
+        lock.unlock()
+        requestReschedule()
     }
 
     /// Loads the first `bytes` of a file (plus its container index at the end) at low priority, replacing any
@@ -758,12 +923,15 @@ public final class Torrent {
         orderDirty = true
         lock.unlock()
         resume()
+        requestReschedule()
     }
 
     public func cancelPrefetch() {
-        lock.lock(); defer { lock.unlock() }
+        lock.lock()
         prefetchTarget = nil
         orderDirty = true
+        lock.unlock()
+        requestReschedule()
     }
 
     /// Every piece of the first `bytes` of a file (and of its last 2 MB) is on disk.
@@ -773,23 +941,113 @@ public final class Torrent {
         let f = info.files[fileIndex]
         guard f.length > 0 else { return true }
         let head = info.pieces(from: f.offset, to: f.offset + min(f.length, max(1, bytes)))
-        let tail = info.pieces(from: max(f.offset, f.offset + f.length - 2 * 1024 * 1024), to: f.offset + f.length)
+        let tail = info.pieces(from: max(f.offset, f.offset + f.length - Torrent.indexTailBytes), to: f.offset + f.length)
         return head.allSatisfy { have[$0] } && tail.allSatisfy { have[$0] }
     }
 
     /// Marks a whole file for background download, or stops downloading it. Streaming doesn't need this:
     /// readers fetch what they read plus the readahead.
     public func setWanted(_ wanted: Bool, fileIndex: Int) {
-        lock.lock(); defer { lock.unlock() }
+        lock.lock()
         if wanted { wantedFiles.insert(fileIndex) } else { wantedFiles.remove(fileIndex); streamingFiles.remove(fileIndex) }
         orderDirty = true
+        lock.unlock()
+        requestReschedule()
     }
 
     public func setAllWanted(_ wanted: Bool) {
-        lock.lock(); defer { lock.unlock() }
-        guard let info = info else { return }
+        lock.lock()
+        guard let info = info else { lock.unlock(); return }
         if wanted { wantedFiles = Set(info.files.filter { !$0.isPadding }.map { $0.index }) } else { wantedFiles.removeAll(); streamingFiles.removeAll() }
         orderDirty = true
+        lock.unlock()
+        requestReschedule()
+    }
+
+    /// Asks for a byte range of a file. `.now` is as urgent as what the player is reading (e.g. the spot under the
+    /// user's finger while scrubbing); `.soon` is a likely next seek target (skip-intro end, +10 s); `.background` sits
+    /// below read-ahead (seek-preview keyframes). Only the blocks covering the range are needed — do not require the
+    /// whole piece to be downloaded first. Replaces any earlier ranges registered under the same tag.
+    public func want(fileIndex: Int, ranges: [Range<Int64>], urgency: RangeUrgency, tag: String) {
+        lock.lock()
+        wantSeq += 1
+        let clean = ranges.filter { !$0.isEmpty && $0.lowerBound >= 0 }
+        if clean.isEmpty { wants[tag] = nil } else { wants[tag] = Want(fileIndex: fileIndex, ranges: clean, urgency: urgency, seq: wantSeq) }
+        orderDirty = true
+        let wake = paused && urgency >= .soon
+        lock.unlock()
+        if wake { resume() }
+        requestReschedule()
+    }
+
+    public func clearWants(tag: String) {
+        lock.lock()
+        let removed = wants.removeValue(forKey: tag) != nil
+        if removed { orderDirty = true }
+        lock.unlock()
+        if removed { requestReschedule() }
+    }
+
+    /// Bytes of the file at offset..<offset+length once every block of it has arrived (verified or not), waiting up to
+    /// `timeout`; nil on timeout. Never blocks the caller's thread longer than the timeout.
+    /// Doesn't prioritize anything by itself: pair it with `want` (or a reader) for ranges that aren't being fetched.
+    public func waitForBlocks(fileIndex: Int, offset: Int64, length: Int64, timeout: TimeInterval) async -> Data? {
+        let check = checkBlockRange(fileIndex: fileIndex, offset: offset, length: length)
+        switch check {
+        case .invalid: return nil
+        case .empty: return Data()
+        case let .ready(storage, start, count):
+            return await withCheckedContinuation { c in
+                DispatchQueue.global(qos: .userInitiated).async { c.resume(returning: try? storage.read(offset: start, length: count)) }
+            }
+        case let .missing(start, end):
+            guard timeout > 0 else { return nil }
+            let waiter = BlockWaiter(start: start, end: end, fileIndex: fileIndex, fileOffset: offset)
+            return await withCheckedContinuation { (c: CheckedContinuation<Data?, Never>) in
+                register(waiter, continuation: c, timeout: timeout)
+            }
+        }
+    }
+
+    private enum BlockRangeCheck {
+        case invalid, empty
+        case ready(Storage, Int64, Int)
+        case missing(Int64, Int64)
+    }
+
+    private func checkBlockRange(fileIndex: Int, offset: Int64, length: Int64) -> BlockRangeCheck {
+        lock.lock(); defer { lock.unlock() }
+        guard let info = info, let storage = storage, fileIndex >= 0, fileIndex < info.files.count, offset >= 0, length >= 0,
+              !stopped else { return .invalid }
+        let file = info.files[fileIndex]
+        let count = max(0, min(length, file.length - offset))
+        guard count > 0 else { return .empty }
+        let start = file.offset + offset, end = start + count
+        return rangeAvailableLocked(start, end) ? .ready(storage, start, Int(count)) : .missing(start, end)
+    }
+
+    private func register(_ waiter: BlockWaiter, continuation c: CheckedContinuation<Data?, Never>, timeout: TimeInterval) {
+        let id = ObjectIdentifier(waiter)
+        lock.lock()
+        if stopped {
+            lock.unlock()
+            c.resume(returning: nil)
+            return
+        }
+        waiter.continuation = c
+        blockWaiters[id] = waiter
+        // Blocks may have landed between the check and registering.
+        notifyBlockWaitersLocked()
+        lock.unlock()
+        DispatchQueue.global().asyncAfter(deadline: .now() + timeout) { [weak self] in
+            guard let self = self else { return }
+            self.lock.lock()
+            let w = self.blockWaiters.removeValue(forKey: id)
+            let cont = w?.continuation
+            w?.continuation = nil
+            self.lock.unlock()
+            cont?.resume(returning: nil)
+        }
     }
 
     /// Blocks until the metadata (file list) is available.
@@ -804,8 +1062,39 @@ public final class Torrent {
 
     public var torrentInfo: TorrentInfo? { lock.lock(); defer { lock.unlock() }; return info }
 
-    /// Registers a streaming reader at `offset` of a file and blocks until `length` bytes from there are on disk.
-    /// Returns false on timeout (the reader stays registered so priorities keep following it).
+    /// Lock held: registers or moves a streaming reader. Moving it re-ranks what to fetch.
+    private func updateReaderLocked(_ readerID: UUID, fileIndex: Int, offset: Int64) {
+        if paused {
+            // Playing something un-pauses the torrent.
+            paused = false
+            retryAfter.removeAll()
+            requeueKnownPeersLocked()
+            let ts = trackers
+            DispatchQueue.global().async { ts.forEach { $0.poke() } }
+            if !connectQueued { connectQueued = true; loop.post { [weak self] in self?.connectMore() } }
+        }
+        let now = Date.timeIntervalSinceReferenceDate
+        if var r = readers[readerID], r.fileIndex == fileIndex {
+            r.offset = offset
+            // Re-rank once the reader has moved a bit (sequential playback) or jumped.
+            if abs(offset - r.orderedAt) >= 256 * 1024 {
+                r.orderedAt = offset
+                r.updated = now
+                orderDirty = true
+                requestRescheduleLocked()
+            }
+            readers[readerID] = r
+        } else {
+            readers[readerID] = Reader(fileIndex: fileIndex, offset: offset, updated: now, orderedAt: offset)
+            orderDirty = true
+            requestRescheduleLocked()
+        }
+        if streamingFiles.insert(fileIndex).inserted { orderDirty = true }
+    }
+
+    /// Registers a streaming reader at `offset` of a file and blocks until `length` bytes from there have arrived
+    /// (their blocks are on disk; the pieces may not be verified yet). Returns false on timeout (the reader stays
+    /// registered so priorities keep following it).
     public func waitForData(fileIndex: Int, offset: Int64, length: Int, readerID: UUID, timeout: TimeInterval) throws -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         lock.lock(); defer { lock.unlock() }
@@ -813,30 +1102,41 @@ public final class Torrent {
         let file = info.files[fileIndex]
         let start = file.offset + offset
         let end = min(file.offset + file.length, start + Int64(max(length, 1)))
-        let range = info.pieces(from: start, to: end)
-        if paused && !range.allSatisfy({ have[$0] }) {
-            // Playing something un-pauses the torrent.
-            paused = false
-            retryAfter.removeAll()
-            let ts = trackers
-            DispatchQueue.global().async { ts.forEach { $0.poke() } }
-        }
-        let moved = readers[readerID].map { $0.piece != range.lowerBound || $0.fileIndex != fileIndex } ?? true
-        if moved { orderDirty = true }
-        readers[readerID] = Reader(fileIndex: fileIndex, offset: offset, piece: range.lowerBound,
-                                   updated: moved ? Date() : readers[readerID]!.updated)
-        if streamingFiles.insert(fileIndex).inserted { orderDirty = true }
+        updateReaderLocked(readerID, fileIndex: fileIndex, offset: offset)
         while true {
             if stopped { throw TorrentError.stopped }
             if let f = failure { throw TorrentError.io(f) }
-            if range.allSatisfy({ have[$0] }) { return true }
+            if rangeAvailableLocked(start, end) { return true }
             if !lock.wait(until: deadline) { return false }
         }
     }
 
-    public func removeReader(_ id: UUID) {
+    /// Like `waitForData`, but returns as soon as any bytes at `offset` have arrived: how many contiguous bytes are
+    /// readable from there (at most `maxLength`), or 0 on timeout. The stream server sends each block as it lands.
+    func waitForAvailable(fileIndex: Int, offset: Int64, maxLength: Int64, readerID: UUID, timeout: TimeInterval) throws -> Int64 {
+        let deadline = Date().addingTimeInterval(timeout)
         lock.lock(); defer { lock.unlock() }
-        if readers.removeValue(forKey: id) != nil { orderDirty = true }
+        guard let info = info, fileIndex >= 0, fileIndex < info.files.count else { throw TorrentError.io("no such file") }
+        let file = info.files[fileIndex]
+        let start = file.offset + offset
+        let limit = min(maxLength, file.length - offset)
+        guard limit > 0 else { return 0 }
+        updateReaderLocked(readerID, fileIndex: fileIndex, offset: offset)
+        while true {
+            if stopped { throw TorrentError.stopped }
+            if let f = failure { throw TorrentError.io(f) }
+            let n = availablePrefixLocked(start, maxLength: limit)
+            if n > 0 { return n }
+            if !lock.wait(until: deadline) { return 0 }
+        }
+    }
+
+    public func removeReader(_ id: UUID) {
+        lock.lock()
+        let removed = readers.removeValue(forKey: id) != nil
+        if removed { orderDirty = true }
+        lock.unlock()
+        if removed { requestReschedule() }
     }
 
     /// Reads bytes of a file that `waitForData` reported available.
@@ -909,6 +1209,46 @@ public final class Torrent {
         )
     }
 
+    /// One line about the swarm, for logs and the command line harness.
+    public var swarmSummary: String {
+        lock.lock(); defer { lock.unlock() }
+        let active = peers.values.filter { $0.isActive }
+        let unchoked = active.filter { !$0.peerChoking }.count
+        let sending = active.filter { $0.rate > 1024 }.count
+        let connecting = peers.values.filter { $0.phase == .connecting || $0.phase == .handshaking }.count
+        func ms(_ t: TimeInterval?) -> String { t.map { String(format: "%.1fs", $0 - createdAt) } ?? "-" }
+        return "peers \(active.count) (unchoked \(unchoked), sending \(sending), connecting \(connecting), queued \(peerQueue.count), known \(knownPeers.count)) "
+            + "first peer \(ms(firstConnectAt)) unchoke \(ms(firstUnchokeAt)) block \(ms(firstBlockAt)) "
+            + String(format: "rate %.0f KB/s", currentRate / 1024)
+            + " top " + active.sorted { $0.rate > $1.rate }.prefix(6).map { String(format: "%.0fK/%d", $0.rate / 1024, $0.pending.count) }.joined(separator: " ")
+    }
+
+    /// Diagnostics: who was asked for the block at a file offset, and how it is going.
+    func blockDebugDescription(fileIndex: Int, offset: Int64) -> String {
+        lock.lock(); defer { lock.unlock() }
+        guard let info = info, fileIndex >= 0, fileIndex < info.files.count else { return "-" }
+        let abs = info.files[fileIndex].offset + offset
+        let piece = Int(abs / Int64(info.pieceLength))
+        let b = Int((abs - Int64(piece) * Int64(info.pieceLength)) / Int64(blockSize))
+        let now = Date.timeIntervalSinceReferenceDate
+        let spanInfo = spans.first { $0.piece == piece && (($0.start)..<($0.end)).contains(b) }.map { "span prio \($0.priority)" } ?? "no span"
+        let holders = peersWithPiece(piece)
+        guard let pp = inProgress[piece] else { return "piece \(piece) block \(b): not started, \(spanInfo), \(holders) peers have it" }
+        let r = BlockRequest(piece: piece, offset: b * blockSize, length: pp.blockLength(b))
+        let reqs = pp.requesters[b].compactMap { peersByID[$0] }.map { p -> String in
+            var s = "\(p.address) \(p.clientName) " + String(format: "%.0fK/s q%d choked %d", p.rate / 1024, p.pending.count, p.peerChoking ? 1 : 0)
+            if let pr = p.pending[r] {
+                let older = p.pending.values.filter { $0.at < pr.at }.count
+                s += " older \(older) delivered since \((p.downloadedBytes - pr.deliveredBefore) / Int64(blockSize)) prio \(pr.priority)"
+            } else { s += " not pending" }
+            return s
+        }
+        return String(format: "piece %d block %d: received %d, asked %.2fs ago, eta %+.2fs, ", piece, b, pp.received[b] ? 1 : 0,
+                      now - pp.requestedAt[b], pp.eta[b] - now) + "\(spanInfo), \(holders) peers have it, requesters [\(reqs.joined(separator: ", "))]"
+    }
+
+    private func peersWithPiece(_ piece: Int) -> Int { peers.values.filter { $0.isActive && $0.has(piece) && !$0.peerChoking }.count }
+
     /// Downloaded fraction of a file split into `buckets` equal segments (for a "buffered" bar).
     public func availability(fileIndex: Int, buckets: Int) -> [Double] {
         lock.lock(); defer { lock.unlock() }
@@ -944,14 +1284,7 @@ public final class Torrent {
         let reader = readers.values.filter { $0.fileIndex == fileIndex }.max { $0.updated < $1.updated }
         var ahead: Int64 = 0
         if let r = reader {
-            let fileEnd = file.offset + file.length
-            var p = r.piece
-            while p < info.pieceCount && have[p] {
-                let pe = min(fileEnd, Int64(p) * Int64(info.pieceLength) + Int64(info.pieceSize(p)))
-                ahead = pe - (file.offset + r.offset)
-                if pe >= fileEnd { break }
-                p += 1
-            }
+            ahead = availablePrefixLocked(file.offset + r.offset, maxLength: file.length - r.offset)
         }
         let range = info.pieces(for: file)
         let haveInFile = range.filter { have[$0] }.count

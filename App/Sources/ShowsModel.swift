@@ -127,6 +127,8 @@ final class ShowsModel: ObservableObject {
     /// Shows whose episode names and stills were looked up this session, so a cached copy gets them once.
     private var enriched: Set<Int> = []
     private var prefetchTask: Task<Void, Never>?
+    private var warmTask: Task<Void, Never>?
+    private weak var warmed: Torrent?
 
     private struct Saved: Codable {
         var myList: [Show] = []
@@ -401,6 +403,33 @@ final class ShowsModel: ObservableObject {
         save()
     }
 
+    /// Gets the episode the Play button would start ready while its page is open: finds the release, joins the
+    /// swarm and loads the opening seconds and the container index, so pressing Play starts at once. Only one
+    /// show is warmed at a time; the one before goes quiet.
+    func warm(_ d: ShowDetails) {
+        guard let next = upNext(d), next.episode.isAired else { return }
+        let key = Self.key(d.show.id, next.season.id, next.episode.number)
+        warmTask?.cancel()
+        warmTask = Task {
+            if prepared[key] == nil, let r = try? await resolve(d, next.season, next.episode, source: nil, status: { _ in }) {
+                prepared[key] = r
+            }
+            guard !Task.isCancelled, let r = prepared[key] else { return }
+            if let old = warmed, old !== r.torrent, !app.isPlaying(old) { old.pause() }
+            warmed = r.torrent
+            r.torrent.prefetch(fileIndex: r.file.index, bytes: Self.warmBytes)
+            // Resuming reads from where the viewer left off; estimate that spot by proportion.
+            if let at = next.resumeAt, let remaining = next.remaining, at + remaining > 0 {
+                let offset = Int64(Double(r.file.length) * at / (at + remaining))
+                let range = max(0, offset - (2 << 20))..<min(r.file.length, offset + (10 << 20))
+                r.torrent.want(fileIndex: r.file.index, ranges: [range], urgency: .soon, tag: "warm.resume")
+            }
+        }
+    }
+
+    /// About the first ten seconds of a 1080p episode.
+    private static let warmBytes: Int64 = 12 << 20
+
     /// Loads the start of the next episode once the current one's bitrate is known.
     func prefetchNext(after request: PlaybackRequest, duration: Double) {
         guard let ctx = request.show, let d = details[ctx.show.id], let s = d.season(id: ctx.seasonID),
@@ -429,6 +458,17 @@ final class ShowsModel: ObservableObject {
             guard let self else { return nil }
             return try? await self.request(d, ns, ne, source: nil, resumeAt: nil, status: { _ in })
         }
+    }
+
+    /// The next episode's file once `prefetchNext` has found it, to compare the playing episode's audio with; its
+    /// number is given when it's in the same season.
+    func preparedNext(after request: PlaybackRequest) -> SkipReference? {
+        guard let ctx = request.show, let d = details[ctx.show.id], let s = d.season(id: ctx.seasonID),
+              let e = s.episodes.first(where: { $0.number == ctx.episode }),
+              let next = d.episode(after: s, e) else { return nil }
+        let (ns, ne) = next
+        guard let r = prepared[Self.key(d.show.id, ns.id, ne.number)] else { return nil }
+        return SkipReference(torrent: r.torrent, file: r.file, episode: ns.id == s.id ? ne.number : nil)
     }
 
     // MARK: finding releases
@@ -470,9 +510,17 @@ final class ShowsModel: ObservableObject {
         if source == nil {
             if let r = prepared[key], app.client.torrent(infoHashHex: r.torrent.infoHashHex) != nil {
                 if r.torrent.isPaused { r.torrent.resume() }
+                PlaybackTrace.shared.mark("resolve: ready ahead of time (\(r.torrent.infoHashHex.prefix(8)))")
                 return r
             }
-            if let saved = savedSources[key], let r = await open(saved) { return r }
+            if let saved = savedSources[key] {
+                PlaybackTrace.shared.mark("resolve: reopening the release played before")
+                if let r = await open(saved) {
+                    PlaybackTrace.shared.mark("resolve: reopened")
+                    return r
+                }
+                PlaybackTrace.shared.mark("resolve: release played before didn't open")
+            }
             // Packs hold the next episodes too.
             for other in savedSources.filter({ $0.key.hasPrefix("\(d.show.id).") && $0.value.isBatch }).map(\.value) {
                 guard let t = app.client.torrent(infoHashHex: other.infoHash), let info = t.torrentInfo,
@@ -485,22 +533,29 @@ final class ShowsModel: ObservableObject {
         }
 
         status("Finding the best version")
+        PlaybackTrace.shared.mark("resolve: searching Nyaa")
         let candidates: [EpisodeSource]
         if let source {
             candidates = [source]
         } else {
             candidates = Array(try await sources(d, s, e).prefix(4))
         }
+        PlaybackTrace.shared.mark("resolve: \(candidates.count) candidates; first: \(candidates.first?.result.title ?? "none")")
         guard !candidates.isEmpty else { throw ShowError.noSources }
         status("Starting")
         for c in candidates {
             guard let t = await app.addSource(torrentURL: c.result.torrentURL, magnet: c.result.magnet,
-                                              infoHash: c.result.infoHash) else { continue }
+                                              infoHash: c.result.infoHash) else {
+                PlaybackTrace.shared.mark("resolve: couldn't add \(c.result.title)")
+                continue
+            }
             guard let info = await Self.info(t, timeout: 25),
                   let f = Self.pickFile(info, s, e, isMovie: isMovie) else {
+                PlaybackTrace.shared.mark("resolve: no metadata or no matching file in \(c.result.title)")
                 app.discardSource(t)
                 continue
             }
+            PlaybackTrace.shared.mark("resolve: playing \(f.displayPath) (\(f.length / 1_000_000) MB, pieces \(info.pieceLength / 1024) KB)")
             let saved = SavedSource(infoHash: t.infoHashHex, fileIndex: f.index, magnet: c.result.magnet ?? t.magnetLink,
                                     torrentURL: c.result.torrentURL, group: c.group, isBatch: c.isBatch)
             return ResolvedEpisode(torrent: t, file: f, source: saved)

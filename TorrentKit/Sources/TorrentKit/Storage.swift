@@ -79,6 +79,20 @@ final class Storage {
         }
     }
 
+    /// Writes raw bytes (a block straight out of the peer's receive buffer) at an absolute torrent offset.
+    func write(offset: Int64, bytes raw: UnsafeRawBufferPointer) throws {
+        guard let base = raw.baseAddress else { return }
+        try segments(offset: offset, length: raw.count) { file, fileOffset, n, bufOffset in
+            guard !file.isPadding, let fd = try fd(for: file, create: true) else { return }
+            var written = 0
+            while written < n {
+                let r = pwrite(fd, base + bufOffset + written, n - written, off_t(fileOffset) + off_t(written))
+                if r < 0 { if errno == EINTR { continue }; throw TorrentError.io("write: \(Net.lastError)") }
+                written += r
+            }
+        }
+    }
+
     func read(offset: Int64, length: Int) throws -> Data {
         var out = Data(count: length)
         try out.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in

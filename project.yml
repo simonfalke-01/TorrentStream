@@ -26,12 +26,16 @@ targets:
         product: SourceKit
       - package: TorrentKit
         product: SubtitleKit
+      - package: TorrentKit
+        product: MediaKit
+      - package: TorrentKit
+        product: SkipKit
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.simonfalke.TorrentStream
         PRODUCT_NAME: TorrentStream
-        MARKETING_VERSION: "5.2"
-        CURRENT_PROJECT_VERSION: "13"
+        MARKETING_VERSION: "5.3"
+        CURRENT_PROJECT_VERSION: "14"
         TARGETED_DEVICE_FAMILY: "1,2"
         SWIFT_VERSION: "5.0"
         CODE_SIGN_STYLE: Automatic

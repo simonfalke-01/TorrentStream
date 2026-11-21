@@ -115,6 +115,10 @@ final class PlaybackEngine: ObservableObject {
     private var lastChange = Date()
     private var seekTarget: Double?
     private var seekDeadline = Date()
+    private var seekStarted: Date?
+    private var lastState: VLCMediaPlayerState?
+    private var tracedFirstFrame = false
+    private var subtitlesAddedAt: Date?
     private var tracksSettled = false
     private var chaptersLoaded = false
     private var startedAt = Date()
@@ -150,17 +154,24 @@ final class PlaybackEngine: ObservableObject {
             errorText = "This video couldn’t be opened."
             return
         }
-        // VLC buffers this much media at start and after every seek before showing a frame; the torrent engine
-        // already reads ahead, so VLC's default for network streams is enough.
-        media.addOption(":network-caching=1000")
+        // VLC buffers this much media at start and after every seek before showing a frame. The torrent engine
+        // does the buffering, so VLC's own only adds delay.
+        media.addOption(":network-caching=400")
         media.addOption(":http-reconnect")
         media.addOption(preferDub ? ":audio-language=eng,en,jpn,ja" : ":audio-language=jpn,ja,eng,en")
         if !preferDub { media.addOption(":sub-language=eng,en,English") }
         if let start, start > 0 { media.addOption(":start-time=\(Int(start))") }
         player.media = media
+    }
+
+    /// Subtitle files beside the video, added once the picture is up: each is another read from the torrent, and
+    /// at the start every read competes with the first frame.
+    private func addSubtitleFiles() {
+        guard !subtitleFiles.isEmpty else { return }
         for s in subtitleFiles {
             player.addPlaybackSlave(s, type: .subtitle, enforce: false)
         }
+        subtitlesAddedAt = Date()
     }
 
     // MARK: lifecycle
@@ -191,6 +202,15 @@ final class PlaybackEngine: ObservableObject {
         let t = player.time.intValue
         if t != lastTime { lastTime = t; lastChange = Date() }
         let idle = Date().timeIntervalSince(lastChange)
+        if state != lastState {
+            lastState = state
+            PlaybackTrace.shared.mark("player state \(Self.name(of: state)) at \(t) ms")
+        }
+        if !tracedFirstFrame, t > 0 {
+            tracedFirstFrame = true
+            PlaybackTrace.shared.mark("first frame \(String(format: "%.2f", Date().timeIntervalSince(startedAt)))s after the player opened")
+            addSubtitleFiles()
+        }
 
         if state == .playing { hasPlayed = true; restarting = false }
         if state == .error {
@@ -222,6 +242,7 @@ final class PlaybackEngine: ObservableObject {
         if len > 0 {
             let d = Double(len) / 1000
             if d != duration {
+                if duration == 0 { PlaybackTrace.shared.mark(String(format: "duration %.0fs", d)) }
                 duration = d
                 output.invalidatePlaybackState()
             }
@@ -231,6 +252,12 @@ final class PlaybackEngine: ObservableObject {
         if let target = seekTarget {
             if abs(now - target) < 2.5 || Date() > seekDeadline { seekTarget = nil } else { currentTime = target }
         }
+        if let began = seekStarted, idle < 0.3, t != 0, state == .playing || !player.isPlaying {
+            if abs(now - (seekTarget ?? now)) < 2.5 {
+                seekStarted = nil
+                PlaybackTrace.shared.mark(String(format: "seek settled at %.1fs after %.2fs", now, Date().timeIntervalSince(began)))
+            }
+        }
         if seekTarget == nil, t > 0 { currentTime = now }
 
         let size = player.videoSize
@@ -238,6 +265,19 @@ final class PlaybackEngine: ObservableObject {
 
         if ticks % 4 == 0 || !tracksSettled { refreshTracks() }
         if !chaptersLoaded, duration > 0 { loadChapters() }
+    }
+
+    private static func name(of state: VLCMediaPlayerState) -> String {
+        switch state {
+        case .stopped: return "stopped"
+        case .stopping: return "stopping"
+        case .opening: return "opening"
+        case .buffering: return "buffering"
+        case .error: return "error"
+        case .playing: return "playing"
+        case .paused: return "paused"
+        default: return "\(state.rawValue)"
+        }
     }
 
     private func refreshTracks() {
@@ -253,8 +293,14 @@ final class PlaybackEngine: ObservableObject {
         let selectedText = text.first(where: { $0.isSelected })?.trackId ?? MediaTrack.offID
         if selectedText != currentSubtitle { currentSubtitle = selectedText }
 
-        // Tracks appear once the file is open; give slaves a moment to load before choosing.
-        if !tracksSettled, !audioTracks.isEmpty, currentTime > 0 || Date().timeIntervalSince(startedAt) > 6 {
+        // Tracks appear once the file is open; give subtitle files a moment to load before choosing.
+        let ready: Bool
+        if subtitleFiles.isEmpty {
+            ready = currentTime > 0 || Date().timeIntervalSince(startedAt) > 6
+        } else {
+            ready = subtitlesAddedAt.map { Date().timeIntervalSince($0) > 1.5 } ?? (Date().timeIntervalSince(startedAt) > 20)
+        }
+        if !tracksSettled, !audioTracks.isEmpty, ready {
             tracksSettled = true
             applyRememberedTracks()
         }
@@ -286,18 +332,24 @@ final class PlaybackEngine: ObservableObject {
     func pause() { player.pause(); isPlaying = false }
     func togglePlay() { isPlaying ? pause() : play() }
 
-    func seek(to seconds: Double) {
+    /// - Parameter fast: land on the nearest keyframe instead of decoding up to the exact time. Right for a
+    ///   scrub, where the viewer picked a rough spot; wrong for skipping an intro or opening a chapter.
+    func seek(to seconds: Double, fast: Bool = false) {
         guard duration > 0 else { return }
         let target = max(0, min(seconds, duration - 1))
         if didFinish {
             restart(from: target)
             return
         }
-        player.position = target / duration
+        PlaybackTrace.shared.mark(String(format: "seek to %.1fs%@ from %.1fs", target, fast ? " (keyframe)" : "", currentTime))
+        if !(fast && setTimeFast(target)) {
+            player.position = target / duration
+        }
         markSeek(target)
     }
 
     func skip(by seconds: Double) {
+        PlaybackTrace.shared.mark(String(format: "skip %+.0fs from %.1fs", seconds, currentTime))
         if seconds > 0 { player.jumpForward(seconds) } else { player.jumpBackward(-seconds) }
         markSeek(max(0, duration > 0 ? min(currentTime + seconds, duration) : currentTime + seconds))
     }
@@ -305,8 +357,28 @@ final class PlaybackEngine: ObservableObject {
     private func markSeek(_ target: Double) {
         seekTarget = target
         seekDeadline = Date().addingTimeInterval(4)
+        seekStarted = Date()
         currentTime = target
         lastChange = Date()
+    }
+
+    private typealias SetTime = @convention(c) (UnsafeMutableRawPointer, Int64, Bool) -> Int32
+    private typealias InstanceGetter = @convention(c) (AnyObject, Selector) -> UnsafeMutableRawPointer?
+
+    /// VLCKit only seeks precisely; libVLC itself can seek to a keyframe, which needs no decoding past it.
+    private static let setTimeSymbol: SetTime? = {
+        guard let sym = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "libvlc_media_player_set_time") else { return nil }
+        return unsafeBitCast(sym, to: SetTime.self)
+    }()
+
+    private func setTimeFast(_ seconds: Double) -> Bool {
+        guard let setTime = Self.setTimeSymbol else { return false }
+        let selector = NSSelectorFromString("libVLCMediaPlayer")
+        guard player.responds(to: selector), let imp = player.method(for: selector) else { return false }
+        let getter = unsafeBitCast(imp, to: InstanceGetter.self)
+        guard let instance = getter(player, selector) else { return false }
+        // libVLC 4 counts in microseconds.
+        return setTime(instance, Int64(seconds * 1_000_000), true) == 0
     }
 
     func replay() { restart(from: 0) }
@@ -324,6 +396,7 @@ final class PlaybackEngine: ObservableObject {
                 MainActor.assumeIsolated {
                     guard let self else { return }
                     self.load(from: start)
+                    self.addSubtitleFiles()
                     self.player.rate = self.rate
                     self.player.play()
                 }
@@ -349,6 +422,32 @@ final class PlaybackEngine: ObservableObject {
             output.attach(external: nil)
             ExternalDisplay.shared.release()
             isOnTV = false
+        }
+    }
+
+    // MARK: leaving the app
+
+    private var videoTrackAway: String?
+
+    /// iOS lets nothing draw while the app is in the background, and libVLC's picture can stall for good if it
+    /// tries, leaving sound over a frozen frame. Sound carries on alone; the picture comes back with the app.
+    func appDidEnterBackground() {
+        guard !isPictureInPicture, !isOnTV, videoTrackAway == nil,
+              let track = player.videoTracks.first(where: { $0.isSelected }) else { return }
+        PlaybackTrace.shared.mark("background: video off")
+        videoTrackAway = track.trackId
+        player.deselectAllVideoTracks()
+    }
+
+    func appWillEnterForeground() {
+        guard let id = videoTrackAway else { return }
+        videoTrackAway = nil
+        PlaybackTrace.shared.mark("foreground: video on")
+        player.videoTracks.first { $0.trackId == id }?.isSelectedExclusively = true
+        // A track switched back on waits for the next keyframe; a seek to here shows the picture at once.
+        if duration > 0, !didFinish {
+            player.position = currentTime / duration
+            markSeek(currentTime)
         }
     }
 

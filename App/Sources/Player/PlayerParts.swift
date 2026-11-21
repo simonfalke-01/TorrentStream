@@ -85,6 +85,10 @@ struct StreamScrubber: View {
     var marks: [Double] = []
     /// The chapter at a fraction, for the drag bubble.
     var chapterName: (Double) -> String? = { _ in nil }
+    /// The picture at a time in seconds, for the drag bubble; nil when this video gets no previews.
+    var preview: ((Double) -> UIImage?)? = nil
+    /// Height over width of the video, so the preview's frame doesn't change shape when its picture arrives.
+    var previewAspect: CGFloat = 9 / 16
     @Binding var scrub: Double?
     let onCommit: (Double) -> Void
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -94,8 +98,9 @@ struct StreamScrubber: View {
     private let activeBar: CGFloat = 10
     private let restingThumb: CGFloat = 13
     private let activeThumb: CGFloat = 20
-    private let bubbleLift: CGFloat = 40
+    private let bubbleGap: CGFloat = 22
     private let bubbleMaxWidth: CGFloat = 220
+    private let previewWidth: CGFloat = 176
 
     var body: some View {
         GeometryReader { geo in
@@ -142,7 +147,8 @@ struct StreamScrubber: View {
                             let x = width * s - d.width / 2
                             return -min(max(x, 0), width - d.width)
                         }
-                        .offset(y: -bubbleLift)
+                        // Bottom edge a fixed gap above the bar, however tall the bubble is.
+                        .alignmentGuide(VerticalAlignment.center) { d in d.height + bubbleGap }
                 }
             }
             .frame(maxHeight: .infinity)
@@ -170,7 +176,44 @@ struct StreamScrubber: View {
         }
     }
 
+    @ViewBuilder
     private func bubble(_ s: Double) -> some View {
+        if let preview {
+            // The picture leads; time and chapter sit beneath it as its caption.
+            VStack(spacing: Space.xs) {
+                previewImage(preview(s * duration))
+                caption(s)
+                    .padding(.bottom, Space.xxs)
+            }
+            .padding(Space.xs)
+            .frame(width: previewWidth + Space.xs * 2)
+            .glassEffect(.regular, in: .rect(cornerRadius: Radius.small + Space.xs))
+        } else {
+            caption(s)
+                .padding(.horizontal, Space.m)
+                .padding(.vertical, Space.xs)
+                .frame(maxWidth: bubbleMaxWidth)
+                .glassEffect(.regular, in: .capsule)
+                .fixedSize()
+        }
+    }
+
+    private func previewImage(_ image: UIImage?) -> some View {
+        ZStack {
+            Rectangle().fill(.black.opacity(0.35))
+            if let image {
+                Image(uiImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                    .transition(.opacity)
+            }
+        }
+        .frame(width: previewWidth, height: (previewWidth * previewAspect).rounded())
+        .clipShape(.rect(cornerRadius: Radius.small))
+        .animation(Motion.role(Motion.fast, reduce: reduceMotion), value: image == nil)
+    }
+
+    private func caption(_ s: Double) -> some View {
         VStack(spacing: 0) {
             Text(Format.seconds(s * duration))
                 .font(.subheadline.weight(.semibold).monospacedDigit())
@@ -181,11 +224,6 @@ struct StreamScrubber: View {
                     .lineLimit(1)
             }
         }
-        .padding(.horizontal, Space.m)
-        .padding(.vertical, Space.xs)
-        .frame(maxWidth: bubbleMaxWidth)
-        .glassEffect(.regular, in: .capsule)
-        .fixedSize()
     }
 }
 
@@ -299,100 +337,55 @@ struct NextEpisodeCard: View {
 
 // MARK: - Double-tap seek
 
-/// A run of double-tap seeks on one side: how far in total, and where each tap landed.
+/// A run of double-tap seeks on one side.
 struct SeekFlash: Equatable {
     let forward: Bool
     var seconds = 0
-    /// Counts taps, so the chevrons run again on each one.
+    /// Counts taps, so the glyph turns again on each one.
     var taps = 0
-    var ripples: [Ripple] = []
-
-    struct Ripple: Equatable, Identifiable {
-        let id = UUID()
-        let point: CGPoint
-    }
 }
 
-/// The side of the screen that was double-tapped lights up as an arc; each tap sends a ripple out from the finger,
-/// the chevrons run in the direction of travel, and the total counts up.
+/// The system skip glyph, drawn for any total: a glass disc on the tapped side whose arrow turns once per tap while
+/// the number inside counts up, as `goforward.10` would read if it had every value.
 struct SeekFeedbackView: View {
     let flash: SeekFlash
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var shown = false
+
+    private let disc: CGFloat = 88
 
     var body: some View {
         GeometryReader { geo in
-            let size = geo.size
-            let arc = SeekArc(forward: flash.forward)
             ZStack {
-                arc.fill(.white.opacity(0.1))
-                ZStack {
-                    ForEach(flash.ripples) { r in
-                        SeekRipple(point: r.point, radius: max(size.width, size.height) * 0.5)
-                    }
-                }
-                .clipShape(arc)
-                VStack(spacing: Space.s) {
-                    SeekChevrons(forward: flash.forward, trigger: flash.taps)
-                    Text("\(flash.forward ? "+" : "−")\(flash.seconds) s")
-                        .font(.subheadline.weight(.semibold).monospacedDigit())
-                        .contentTransition(.numericText(value: Double(flash.seconds)))
-                }
-                .shadow(color: .black.opacity(0.35), radius: PlayerMetrics.glyphShadow)
-                .position(x: size.width * (flash.forward ? SeekArc.labelCenter : 1 - SeekArc.labelCenter), y: size.height / 2)
+                Image(systemName: flash.forward ? "goforward" : "gobackward")
+                    .font(.system(size: 50, weight: .regular))
+                    .symbolEffect(.rotate.byLayer, options: .speed(1.6), value: reduceMotion ? 0 : flash.taps)
+                Text("\(flash.seconds)")
+                    .font(.system(size: 15, weight: .semibold).monospacedDigit())
+                    .contentTransition(.numericText(value: Double(flash.seconds)))
+                    .offset(y: 2)
             }
             .foregroundStyle(.white)
+            .frame(width: disc, height: disc)
+            .glassEffect(.regular, in: .circle)
+            .scaleEffect(shown || reduceMotion ? 1 : 0.7)
+            .opacity(shown || reduceMotion ? 1 : 0)
+            .keyframeAnimator(initialValue: 1.0, trigger: reduceMotion ? 0 : flash.taps) { view, scale in
+                view.scaleEffect(scale)
+            } keyframes: { _ in
+                KeyframeTrack {
+                    SpringKeyframe(1.08, duration: 0.12, spring: .snappy)
+                    SpringKeyframe(1.0, duration: 0.3, spring: .bouncy)
+                }
+            }
+            .position(x: geo.size.width * (flash.forward ? 0.75 : 0.25), y: geo.size.height / 2)
         }
         .ignoresSafeArea()
         .allowsHitTesting(false)
+        .sensoryFeedback(.impact(weight: .light), trigger: flash.taps)
+        .onAppear {
+            withAnimation(.spring(response: 0.32, dampingFraction: 0.72)) { shown = true }
+        }
         .accessibilityHidden(true)
-    }
-}
-
-/// The lit side for a double-tap seek: the outer part of the screen, bounded by a shallow curve.
-struct SeekArc: Shape {
-    let forward: Bool
-    /// Where the curve meets the vertical middle, as a fraction of the width from the near edge.
-    static let depth: CGFloat = 0.38
-    /// Middle of the lit area, from the leading edge for a forward seek.
-    static let labelCenter: CGFloat = 1 - depth / 2
-
-    func path(in rect: CGRect) -> Path {
-        let a = rect.width * 0.5
-        let b = rect.height * 0.85
-        let innerX = forward ? rect.maxX - rect.width * Self.depth : rect.minX + rect.width * Self.depth
-        let centerX = forward ? innerX + a : innerX - a
-        return Path(ellipseIn: CGRect(x: centerX - a, y: rect.midY - b, width: a * 2, height: b * 2))
-    }
-}
-
-private struct SeekRipple: View {
-    let point: CGPoint
-    let radius: CGFloat
-    @State private var grown = false
-
-    var body: some View {
-        Circle()
-            .fill(.white.opacity(grown ? 0 : 0.25))
-            .frame(width: radius * 2, height: radius * 2)
-            .scaleEffect(grown ? 1 : 0.1)
-            .position(point)
-            .onAppear { withAnimation(.easeOut(duration: 0.55)) { grown = true } }
-    }
-}
-
-/// Three chevrons that light one after another in the direction of the seek.
-private struct SeekChevrons: View {
-    let forward: Bool
-    let trigger: Int
-
-    var body: some View {
-        PhaseAnimator([-1, 0, 1, 2], trigger: trigger) { lit in
-            HStack(spacing: 0) {
-                ForEach(0..<3, id: \.self) { i in
-                    Image(systemName: forward ? "arrowtriangle.forward.fill" : "arrowtriangle.backward.fill")
-                        .opacity(lit == (forward ? i : 2 - i) ? 1 : 0.4)
-                }
-            }
-            .font(.footnote)
-        } animation: { _ in .easeOut(duration: 0.09) }
     }
 }

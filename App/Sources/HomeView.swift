@@ -89,6 +89,10 @@ struct HomeView: View {
         for h in shows.history.prefix(10) {
             _ = try? await shows.loadDetails(h.show)
         }
+        // The show at the front of Continue Watching is the likeliest next play; have it ready.
+        if let first = shows.continueWatching.first, let d = shows.details[first.entry.show.id] {
+            shows.warm(d)
+        }
     }
 
     @ViewBuilder

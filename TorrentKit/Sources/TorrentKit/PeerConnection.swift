@@ -1,4 +1,9 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 
 struct BlockRequest: Hashable {
     let piece: Int
@@ -8,173 +13,298 @@ struct BlockRequest: Hashable {
 
 let blockSize = 16 * 1024
 
-/// One connection to a remote peer, driven by its own thread.
-/// State marked "torrent lock" is only touched while holding `Torrent.lock`.
-final class PeerConnection {
+/// An outstanding request: when it was sent, when it should arrive, and how urgent it was.
+struct PendingRequest {
+    let at: TimeInterval
+    let eta: TimeInterval
+    var priority: Int
+    /// The peer's downloaded byte count when this was requested (diagnostics: requests are answered in order).
+    var deliveredBefore: Int64 = 0
+    /// Requests of this peer outstanding when this one was sent.
+    var queuedAhead = 0
+}
+
+/// What the scheduler wants sent to a peer.
+struct PeerActions {
+    var sendInterested = false
+    var requests: [BlockRequest] = []
+    var cancels: [BlockRequest] = []
+    var metadataRequests: [(Int, Int)] = []
+    var disconnectReason: String?
+}
+
+/// One connection to a remote peer: a non-blocking socket driven by the client's event loop.
+/// I/O state is touched only on the loop thread; state marked "torrent lock" only while holding `Torrent.lock`.
+final class PeerConnection: LoopHandler {
+    enum Phase { case idle, connecting, handshaking, active, closed }
+
     let address: PeerAddress
     private weak var torrent: Torrent?
-    private var socket: TCPSocket?
-    private var buffer = Data()
+    private(set) var fd: Int32 = -1
+    private(set) var phase = Phase.idle
+
+    // loop thread
+    private var inbuf = [UInt8](repeating: 0, count: 64 * 1024)
+    private var inLen = 0
+    private var outbuf: [UInt8] = []
+    private var outStart = 0
+    private(set) var lastSendAt = Date.timeIntervalSinceReferenceDate
 
     // torrent lock
     var peerChoking = true
     var amInterested = false
     var bitfield: [Bool] = []
     var rawBitfield: Data?
+    var pendingHaveAll = false
     var pendingHaves: [Int] = []
-    var pending = Set<BlockRequest>()
-    var lastBlockAt = Date()
+    var pending: [BlockRequest: PendingRequest] = [:]
+    /// Requests we cancelled and the peer hasn't answered yet (with the fast extension it answers each with the
+    /// block or a reject). Not re-requested from this peer meanwhile: libtorrent ignores a request that duplicates one
+    /// still queued, and the reject for the cancel would otherwise be taken for a reject of the new request.
+    /// Also holds requests the peer rejected, so they go to other peers for a while.
+    var cancelled: [BlockRequest: TimeInterval] = [:]
+    var lastBlockAt = Date.timeIntervalSinceReferenceDate
     var downloadedBytes: Int64 = 0
-    /// Recent peak download rate from this peer in bytes/s, decaying while it is slow (updated by the torrent's tick).
-    var capacity: Double = 0
-    var bytesAtLastTick: Int64 = 0
+    /// Recent peak download rate from this peer in bytes/s, decaying while it is slow.
+    var rate: Double = 0
+    var bytesAtLastSample: Int64 = 0
+    /// Connect round trip, a floor for how soon a request can be answered.
+    var rtt: TimeInterval = 0.3
     var supportsExtensions = false
+    var supportsFast = false
     var utMetadataID: Int?
     var utPexID: Int?
+    var maxRequests = 250
+    var allowedFast = Set<Int>()
     var metadataRequestedAt: [Int: Date] = [:]
     var closed = false
+    var snubbed = false
     var clientName = ""
-
-    private var lastSend = Date()
-    private let pipelineDepth = 48
+    var startedAt = Date.timeIntervalSinceReferenceDate
+    var connectedAt: TimeInterval?
+    var firstUnchokeAt: TimeInterval?
+    var chokedSince = Date.timeIntervalSinceReferenceDate
+    var hashFailures = 0
 
     init(address: PeerAddress, torrent: Torrent) {
         self.address = address
         self.torrent = torrent
     }
 
-    func start() {
-        let t = Thread { [self] in self.run() }
-        t.name = "peer \(address)"
-        t.stackSize = 256 * 1024
-        t.start()
-    }
+    var wantsWrite: Bool { phase == .connecting || outStart < outbuf.count }
+    var isActive: Bool { phase == .active }
 
-    func close() {
-        socket?.close()
-    }
+    func has(_ piece: Int) -> Bool { piece >= 0 && piece < bitfield.count && bitfield[piece] }
 
-    // MARK: main loop
+    // MARK: lifecycle (loop thread)
 
-    private func run() {
-        defer {
-            socket?.close()
-            torrent?.peerDisconnected(self)
-        }
-        guard let torrent = torrent else { return }
+    /// Starts a non-blocking connect; the loop reports completion as writability.
+    func startConnect(loop: EventLoop) {
+        guard phase == .idle else { return }
+        startedAt = Date.timeIntervalSinceReferenceDate
         do {
-            // Reachable peers answer within a second or two; most tracker entries never do.
-            let sock = try TCPSocket.connect(to: address, timeout: 4)
-            socket = sock
-            sock.setSendTimeout(30)
-            sock.setReceiveTimeout(4)
-            try handshake(torrent: torrent)
-            // Short, so new priorities (a seek) reach idle peers quickly.
-            sock.setReceiveTimeout(0.2)
-            guard torrent.peerConnected(self) else { return }
-            if supportsExtensions { try sendExtendedHandshake(torrent: torrent) }
-            if let bf = torrent.ourBitfieldMessage() { try send(bf) }
-
-            while true {
-                if torrent.isStopped || closed { return }
-                if let data = try sock.receive() {
-                    buffer.append(data)
-                    try processBuffer(torrent: torrent)
-                }
-                try housekeeping(torrent: torrent)
-            }
+            fd = try Net.startConnect(to: address)
+            phase = .connecting
+            loop.add(self)
         } catch {
-            log("peer \(address) closed: \(error)")
+            close(reason: "\(error)")
         }
     }
 
-    private func handshake(torrent: Torrent) throws {
-        var hs = Data([19])
+    /// Closes the socket; the torrent forgets the peer. Safe to call more than once.
+    func close(reason: String) {
+        guard phase != .closed else { return }
+        phase = .closed
+        if fd >= 0 {
+            _ = Glue.close(fd)
+            fd = -1
+        }
+        outbuf = []
+        log("peer \(address) closed: \(reason)")
+        torrent?.peerDisconnected(self)
+    }
+
+    func handleEvents(_ revents: Int16) {
+        if phase == .connecting {
+            if revents & Int16(POLLOUT | POLLERR | POLLHUP) != 0 { finishConnect() }
+            return
+        }
+        if revents & Int16(POLLIN | POLLHUP | POLLERR) != 0 { readAvailable() }
+        if phase != .closed && revents & Int16(POLLOUT) != 0 { flush() }
+    }
+
+    private func finishConnect() {
+        var err: Int32 = 0
+        var len = socklen_t(MemoryLayout<Int32>.size)
+        getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len)
+        guard err == 0 else { close(reason: "connect: \(String(cString: strerror(err)))"); return }
+        guard let torrent = torrent else { close(reason: "torrent gone"); return }
+        rtt = max(0.02, Date.timeIntervalSinceReferenceDate - startedAt)
+        phase = .handshaking
+        var hs = [UInt8]()
+        hs.reserveCapacity(68)
+        hs.append(19)
         hs.append(contentsOf: Array("BitTorrent protocol".utf8))
         var reserved = [UInt8](repeating: 0, count: 8)
         reserved[5] |= 0x10 // extension protocol (BEP 10)
+        reserved[7] |= 0x04 // fast extension (BEP 6)
         hs.append(contentsOf: reserved)
-        hs.append(torrent.infoHash)
-        hs.append(torrent.peerID)
-        try socket!.send(hs)
-        let resp = try socket!.receiveExactly(68, deadline: Date().addingTimeInterval(8))
-        guard resp[resp.startIndex] == 19,
-              resp.subdata(in: resp.startIndex + 1 ..< resp.startIndex + 20) == Data("BitTorrent protocol".utf8) else {
-            throw TorrentError.io("bad handshake")
-        }
-        guard resp.subdata(in: resp.startIndex + 28 ..< resp.startIndex + 48) == torrent.infoHash else {
-            throw TorrentError.io("info-hash mismatch")
-        }
-        supportsExtensions = resp[resp.startIndex + 25] & 0x10 != 0
-        let peerID = resp.subdata(in: resp.startIndex + 48 ..< resp.startIndex + 68)
-        if peerID == torrent.peerID { throw TorrentError.io("connected to self") }
-        clientName = String(decoding: peerID.prefix(8), as: UTF8.self)
+        hs.append(contentsOf: torrent.infoHash)
+        hs.append(contentsOf: torrent.peerID)
+        enqueue(hs)
+        flush()
     }
 
-    private func processBuffer(torrent: Torrent) throws {
-        var consumed = 0
-        let bytes = buffer
-        let base = bytes.startIndex
-        while bytes.count - consumed >= 4 {
-            let len = Int(bytes.readUInt32BE(at: consumed))
-            guard len <= 4 * 1024 * 1024 else { throw TorrentError.io("message too large (\(len))") }
-            guard bytes.count - consumed - 4 >= len else { break }
-            if len > 0 {
-                let id = bytes[base + consumed + 4]
-                let payload = bytes.subdata(in: base + consumed + 5 ..< base + consumed + 4 + len)
-                try handleMessage(id: id, payload: payload, torrent: torrent)
+    // MARK: reading
+
+    private func readAvailable() {
+        var total = 0
+        while phase != .closed {
+            if inbuf.count - inLen < 32 * 1024 { inbuf.append(contentsOf: [UInt8](repeating: 0, count: max(64 * 1024, inbuf.count))) }
+            let space = inbuf.count - inLen
+            let n = inbuf.withUnsafeMutableBytes { raw in Glue.recv(fd, raw.baseAddress! + inLen, space, 0) }
+            if n > 0 {
+                inLen += n
+                total += n
+                // Bounded per wake-up so one fast peer can't starve the rest.
+                if total >= 1 << 20 { break }
+                continue
             }
-            consumed += 4 + len
+            if n == 0 { close(reason: "eof"); return }
+            if errno == EINTR { continue }
+            if errno == EAGAIN || errno == EWOULDBLOCK { break }
+            close(reason: "recv: \(Net.lastError)")
+            return
         }
-        if consumed > 0 { buffer = bytes.subdata(in: base + consumed ..< bytes.endIndex) }
+        if total > 0 { processInput() }
     }
 
-    private func handleMessage(id: UInt8, payload: Data, torrent: Torrent) throws {
+    private func processInput() {
+        guard let torrent = torrent else { close(reason: "torrent gone"); return }
+        var consumed = 0
+        if phase == .handshaking {
+            guard inLen >= 68 else { return }
+            let hs = Data(inbuf[0..<68])
+            consumed = 68
+            guard hs[0] == 19, hs[1..<20] == Data("BitTorrent protocol".utf8) else { close(reason: "bad handshake"); return }
+            guard hs[28..<48] == torrent.infoHash else { close(reason: "info-hash mismatch"); return }
+            let peerID = hs.subdata(in: 48..<68)
+            if peerID == torrent.peerID { close(reason: "connected to self"); return }
+            supportsExtensions = hs[25] & 0x10 != 0
+            supportsFast = hs[27] & 0x04 != 0
+            clientName = String(decoding: peerID.prefix(8), as: UTF8.self)
+            guard torrent.peerConnected(self) else { close(reason: "not accepted"); return }
+            phase = .active
+            if supportsExtensions { sendExtendedHandshake(torrent: torrent) }
+            if let bf = torrent.ourBitfieldMessage() { enqueue([UInt8](bf)) }
+            else if supportsFast { enqueueMessage([0x0F]) } // have_none
+        }
+        guard phase == .active else { return }
+
+        var error: String?
+        torrent.lock.lock()
+        inbuf.withUnsafeBytes { raw in
+            let base = raw.baseAddress!
+            while inLen - consumed >= 4 && error == nil && phase == .active {
+                let p = base + consumed
+                let len = Int(UInt32(p.load(fromByteOffset: 0, as: UInt8.self)) << 24 | UInt32(p.load(fromByteOffset: 1, as: UInt8.self)) << 16
+                    | UInt32(p.load(fromByteOffset: 2, as: UInt8.self)) << 8 | UInt32(p.load(fromByteOffset: 3, as: UInt8.self)))
+                guard len <= 2 * 1024 * 1024 else { error = "message too large (\(len))"; break }
+                guard inLen - consumed - 4 >= len else { break }
+                if len > 0 {
+                    let id = p.load(fromByteOffset: 4, as: UInt8.self)
+                    let payload = UnsafeRawBufferPointer(start: p + 5, count: len - 1)
+                    error = handleMessageLocked(id: id, payload: payload, torrent: torrent)
+                }
+                consumed += 4 + len
+            }
+        }
+        if error == nil && phase == .active {
+            let actions = torrent.nextActionsLocked(for: self)
+            apply(actions)
+        }
+        torrent.lock.unlock()
+        if consumed > 0 {
+            let remaining = inLen - consumed
+            if remaining > 0 {
+                inbuf.withUnsafeMutableBytes { raw in _ = memmove(raw.baseAddress!, raw.baseAddress! + consumed, remaining) }
+            }
+            inLen = remaining
+            if inbuf.count > 256 * 1024 && inLen < 64 * 1024 { inbuf = Array(inbuf[0..<max(64 * 1024, inLen)]) }
+        }
+        if let e = error { close(reason: e); return }
+        torrent.flushPeersAfterEvent()
+        flush()
+    }
+
+    private static func u32(_ b: UnsafeRawBufferPointer, _ at: Int) -> Int {
+        Int(UInt32(b[at]) << 24 | UInt32(b[at + 1]) << 16 | UInt32(b[at + 2]) << 8 | UInt32(b[at + 3]))
+    }
+
+    /// Returns a reason to disconnect, if any. Torrent lock held.
+    private func handleMessageLocked(id: UInt8, payload: UnsafeRawBufferPointer, torrent: Torrent) -> String? {
         switch id {
-        case 0: torrent.peerChoked(self)
-        case 1: torrent.peerUnchoked(self)
-        case 2, 3: break // we never upload pieces, so their interest doesn't matter
+        case 0: torrent.peerChokedLocked(self)
+        case 1: torrent.peerUnchokedLocked(self)
+        case 2, 3: break // we don't upload, so their interest doesn't matter
         case 4:
-            guard payload.count >= 4 else { return }
-            torrent.peerHave(self, piece: Int(payload.readUInt32BE(at: 0)))
+            guard payload.count >= 4 else { return nil }
+            torrent.peerHaveLocked(self, piece: Self.u32(payload, 0))
         case 5:
-            torrent.peerBitfield(self, data: payload)
-        case 6, 8: break // requests/cancels: we don't serve pieces
+            torrent.peerBitfieldLocked(self, data: Data(payload))
+        case 6:
+            // We never unchoke, so requests are refused; with the fast extension that has to be said explicitly.
+            if supportsFast && payload.count >= 12 {
+                var m: [UInt8] = [0x10]
+                m.append(contentsOf: Array(payload[0..<12]))
+                enqueueMessage(m)
+            }
         case 7:
-            guard payload.count >= 8 else { return }
-            let piece = Int(payload.readUInt32BE(at: 0))
-            let offset = Int(payload.readUInt32BE(at: 4))
-            let block = payload.subdata(in: payload.startIndex + 8 ..< payload.endIndex)
-            torrent.blockReceived(self, piece: piece, offset: offset, data: block)
+            guard payload.count >= 8 else { return nil }
+            let piece = Self.u32(payload, 0), offset = Self.u32(payload, 4)
+            torrent.blockReceivedLocked(self, piece: piece, offset: offset,
+                                        data: UnsafeRawBufferPointer(rebasing: payload[8...]))
+        case 8: break
+        case 0x0D: break // suggest piece
+        case 0x0E: torrent.peerHaveAllLocked(self)
+        case 0x0F: torrent.peerBitfieldLocked(self, data: Data())
+        case 0x10:
+            guard payload.count >= 12 else { return nil }
+            torrent.requestRejectedLocked(self, BlockRequest(piece: Self.u32(payload, 0), offset: Self.u32(payload, 4),
+                                                             length: Self.u32(payload, 8)))
+        case 0x11:
+            guard payload.count >= 4 else { return nil }
+            allowedFast.insert(Self.u32(payload, 0))
         case 20:
-            guard let ext = payload.first else { return }
-            try handleExtended(ext, payload: payload.dropFirst(), torrent: torrent)
+            guard let ext = payload.first else { return nil }
+            handleExtendedLocked(ext, payload: Data(payload.dropFirst()), torrent: torrent)
         default: break
         }
+        return nil
     }
 
-    // MARK: extension protocol
+    // MARK: extension protocol (BEP 10)
 
     static let ourUtMetadataID = 1
     static let ourUtPexID = 2
 
-    private func sendExtendedHandshake(torrent: Torrent) throws {
+    private func sendExtendedHandshake(torrent: Torrent) {
         var d: [String: BValue] = [
             "m": .dict(["ut_metadata": .int(Int64(Self.ourUtMetadataID)), "ut_pex": .int(Int64(Self.ourUtPexID))]),
-            "v": .str("TorrentStream 1.0"),
+            "v": .str("TorrentStream 2.0"),
             "reqq": .int(500),
         ]
         if let size = torrent.metadataSizeIfKnown { d["metadata_size"] = .int(Int64(size)) }
-        try sendExtended(id: 0, payload: BValue.dict(d).encoded())
+        sendExtended(id: 0, payload: BValue.dict(d).encoded())
     }
 
-    func sendExtended(id: Int, payload: Data) throws {
-        var msg = Data([20, UInt8(id)])
-        msg.append(payload)
-        try send(message: msg)
+    func sendExtended(id: Int, payload: Data) {
+        var m: [UInt8] = [20, UInt8(id)]
+        m.append(contentsOf: payload)
+        enqueueMessage(m)
     }
 
-    private func handleExtended(_ ext: UInt8, payload: Data, torrent: Torrent) throws {
+    private func handleExtendedLocked(_ ext: UInt8, payload: Data, torrent: Torrent) {
         if ext == 0 {
             guard let hs = try? BDecoder.decode(payload) else { return }
             if let m = hs["m"] {
@@ -182,72 +312,78 @@ final class PeerConnection {
                 if let v = m["ut_pex"]?.int, v > 0 { utPexID = Int(v) }
             }
             if let v = hs["v"]?.string { clientName = v }
-            if let size = hs["metadata_size"]?.int { torrent.peerReportedMetadataSize(self, size: Int(size)) }
+            if let q = hs["reqq"]?.int, q > 0 { maxRequests = max(8, min(500, Int(q))) }
+            if let size = hs["metadata_size"]?.int { torrent.peerReportedMetadataSizeLocked(self, size: Int(size)) }
         } else if Int(ext) == Self.ourUtMetadataID {
             var dec = BDecoder(payload)
             guard let header = try? dec.decode(), let type = header["msg_type"]?.int, let piece = header["piece"]?.int else { return }
             switch type {
-            case 0: // request: serve metadata if we have it
-                if let id = utMetadataID, let reply = torrent.metadataPieceReply(Int(piece)) { try sendExtended(id: id, payload: reply) }
+            case 0:
+                if let id = utMetadataID, let reply = torrent.metadataPieceReplyLocked(Int(piece)) { sendExtended(id: id, payload: reply) }
             case 1:
                 let data = payload.subdata(in: payload.startIndex + dec.position ..< payload.endIndex)
-                torrent.metadataPieceReceived(self, piece: Int(piece), data: data)
+                torrent.metadataPieceReceivedLocked(self, piece: Int(piece), data: data)
             default:
-                torrent.metadataPieceRejected(self, piece: Int(piece))
+                torrent.metadataPieceRejectedLocked(self, piece: Int(piece))
             }
         } else if Int(ext) == Self.ourUtPexID {
             guard let msg = try? BDecoder.decode(payload), let added = msg["added"]?.data else { return }
-            torrent.addPeers(PeerAddress.parseCompactList(added), source: "pex")
+            torrent.queuePexPeers(PeerAddress.parseCompactList(added))
         }
     }
 
-    // MARK: sending
+    // MARK: writing (loop thread)
 
-    private func housekeeping(torrent: Torrent) throws {
-        let actions = torrent.nextActions(for: self, pipelineDepth: pipelineDepth)
-        if let err = actions.disconnectReason { throw TorrentError.io(err) }
-        var out = Data()
-        if actions.sendInterested {
-            out.appendBE(UInt32(1)); out.append(2)
+    /// Queues the scheduler's messages. Torrent lock held (or the peer isn't shared yet).
+    func apply(_ actions: PeerActions) {
+        if let reason = actions.disconnectReason {
+            torrent?.deferClose(self, reason: reason)
+            return
         }
-        for r in actions.cancels {
-            out.appendBE(UInt32(13)); out.append(8)
-            out.appendBE(UInt32(r.piece)); out.appendBE(UInt32(r.offset)); out.appendBE(UInt32(r.length))
-        }
-        for r in actions.requests {
-            out.appendBE(UInt32(13)); out.append(6)
-            out.appendBE(UInt32(r.piece)); out.appendBE(UInt32(r.offset)); out.appendBE(UInt32(r.length))
-        }
+        guard phase == .active else { return }
+        var out = [UInt8]()
+        out.reserveCapacity(5 + 17 * (actions.requests.count + actions.cancels.count))
+        func be32(_ v: Int) { out.append(UInt8(truncatingIfNeeded: v >> 24)); out.append(UInt8(truncatingIfNeeded: v >> 16)); out.append(UInt8(truncatingIfNeeded: v >> 8)); out.append(UInt8(truncatingIfNeeded: v)) }
+        if actions.sendInterested { be32(1); out.append(2) }
+        for r in actions.cancels { be32(13); out.append(8); be32(r.piece); be32(r.offset); be32(r.length) }
+        for r in actions.requests { be32(13); out.append(6); be32(r.piece); be32(r.offset); be32(r.length) }
         for (piece, id) in actions.metadataRequests {
             let p = BValue.dict(["msg_type": .int(0), "piece": .int(Int64(piece))]).encoded()
-            out.appendBE(UInt32(2 + p.count)); out.append(20); out.append(UInt8(id)); out.append(p)
+            be32(2 + p.count); out.append(20); out.append(UInt8(id)); out.append(contentsOf: p)
         }
-        if out.isEmpty && Date().timeIntervalSince(lastSend) > 90 {
-            out.appendBE(UInt32(0)) // keep-alive
+        if !out.isEmpty { enqueue(out) }
+    }
+
+    func enqueueCancel(_ r: BlockRequest) {
+        var m: [UInt8] = [8]
+        for v in [r.piece, r.offset, r.length] { m.append(contentsOf: [UInt8(truncatingIfNeeded: v >> 24), UInt8(truncatingIfNeeded: v >> 16), UInt8(truncatingIfNeeded: v >> 8), UInt8(truncatingIfNeeded: v)]) }
+        enqueueMessage(m)
+    }
+
+    func enqueueKeepAlive() { enqueue([0, 0, 0, 0]) }
+
+    private func enqueueMessage(_ body: [UInt8]) {
+        let n = body.count
+        enqueue([UInt8(truncatingIfNeeded: n >> 24), UInt8(truncatingIfNeeded: n >> 16), UInt8(truncatingIfNeeded: n >> 8), UInt8(truncatingIfNeeded: n)] + body)
+    }
+
+    private func enqueue(_ bytes: [UInt8]) {
+        guard phase != .closed else { return }
+        if outStart > 0 && outStart == outbuf.count { outbuf.removeAll(keepingCapacity: true); outStart = 0 }
+        outbuf.append(contentsOf: bytes)
+    }
+
+    /// Writes as much queued output as the socket takes.
+    func flush() {
+        guard fd >= 0, phase == .handshaking || phase == .active else { return }
+        while outStart < outbuf.count {
+            let n = outbuf.withUnsafeBytes { raw in Glue.send(fd, raw.baseAddress! + outStart, outbuf.count - outStart, Net.sendFlags) }
+            if n > 0 { outStart += n; lastSendAt = Date.timeIntervalSinceReferenceDate; continue }
+            if n < 0 && errno == EINTR { continue }
+            if n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) { break }
+            close(reason: "send: \(Net.lastError)")
+            return
         }
-        if !out.isEmpty { try socket?.send(out); lastSend = Date() }
+        if outStart == outbuf.count { outbuf.removeAll(keepingCapacity: outbuf.count < 64 * 1024); outStart = 0 }
     }
-
-    /// Sends a complete message body (without length prefix).
-    func send(message: Data) throws {
-        var d = Data()
-        d.appendBE(UInt32(message.count))
-        d.append(message)
-        try socket?.send(d)
-        lastSend = Date()
-    }
-
-    /// Sends a pre-framed message.
-    func send(_ framed: Data) throws {
-        try socket?.send(framed)
-        lastSend = Date()
-    }
-}
-
-struct PeerActions {
-    var sendInterested = false
-    var requests: [BlockRequest] = []
-    var cancels: [BlockRequest] = []
-    var metadataRequests: [(Int, Int)] = []
-    var disconnectReason: String?
 }

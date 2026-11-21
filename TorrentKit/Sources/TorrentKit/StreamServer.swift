@@ -163,21 +163,26 @@ final class StreamServer {
 
         let readerID = UUID()
         defer { torrent.removeReader(readerID) }
+        let began = Date()
         var pos = start
-        let chunk: Int64 = 256 * 1024
-        let pieceLength = Int64(info.pieceLength)
+        defer { log("http \(start)-\(end) sent \(pos - start) in " + String(format: "%.2fs", Date().timeIntervalSince(began))) }
         while pos <= end {
-            // Send each piece as soon as it is verified rather than waiting for a whole chunk.
-            let pieceEnd = ((file.offset + pos) / pieceLength + 1) * pieceLength - file.offset
-            let n = Int(min(chunk, end - pos + 1, pieceEnd - pos))
-            // Wait for the bytes, checking often whether the player gave up on this request (it does on every
-            // seek), so a stale reader doesn't keep its priority.
-            while try !torrent.waitForData(fileIndex: fileIndex, offset: pos, length: n, readerID: readerID, timeout: 0.25) {
+            // Send whatever has arrived as soon as it lands, block by block (pieces needn't be complete or verified):
+            // with 16 MB pieces, waiting for whole pieces costs seconds after every seek. Wake often to notice the
+            // player giving up on this request (it does on every seek), so a stale reader doesn't keep its priority.
+            var n: Int64 = 0
+            var waits = 0
+            while true {
+                n = try torrent.waitForAvailable(fileIndex: fileIndex, offset: pos, maxLength: min(end - pos + 1, 1 << 20),
+                                                 readerID: readerID, timeout: 0.25)
+                if n > 0 { break }
                 if sock.isPeerClosed() { return false }
+                waits += 1
+                if waits % 4 == 0 && TorrentLog.enabled { log("http stalled \(waits / 4)s at \(pos): " + torrent.blockDebugDescription(fileIndex: fileIndex, offset: pos)) }
             }
-            let data = try torrent.readData(fileIndex: fileIndex, offset: pos, length: n)
+            let data = try torrent.readData(fileIndex: fileIndex, offset: pos, length: Int(n))
             try sock.send(data)
-            pos += Int64(n)
+            pos += n
         }
         return true
     }

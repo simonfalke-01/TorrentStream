@@ -23,6 +23,10 @@ public final class TorrentClient {
     private let lock = NSLock()
     private var torrentsByHash: [String: Torrent] = [:]
     private var order: [String] = []
+    /// Torrents whose player is waiting on data; the others hold back so the phone's bandwidth goes there.
+    private var starvingTorrents = Set<ObjectIdentifier>()
+    /// Single network thread shared by every torrent's peer connections.
+    let loop = EventLoop()
 
     public init(downloadDirectory: URL, useDHT: Bool = true, extraTrackers: [String] = TorrentClient.defaultTrackers,
                 streamingPort: UInt16 = 0) {
@@ -40,6 +44,8 @@ public final class TorrentClient {
         dht?.start()
         try? server.ensureRunning()
     }
+
+    deinit { loop.stop() }
 
     public var torrents: [Torrent] {
         lock.lock(); defer { lock.unlock() }
@@ -81,6 +87,7 @@ public final class TorrentClient {
         torrentsByHash[torrent.infoHashHex] = nil
         order.removeAll { $0 == torrent.infoHashHex }
         lock.unlock()
+        setStarving(torrent, false)
         torrent.stop()
         if deleteData { try? FileManager.default.removeItem(at: torrent.directory) }
     }
@@ -104,6 +111,20 @@ public final class TorrentClient {
         torrents.forEach { $0.stop() }
         dht?.stop()
         server.stop()
+        // Let the torrents' posted cleanup run first.
+        loop.post { [loop] in loop.stop() }
+    }
+
+    func setStarving(_ torrent: Torrent, _ starving: Bool) {
+        lock.lock(); defer { lock.unlock() }
+        if starving { starvingTorrents.insert(ObjectIdentifier(torrent)) } else { starvingTorrents.remove(ObjectIdentifier(torrent)) }
+    }
+
+    /// Whether a torrent other than `torrent` has a player waiting on data.
+    func otherTorrentStarving(excluding torrent: Torrent) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        let me = ObjectIdentifier(torrent)
+        return starvingTorrents.contains { $0 != me }
     }
 }
 

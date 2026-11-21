@@ -275,7 +275,14 @@ final class AppModel: ObservableObject {
             if t.isPaused { t.resume() }
             return t
         }
-        if let url = torrentURL, let data = try? await Self.fetch(url) {
+        let fetchStart = Date()
+        var fetched: Data?
+        if let url = torrentURL {
+            fetched = try? await Self.fetch(url)
+            PlaybackTrace.shared.mark(String(format: "torrent file %@ in %.2fs", fetched == nil ? "failed" : "fetched",
+                                             Date().timeIntervalSince(fetchStart)))
+        }
+        if let data = fetched {
             if let existing = (try? TorrentDescriptor.parse(torrentData: data)).flatMap({ client.torrent(infoHashHex: $0.infoHashHex) }) {
                 if existing.isPaused { existing.resume() }
                 return existing
@@ -287,6 +294,7 @@ final class AppModel: ObservableObject {
             }
         }
         if let magnet, let t = try? client.add(magnet: magnet) {
+            PlaybackTrace.shared.mark("added by magnet; metadata comes from peers")
             didAddSource(t)
             return t
         }
@@ -513,6 +521,8 @@ final class AppModel: ObservableObject {
     /// Open players per title; those titles are never evicted.
     private var playing: [String: Int] = [:]
 
+    func isPlaying(_ torrent: Torrent) -> Bool { playing[torrent.infoHashHex] != nil }
+
     /// Keeps cached video within budget by dropping the data of the titles watched longest ago, the most recent
     /// one last. Titles stay in My List with their episodes and positions; they stream again when played.
     func trimCache() {
@@ -641,25 +651,22 @@ final class AppModel: ObservableObject {
         for t in client.torrents where sourceHashes.contains(t.infoHashHex) && t !== torrent && playing[t.infoHashHex] == nil {
             if !t.isPaused { t.pause() }
         }
-        // Show pages find the next episode themselves; it may be in another release.
-        guard request.show == nil else { return }
-        if let d = knownDuration(torrent: torrent, file: request.file) {
-            durationKnown(request, seconds: d)
-        } else if let next = nextPlayable(after: request.file, in: torrent) {
-            torrent.prefetch(fileIndex: next.index, bytes: AppModel.defaultPrefetch)
-        }
+        if let d = knownDuration(torrent: torrent, file: request.file) { durationKnown(request, seconds: d) }
     }
 
-    /// Sizes the readahead and the next episode's prefetch from the video's bitrate.
+    /// Sizes the readahead from the video's bitrate.
     func durationKnown(_ request: PlaybackRequest, seconds: Double) {
         guard seconds.isFinite, seconds > 60 else { return }
         let bytesPerSecond = Double(request.file.length) / seconds
-        func clamp(_ v: Double, _ lo: Int64, _ hi: Int64) -> Int64 { min(hi, max(lo, Int64(v))) }
-        let torrent = request.torrent
-        torrent.setReadahead(clamp(bytesPerSecond * 600, 64 << 20, 1 << 30), fileIndex: request.file.index)
-        if request.show == nil, let next = nextPlayable(after: request.file, in: torrent) {
-            torrent.prefetch(fileIndex: next.index, bytes: clamp(bytesPerSecond * 180, 32 << 20, 200 << 20))
-        }
+        request.torrent.setReadahead(min(1 << 30, max(64 << 20, Int64(bytesPerSecond * 600))), fileIndex: request.file.index)
+    }
+
+    /// Once playback has run smoothly for a while, loads the start of the next video in the same torrent. Not
+    /// earlier: until then every peer request should go to what's on screen. Show pages find the next episode
+    /// themselves, since it may be in another release.
+    func playbackSteady(_ request: PlaybackRequest, seconds: Double) {
+        guard request.show == nil, let next = nextPlayable(after: request.file, in: request.torrent) else { return }
+        request.torrent.prefetch(fileIndex: next.index, bytes: AppModel.prefetchBytes(fileLength: request.file.length, seconds: seconds))
     }
 
     nonisolated static let defaultPrefetch: Int64 = 100 << 20

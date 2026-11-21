@@ -92,6 +92,7 @@ struct ShowView: View {
         do {
             let d = try await shows.loadDetails(show, force: force)
             loadError = nil
+            shows.warm(d)
             // Opened from a later season: start there.
             if seasonID == nil, d.season(id: show.id) != nil, show.id != d.show.id { seasonID = show.id }
         } catch {
@@ -817,15 +818,23 @@ struct PlaybackLauncher: View {
     private func start() async {
         failure = nil
         status = "Loading"
+        let trace = PlaybackTrace.shared
+        trace.begin("Play \(launch.show.title)" + (launch.episode.map { " episode \($0)" } ?? ""))
         do {
             let d = try await shows.loadDetails(launch.show)
+            trace.mark("details loaded")
             let t = try pick(d)
             target = t
-            let req = try await shows.request(d, t.season, t.episode, source: chosen ?? launch.source, resumeAt: nil) { status = $0 }
+            let req = try await shows.request(d, t.season, t.episode, source: chosen ?? launch.source, resumeAt: nil) {
+                status = $0
+                trace.mark("status: \($0)")
+            }
             guard !Task.isCancelled else { return }
+            trace.mark("player opening")
             request = req
         } catch {
             guard !Task.isCancelled else { return }
+            trace.mark("failed: \(error.localizedDescription)")
             failure = Self.message(for: error)
         }
     }

@@ -126,6 +126,36 @@ enum Net {
 
     static var lastError: String { String(cString: strerror(errno)) }
 
+    static let sendFlags = SEND_FLAGS
+
+    static func setNonBlocking(_ fd: Int32) {
+        let flags = fcntl(fd, F_GETFL, 0)
+        _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+    }
+
+    /// Creates a non-blocking TCP socket and starts connecting it. Completion (or failure) shows up as
+    /// writability; read SO_ERROR then.
+    static func startConnect(to address: PeerAddress) throws -> Int32 {
+        let fd = socket(AF_INET, SOCK_STREAM_VALUE, 0)
+        guard fd >= 0 else { throw SocketError.failed("socket: \(Net.lastError)") }
+        setNoSigPipe(fd)
+        setNonBlocking(fd)
+        var one: Int32 = 1
+        setsockopt(fd, Int32(IPPROTO_TCP), TCP_NODELAY, &one, socklen_t(MemoryLayout<Int32>.size))
+        var sa = address.sockaddr
+        let rc = withUnsafePointer(to: &sa) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Glue.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        if rc != 0 && errno != EINPROGRESS {
+            let e = Net.lastError
+            _ = Glue.close(fd)
+            throw SocketError.failed("connect: \(e)")
+        }
+        return fd
+    }
+
     static func isTimeoutErrno(_ e: Int32) -> Bool { e == EAGAIN || e == EWOULDBLOCK || e == EINTR }
 }
 
@@ -332,6 +362,8 @@ enum Glue {
     static let accept = Darwin.accept
     static let sendto = Darwin.sendto
     static let recvfrom = Darwin.recvfrom
+    static let read = Darwin.read
+    static let write = Darwin.write
     #else
     static let connect = Glibc.connect
     static let send = Glibc.send
@@ -342,5 +374,7 @@ enum Glue {
     static let accept = Glibc.accept
     static let sendto = Glibc.sendto
     static let recvfrom = Glibc.recvfrom
+    static let read = Glibc.read
+    static let write = Glibc.write
     #endif
 }

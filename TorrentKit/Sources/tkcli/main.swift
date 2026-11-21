@@ -56,6 +56,8 @@ if args.contains("--serve") {
         let s = torrent.streamStatus(fileIndex: target.index)
         print(String(format: "  peers %d rate %.1f KB/s buffered %.1f MB file %.1f%%", s.connectedPeers, s.downloadRate / 1024,
                      Double(s.bufferedAhead) / 1e6, s.fileProgress * 100))
+        print("    " + torrent.swarmSummary)
+        fflush(stdout)
     }
 }
 

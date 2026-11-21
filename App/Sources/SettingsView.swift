@@ -108,6 +108,11 @@ struct SettingsView: View {
 
                 Section {
                     LabeledContent("Version", value: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "")
+                    ShareLink(item: PlaybackTrace.shared.flush()) {
+                        Text("Share Playback Log")
+                    }
+                } footer: {
+                    Text("The log times each step of starting and seeking, to explain a slow start.")
                 }
             }
             .navigationTitle("Settings")
