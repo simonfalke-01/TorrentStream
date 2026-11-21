@@ -34,6 +34,36 @@ final class DHT {
     private var bootstrapAddresses: [PeerAddress] = []
     private var running = false
     private var nextTxid: UInt16 = 0
+    /// Nodes that answered, kept across launches so lookups don't wait for DNS and the bootstrap routers.
+    private let stateFile: URL?
+    private var lastSave = Date()
+    /// Queries in flight per lookup, and how long one may go unanswered (most stale nodes never answer).
+    static let parallelQueries = 16
+    static let queryTimeout: TimeInterval = 1.5
+
+    init(stateFile: URL? = nil) {
+        self.stateFile = stateFile
+        if let f = stateFile, let d = try? Data(contentsOf: f) {
+            var i = d.startIndex
+            while i + 26 <= d.endIndex {
+                let id = d.subdata(in: i ..< i + 20)
+                if let a = PeerAddress(compact: d.subdata(in: i + 20 ..< i + 26)) { goodNodes.append(Node(id: id, address: a)) }
+                i += 26
+            }
+        }
+    }
+
+    /// Writes the nodes that answered recently (they are tried first next launch).
+    func save() {
+        guard let f = stateFile else { return }
+        lock.lock()
+        var d = Data()
+        for n in goodNodes.suffix(200) { d.append(n.id); d.append(n.address.compact) }
+        lastSave = Date()
+        lock.unlock()
+        guard !d.isEmpty else { return }
+        try? d.write(to: f, options: .atomic)
+    }
 
     func start() {
         lock.lock()
@@ -56,7 +86,10 @@ final class DHT {
         lookups.removeAll { $0.infoHash == infoHash }
         seed(l)
         lookups.append(l)
+        let started = socket != nil
         lock.unlock()
+        // Don't wait for the idle loop to wake up.
+        if started { pump() }
     }
 
     private func seed(_ l: Lookup) {
@@ -80,23 +113,39 @@ final class DHT {
     }
 
     private func run() {
-        do { socket = try UDPSocket() } catch { log("dht: socket failed \(error)"); return }
-        socket?.setReceiveTimeout(0.2)
-        var resolved: [PeerAddress] = []
-        for (h, p) in DHT.bootstrapHosts { resolved += Net.resolve(host: h, port: p) }
-        lock.lock()
-        bootstrapAddresses = resolved
-        for l in lookups { seed(l) }
-        lock.unlock()
-        log("dht: bootstrap nodes \(resolved.count)")
+        let sock: UDPSocket
+        do { sock = try UDPSocket() } catch { log("dht: socket failed \(error)"); return }
+        lock.lock(); socket = sock; lock.unlock()
+        // Short waits while lookups run (queries time out and get replaced), long ones otherwise: an idle node
+        // shouldn't wake the phone 20 times a second.
+        var busyTimeout = true
+        sock.setReceiveTimeout(0.05)
+        // Saved nodes are queried right away; the bootstrap routers join as their names resolve (in parallel: on a
+        // phone each lookup can take a few hundred milliseconds).
+        for (h, p) in DHT.bootstrapHosts {
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let resolved = Net.resolve(host: h, port: p)
+                guard let self, !resolved.isEmpty else { return }
+                self.lock.lock()
+                self.bootstrapAddresses += resolved
+                for l in self.lookups { self.seed(l) }
+                self.lock.unlock()
+            }
+        }
 
         while true {
             lock.lock()
             let isRunning = running
+            let saveDue = Date().timeIntervalSince(lastSave) > 120
             lock.unlock()
-            if !isRunning { return }
+            if !isRunning { save(); return }
+            if saveDue { save() }
             pump()
-            if let (data, from) = socket?.receive() { handle(data, from: from) }
+            lock.lock()
+            let busy = !lookups.isEmpty
+            lock.unlock()
+            if busy != busyTimeout { busyTimeout = busy; sock.setReceiveTimeout(busy ? 0.05 : 1) }
+            if let (data, from) = sock.receive() { handle(data, from: from) }
         }
     }
 
@@ -105,8 +154,8 @@ final class DHT {
         let now = Date()
         lock.lock()
         for l in lookups {
-            for (a, t) in l.inFlight where now.timeIntervalSince(t) > 3 { l.inFlight[a] = nil }
-            while l.inFlight.count < 8, !l.candidates.isEmpty, l.queried.count < 400 {
+            for (a, t) in l.inFlight where now.timeIntervalSince(t) > DHT.queryTimeout { l.inFlight[a] = nil }
+            while l.inFlight.count < DHT.parallelQueries, !l.candidates.isEmpty, l.queried.count < 400 {
                 let n = l.candidates.removeFirst()
                 if l.queried.contains(n.address) { continue }
                 l.queried.insert(n.address)

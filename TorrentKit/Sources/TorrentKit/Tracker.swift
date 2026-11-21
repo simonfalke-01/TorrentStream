@@ -88,18 +88,36 @@ enum TrackerClient {
 
     // MARK: UDP (BEP 15)
 
+    /// Tracker addresses and connection IDs, shared by every torrent: the next torrent (or a re-announce after the
+    /// app comes back) skips the DNS lookup and, within a minute, the connect round trip.
+    private static let udpLock = NSLock()
+    private static var resolved: [String: (PeerAddress, Date)] = [:]
+    private static var connectionIDs: [PeerAddress: (Data, Date)] = [:]
+
+    private static func udpAddress(host: String, port: UInt16) -> PeerAddress? {
+        let key = "\(host):\(port)"
+        udpLock.lock()
+        if let (a, at) = resolved[key], Date().timeIntervalSince(at) < 600 { udpLock.unlock(); return a }
+        udpLock.unlock()
+        guard let a = Net.resolve(host: host, port: port).first else { return nil }
+        udpLock.lock(); resolved[key] = (a, Date()); udpLock.unlock()
+        return a
+    }
+
     private static func announceUDP(url: String, request r: AnnounceRequest) throws -> AnnounceResponse {
         guard let comps = URLComponents(string: url), let host = comps.host, let port = comps.port else {
             throw TorrentError.io("bad udp tracker url")
         }
-        guard let addr = Net.resolve(host: host, port: UInt16(port)).first else { throw TorrentError.io("cannot resolve \(host)") }
+        guard let addr = udpAddress(host: host, port: UInt16(port)) else { throw TorrentError.io("cannot resolve \(host)") }
         let sock = try UDPSocket()
 
+        // Phones drop UDP now and then: the first retransmission comes after 1.5 s, not BEP 15's 15.
         func transact(_ packet: Data, expectAction: UInt32, txid: UInt32, attempts: Int) throws -> Data {
             for attempt in 0..<attempts {
-                sock.setReceiveTimeout(Double(3 + attempt * 3))
+                let wait = 1.5 + Double(attempt) * 3
+                sock.setReceiveTimeout(wait)
                 sock.send(packet, to: addr)
-                let deadline = Date().addingTimeInterval(Double(3 + attempt * 3))
+                let deadline = Date().addingTimeInterval(wait)
                 while Date() < deadline {
                     guard let (resp, _) = sock.receive() else { break }
                     guard resp.count >= 8, resp.readUInt32BE(at: 4) == txid else { continue }
@@ -113,34 +131,51 @@ enum TrackerClient {
             throw TorrentError.timeout
         }
 
-        var txid = UInt32.random(in: 0...UInt32.max)
-        var connect = Data()
-        connect.appendBE(UInt64(0x41727101980))
-        connect.appendBE(UInt32(0))
-        connect.appendBE(txid)
-        let connResp = try transact(connect, expectAction: 0, txid: txid, attempts: 2)
-        guard connResp.count >= 16 else { throw TorrentError.io("short connect response") }
-        let connID = connResp.subdata(in: connResp.startIndex + 8 ..< connResp.startIndex + 16)
+        func connect() throws -> Data {
+            let txid = UInt32.random(in: 0...UInt32.max)
+            var connect = Data()
+            connect.appendBE(UInt64(0x41727101980))
+            connect.appendBE(UInt32(0))
+            connect.appendBE(txid)
+            let connResp = try transact(connect, expectAction: 0, txid: txid, attempts: 3)
+            guard connResp.count >= 16 else { throw TorrentError.io("short connect response") }
+            let id = connResp.subdata(in: connResp.startIndex + 8 ..< connResp.startIndex + 16)
+            udpLock.lock(); connectionIDs[addr] = (id, Date()); udpLock.unlock()
+            return id
+        }
 
-        txid = UInt32.random(in: 0...UInt32.max)
-        var ann = Data()
-        ann.append(connID)
-        ann.appendBE(UInt32(1))
-        ann.appendBE(txid)
-        ann.append(r.infoHash)
-        ann.append(r.peerID)
-        ann.appendBE(UInt64(r.downloaded))
-        ann.appendBE(UInt64(r.left))
-        ann.appendBE(UInt64(r.uploaded))
-        ann.appendBE(r.event.rawValue)
-        ann.appendBE(UInt32(0))                       // ip
-        ann.appendBE(UInt32.random(in: 0...UInt32.max)) // key
-        ann.appendBE(UInt32(bitPattern: -1))          // num_want
-        ann.appendBE(r.port)
-        let resp = try transact(ann, expectAction: 1, txid: txid, attempts: 2)
-        guard resp.count >= 20 else { throw TorrentError.io("short announce response") }
-        let interval = TimeInterval(resp.readUInt32BE(at: 8))
-        let peers = PeerAddress.parseCompactList(resp.subdata(in: resp.startIndex + 20 ..< resp.endIndex))
+        func announce(_ connID: Data, attempts: Int) throws -> Data {
+            let txid = UInt32.random(in: 0...UInt32.max)
+            var ann = Data()
+            ann.append(connID)
+            ann.appendBE(UInt32(1))
+            ann.appendBE(txid)
+            ann.append(r.infoHash)
+            ann.append(r.peerID)
+            ann.appendBE(UInt64(r.downloaded))
+            ann.appendBE(UInt64(r.left))
+            ann.appendBE(UInt64(r.uploaded))
+            ann.appendBE(r.event.rawValue)
+            ann.appendBE(UInt32(0))                       // ip
+            ann.appendBE(UInt32.random(in: 0...UInt32.max)) // key
+            ann.appendBE(UInt32(bitPattern: -1))          // num_want
+            ann.appendBE(r.port)
+            return try transact(ann, expectAction: 1, txid: txid, attempts: attempts)
+        }
+
+        // A connection ID may be used for a minute after it was received.
+        udpLock.lock()
+        let cached = connectionIDs[addr].flatMap { Date().timeIntervalSince($0.1) < 50 ? $0.0 : nil }
+        udpLock.unlock()
+        var resp: Data?
+        if let id = cached {
+            resp = try? announce(id, attempts: 1)
+            if resp == nil { udpLock.lock(); connectionIDs[addr] = nil; udpLock.unlock() }
+        }
+        let reply = try resp ?? announce(connect(), attempts: 3)
+        guard reply.count >= 20 else { throw TorrentError.io("short announce response") }
+        let interval = TimeInterval(reply.readUInt32BE(at: 8))
+        let peers = PeerAddress.parseCompactList(reply.subdata(in: reply.startIndex + 20 ..< reply.endIndex))
         return AnnounceResponse(interval: interval, peers: peers)
     }
 }
@@ -178,13 +213,15 @@ final class TrackerAnnouncer {
         var failures = 0
         while true {
             cond.lock(); let isStopped = stopped; forceAnnounce = false; cond.unlock()
-            guard !isStopped, let torrent = torrent else { return }
-            if torrent.isPaused {
+            if isStopped || torrent == nil { return }
+            if torrent?.isPaused == true {
+                // Nothing until the torrent resumes (which pokes) or stops; no reference to it is held meanwhile.
                 cond.lock()
-                _ = cond.wait(until: Date().addingTimeInterval(5))
+                while !stopped && !forceAnnounce { cond.wait() }
                 cond.unlock()
                 continue
             }
+            guard let torrent = torrent else { return }
             let req = torrent.makeAnnounceRequest(event: event)
             var wait: TimeInterval
             do {
@@ -203,9 +240,11 @@ final class TrackerAnnouncer {
             // A starving torrent may poke us, but never re-announce more often than every 60s.
             let earliest = Date().addingTimeInterval(min(wait, 60))
             cond.lock()
-            while !stopped && Date() < deadline {
-                if forceAnnounce && Date() >= earliest { break }
-                _ = cond.wait(until: min(deadline, Date().addingTimeInterval(5)))
+            while !stopped {
+                let now = Date()
+                if now >= deadline || (forceAnnounce && now >= earliest) { break }
+                // Sleeps to the announce time, or to the earliest re-announce once poked (poke and stop signal).
+                _ = cond.wait(until: forceAnnounce ? earliest : deadline)
             }
             cond.unlock()
         }

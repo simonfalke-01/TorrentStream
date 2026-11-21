@@ -118,6 +118,23 @@ final class Storage {
         try read(offset: Int64(index) * Int64(info.pieceLength), length: info.pieceSize(index))
     }
 
+    /// Whether every file a piece lies in exists and extends past it (a piece recorded as verified can only have
+    /// been lost by a file that was removed or truncated). `sizes` caches file sizes across calls.
+    func holdsPiece(_ index: Int, sizes: inout [Int: Int64]) -> Bool {
+        var ok = true
+        segments(offset: Int64(index) * Int64(info.pieceLength), length: info.pieceSize(index)) { file, fileOffset, n, _ in
+            guard ok, !file.isPadding else { return }
+            let size: Int64
+            if let s = sizes[file.index] { size = s } else {
+                let attrs = try? FileManager.default.attributesOfItem(atPath: url(for: file).path)
+                size = (attrs?[.size] as? NSNumber)?.int64Value ?? -1
+                sizes[file.index] = size
+            }
+            if size < fileOffset + Int64(n) { ok = false }
+        }
+        return ok
+    }
+
     func closeAll() {
         lock.lock()
         for (_, fd) in fds { close(fd) }

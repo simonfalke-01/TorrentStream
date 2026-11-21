@@ -100,6 +100,7 @@ private struct PlayerContainer: View {
                 client.ensureStreamingServer()
                 return client.streamingPort
             }
+            e.streamGeneration = { [client = model.client] in client.streamingServerGeneration }
             e.start()
             e.showOnTV(ExternalDisplay.shared.isConnected)
             secondary.prepare(request)

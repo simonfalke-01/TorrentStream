@@ -4,7 +4,7 @@ import TorrentKit
 import FoundationNetworking
 #endif
 
-// Usage: tkcli <magnet-link | path.torrent> [fileIndex] [--serve]
+// Usage: tkcli <magnet-link | path.torrent> [fileIndex] [--serve] [--prefetch <bytes>] [--verbose]
 // Fetches metadata, lists files, then streams the start and the middle of a file through the local HTTP server
 // exactly like a media player would (Range requests), printing throughput.
 
@@ -46,6 +46,11 @@ for f in info.files where !f.isPadding {
 }
 
 let fileIndex = args.count >= 3 ? Int(args[2]) ?? -1 : -1
+// Warms the file like the app does while a show page is open: its head and container index at low priority.
+if let i = args.firstIndex(of: "--prefetch"), i + 1 < args.count, let bytes = Int64(args[i + 1]) {
+    let f = fileIndex >= 0 ? info.files[fileIndex] : info.files.filter { !$0.isPadding }.max { $0.length < $1.length }!
+    torrent.prefetch(fileIndex: f.index, bytes: bytes)
+}
 let target = fileIndex >= 0 ? info.files[fileIndex] : info.files.filter { !$0.isPadding }.max { $0.length < $1.length }!
 let url = client.streamURL(for: torrent, fileIndex: target.index, fileName: target.fileName)
 print("streaming [\(target.index)] \(target.fileName) via \(url)")

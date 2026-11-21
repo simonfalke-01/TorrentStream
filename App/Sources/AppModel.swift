@@ -930,11 +930,11 @@ final class AppModel: ObservableObject {
         if let data = try? JSONEncoder().encode(live + sleeping) { try? data.write(to: libraryURL, options: .atomic) }
     }
 
-    private func add(_ e: SavedEntry) -> Torrent? {
+    private func add(_ e: SavedEntry, paused: Bool = false) -> Torrent? {
         if e.hasTorrentFile, let d = try? Data(contentsOf: torrentFileURL(e.infoHash)) {
-            return try? client.add(torrentData: d)
+            return try? client.add(torrentData: d, paused: paused)
         } else if let m = e.magnet {
-            return try? client.add(magnet: m)
+            return try? client.add(magnet: m, paused: paused)
         }
         return nil
     }
@@ -951,10 +951,11 @@ final class AppModel: ObservableObject {
                 addedAt[e.infoHash] = added
                 continue
             }
-            guard let t = add(e) else { continue }
-            addedAt[t.infoHashHex] = added
             // Idle titles stay off the network until played. Files wanted by older versions aren't fetched in full.
-            if t.torrentInfo != nil { t.pause() }
+            guard let t = add(e, paused: true) else { continue }
+            addedAt[t.infoHashHex] = added
+            // A magnet still needs its metadata from peers.
+            if t.torrentInfo == nil { t.resume() }
         }
     }
 }

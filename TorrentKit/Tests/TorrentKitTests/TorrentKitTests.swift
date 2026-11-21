@@ -219,8 +219,9 @@ final class TorrentKitTests: XCTestCase {
         XCTAssertEqual(try torrent.readData(fileIndex: 0, offset: 60_000, length: 10_000), content.subdata(in: 60_000..<70_000))
     }
 
-    /// Pieces restored from a resume file are served by `availableData`; anything touching a missing or corrupt
-    /// piece is nil, and asking never registers a reader.
+    /// Pieces restored from a resume file are served by `availableData` right away (no re-hash while their files are
+    /// intact); anything touching a missing piece (here: recorded, but its file was truncated) is nil, and asking never
+    /// registers a reader.
     func testAvailableData() throws {
         let (data, content) = makeTorrent(files: [("a.bin", 20_000), ("b.mkv", 30_000)], pieceLength: 16384)
         let desc = try TorrentDescriptor.parse(torrentData: data)
@@ -230,20 +231,17 @@ final class TorrentKitTests: XCTestCase {
         let torrentDir = dir.appendingPathComponent(desc.infoHashHex, isDirectory: true)
         let storage = Storage(root: torrentDir.appendingPathComponent("data", isDirectory: true), info: info)
         for p in 0..<2 { try storage.writePiece(p, data: content.subdata(in: p * 16384..<(p + 1) * 16384)) }
-        try storage.writePiece(2, data: Data(repeating: 0xAA, count: 16384))
         storage.closeAll()
         try Data([1, 1, 1, 0]).write(to: torrentDir.appendingPathComponent("resume.bin"))
 
         let client = TorrentClient(downloadDirectory: dir, useDHT: false, extraTrackers: [])
         defer { client.shutdown() }
         let torrent = try client.add(torrentData: data)
-        let deadline = Date().addingTimeInterval(10)
-        while torrent.availableData(fileIndex: 1, offset: 0, length: 1) == nil && Date() < deadline { Thread.sleep(forTimeInterval: 0.05) }
-
+        XCTAssertNotNil(torrent.availableData(fileIndex: 1, offset: 0, length: 1), "intact pieces are trusted at once")
         XCTAssertEqual(torrent.availableData(fileIndex: 0, offset: 100, length: 1_000), content.subdata(in: 100..<1_100))
         XCTAssertEqual(torrent.availableData(fileIndex: 0, offset: 10_000, length: 1_000_000), content.subdata(in: 10_000..<20_000))
         XCTAssertEqual(torrent.availableData(fileIndex: 1, offset: 0, length: 12_768), content.subdata(in: 20_000..<32_768))
-        XCTAssertNil(torrent.availableData(fileIndex: 1, offset: 0, length: 12_769), "piece 2 failed verification")
+        XCTAssertNil(torrent.availableData(fileIndex: 1, offset: 0, length: 12_769), "piece 2's file was truncated")
         XCTAssertNil(torrent.availableData(fileIndex: 1, offset: 29_000, length: 100))
         XCTAssertEqual(torrent.availableData(fileIndex: 1, offset: 30_000, length: 10), Data())
         XCTAssertNil(torrent.availableData(fileIndex: 2, offset: 0, length: 10))
@@ -300,6 +298,9 @@ final class TorrentKitTests: XCTestCase {
         range.map { BlockRequest(piece: piece, offset: $0 * 16384, length: 16384) }
     }
 
+    /// "piece/block" names, for readable failures.
+    private func names(_ requests: [BlockRequest]) -> [String] { requests.map { "\($0.piece)/\($0.offset / 16384)" } }
+
     private func waitUntil(_ timeout: TimeInterval = 20, _ cond: () -> Bool) {
         let deadline = Date().addingTimeInterval(timeout)
         while !cond() && Date() < deadline { Thread.sleep(forTimeInterval: 0.02) }
@@ -317,7 +318,8 @@ final class TorrentKitTests: XCTestCase {
     }
 
     /// After a seek, the new position is requested before what the previous (still waiting) reader needs.
-    /// Pieces are 256 KB (16 blocks); a peer of unknown speed gets 8 of the blocks the player waits on.
+    /// Pieces are 256 KB (16 blocks); a peer of unknown speed gets its slow-start window (32) of the blocks the player
+    /// waits on.
     func testSeekRequestsNewPositionFirst() throws {
         let (data, _) = makeTorrent(files: [("a.mkv", 32 * 262_144)], pieceLength: 262_144)
         let (client, torrent, dir) = try makeIdleTorrent(data)
@@ -325,38 +327,40 @@ final class TorrentKitTests: XCTestCase {
         let old = UUID(), new = UUID()
         try registerReader(torrent, old, piece: 20)
         let a = actions(torrent, unchokedPeer(torrent, port: 1))
-        XCTAssertEqual(a.requests, blocks(20, Array(0..<8)))
+        XCTAssertEqual(names(a.requests), names(blocks(20, Array(0..<16)) + blocks(21, Array(0..<16))))
 
         try registerReader(torrent, new, piece: 8, extra: 1000)
         try registerReader(torrent, old, piece: 20)
         let b = actions(torrent, unchokedPeer(torrent, port: 2))
-        XCTAssertEqual(b.requests, blocks(8, Array(0..<8)))
+        // The old reader's first blocks are raced too (raced blocks may exceed the share).
+        XCTAssertEqual(names(b.requests), names(blocks(8, Array(0..<16)) + blocks(9, Array(0..<16)) + blocks(20, [0, 1])))
     }
 
-    /// A peer whose pipeline is full of less urgent requests cancels them (keeping ~0.3 s of its rate that is likely
+    /// A peer whose pipeline is full of less urgent requests cancels them (keeping ~0.15 s of its rate that is likely
     /// on the wire) when the player waits on new blocks; blocks that were urgent before the seek lose their priority.
     func testSeekCancelsQueuedBackgroundRequests() throws {
         let (data, _) = makeTorrent(files: [("a.mkv", 32 * 262_144)], pieceLength: 262_144)
         let (client, torrent, dir) = try makeIdleTorrent(data)
         defer { client.shutdown(); try? FileManager.default.removeItem(at: dir) }
         try registerReader(torrent, UUID(), piece: 31)
-        // 1 MB/s: a share of 0.5 s (32 urgent blocks), a queue of rate × (rtt + 0.5 s) + 8 = 59 blocks.
+        // 1 MB/s: a share of 0.5 s (32 urgent blocks), a queue of rate × (rtt + 0.3 s) + 8 = 46 blocks.
         let peer = unchokedPeer(torrent, port: 1, rate: 1_048_576)
         // The reader's (last) piece, then the container index at the end of the file.
         let a = actions(torrent, peer)
-        XCTAssertEqual(a.requests.count, 59)
+        XCTAssertEqual(a.requests.count, 46)
         XCTAssertEqual(Array(a.requests.prefix(16)), blocks(31, Array(0..<16)))
-        XCTAssertEqual(Set(a.requests.map(\.piece)), [31, 24, 25, 26])
+        XCTAssertEqual(Set(a.requests.map(\.piece)), [31, 24, 25])
 
+        // The block the new reader is blocked on comes after 0.15 s of the queue (9 blocks); 32 urgent ones follow.
         try registerReader(torrent, UUID(), piece: 8)
         let b = actions(torrent, peer)
         XCTAssertEqual(b.requests.count, 32)
         XCTAssertEqual(b.requests.first, BlockRequest(piece: 8, offset: 0, length: 16384))
-        XCTAssertEqual(Set(b.requests.map(\.piece)), [8, 9])
-        XCTAssertEqual(b.cancels.count, 59 - 19)
-        XCTAssertTrue(b.cancels.allSatisfy { [31, 24, 25, 26].contains($0.piece) })
-        XCTAssertEqual(peer.pending.count, 19 + 32)
-        XCTAssertEqual(peer.cancelled.count, 40, "cancelled requests aren't asked of this peer again until answered")
+        XCTAssertEqual(Set(b.requests.map(\.piece)), [8, 9], "\(names(b.requests))")
+        XCTAssertEqual(b.cancels.count, 46 - 9)
+        XCTAssertTrue(b.cancels.allSatisfy { [31, 24, 25].contains($0.piece) })
+        XCTAssertEqual(peer.pending.count, 9 + 32)
+        XCTAssertEqual(peer.cancelled.count, 37, "cancelled requests aren't asked of this peer again until answered")
     }
 
     /// The first blocks at a new position go to several peers at once; blocks the player waits on that a peer is
@@ -367,37 +371,44 @@ final class TorrentKitTests: XCTestCase {
         defer { client.shutdown(); try? FileManager.default.removeItem(at: dir) }
         try registerReader(torrent, UUID(), piece: 31)
         let slow = unchokedPeer(torrent, port: 1), other = unchokedPeer(torrent, port: 2)
-        XCTAssertEqual(actions(torrent, slow).requests, blocks(31, Array(0..<8)))
+        XCTAssertEqual(names(Array(actions(torrent, slow).requests.prefix(16))), names(blocks(31, Array(0..<16))))
         // Only the head is raced while the rest isn't late.
-        XCTAssertEqual(actions(torrent, other).requests, blocks(31, [0, 1, 8, 9, 10, 11, 12, 13]))
+        let second = actions(torrent, other).requests
+        XCTAssertEqual(names(second.filter { $0.piece == 31 }), names(blocks(31, [0, 1])))
 
         // Two seconds later nothing has arrived.
         torrent.lock.lock()
         if let pp = torrent.inProgress[31] {
             for b in 0..<pp.blockCount { pp.requestedAt[b] -= 2; pp.eta[b] -= 2 }
         }
+        for p in [slow, other] {
+            for (r, v) in p.pending { p.pending[r] = PendingRequest(at: v.at - 2, eta: v.eta - 2, priority: v.priority,
+                                                                    deliveredBefore: v.deliveredBefore, queuedAhead: v.queuedAhead, seq: v.seq) }
+        }
         torrent.lock.unlock()
         let fast = unchokedPeer(torrent, port: 3, rate: 2_000_000)
         let late = actions(torrent, fast)
-        XCTAssertEqual(Array(late.requests.prefix(16)), blocks(31, Array(0..<16)))
+        XCTAssertEqual(names(Array(late.requests.prefix(16))), names(blocks(31, Array(0..<16))))
     }
 
-    /// A peer gets about half a second's worth of the blocks the player waits on (8 when its speed is unknown) and nothing
-    /// behind them while some are still unassigned, so slow peers can't hold much and fast peers take most.
+    /// A peer gets about half a second's worth of the blocks the player waits on (its slow-start window while its
+    /// speed is being found out) and nothing behind them while some are still unassigned, so slow peers can't hold
+    /// much and fast peers take most.
     func testCriticalBlocksAreSharedByPeerSpeed() throws {
         let (data, _) = makeTorrent(files: [("a.mkv", 32 * 262_144)], pieceLength: 262_144)
         let (client, torrent, dir) = try makeIdleTorrent(data)
         defer { client.shutdown(); try? FileManager.default.removeItem(at: dir) }
         try registerReader(torrent, UUID(), piece: 8)
         let unknown = actions(torrent, unchokedPeer(torrent, port: 1))
-        XCTAssertEqual(unknown.requests, blocks(8, Array(0..<8)))
-        let slow = actions(torrent, unchokedPeer(torrent, port: 2, rate: 20_000))
-        XCTAssertEqual(slow.requests, blocks(8, [0, 1, 8, 9, 10, 11, 12, 13]))
-        // The rest of the 2 MB window (pieces 8-15); nothing less urgent while the player waits and the window takes
-        // half of the in-flight budget (256 blocks while the swarm's speed is unknown).
+        XCTAssertEqual(names(unknown.requests), names(blocks(8, Array(0..<16)) + blocks(9, Array(0..<16))))
+        let slowPeer = unchokedPeer(torrent, port: 2, rate: 20_000)
+        slowPeer.windowGrowing = false
+        let slow = actions(torrent, slowPeer)
+        XCTAssertEqual(names(slow.requests), names(blocks(8, [0, 1]) + blocks(10, Array(0..<6))))
+        // The rest of the 2 MB window (pieces 8-15); nothing less urgent while the player waits.
         let fast = actions(torrent, unchokedPeer(torrent, port: 3, rate: 4_000_000))
-        XCTAssertEqual(fast.requests.count, 116)
-        XCTAssertEqual(Array(fast.requests.prefix(4)), blocks(8, [0, 1, 14, 15]))
+        XCTAssertEqual(names(Array(fast.requests.prefix(4))), names(blocks(8, [0, 1]) + blocks(10, [6, 7])))
+        XCTAssertEqual(fast.requests.count, 2 + 128 - 32 - 6)
         XCTAssertTrue(fast.requests.allSatisfy { (8...15).contains($0.piece) })
     }
 
@@ -633,6 +644,235 @@ final class TorrentKitTests: XCTestCase {
         waitUntil { b.hasPrefix(fileIndex: 0, bytes: 4 * 16384) }
         XCTAssertTrue(b.hasPrefix(fileIndex: 0, bytes: 4 * 16384))
     }
+
+    // MARK: app lifecycle and the streaming server
+
+    /// Sends a GET on its own connection and reads the response head. Returns the socket, the head (status line under
+    /// ":status") and body bytes that came with it.
+    private func openStream(port: UInt16, path: String, range: String) throws -> (TCPSocket, [String: String], Data) {
+        let s = try TCPSocket.connect(to: PeerAddress(ip: 0x7f00_0001, port: port), timeout: 2)
+        s.setReceiveTimeout(1)
+        try s.send(Data("GET \(path) HTTP/1.1\r\nHost: 127.0.0.1\r\nRange: bytes=\(range)\r\n\r\n".utf8))
+        let terminator = Data("\r\n\r\n".utf8)
+        var buf = Data()
+        let deadline = Date().addingTimeInterval(20)
+        while buf.range(of: terminator) == nil {
+            guard Date() < deadline else { throw SocketError.timeout }
+            if let d = try s.receive(max: 4096) { buf.append(d) }
+        }
+        let end = buf.range(of: terminator)!
+        let lines = String(decoding: buf[..<end.lowerBound], as: UTF8.self).components(separatedBy: "\r\n")
+        var headers = [":status": lines[0]]
+        for l in lines.dropFirst() {
+            if let c = l.firstIndex(of: ":") { headers[l[..<c].lowercased()] = l[l.index(after: c)...].trimmingCharacters(in: .whitespaces) }
+        }
+        return (s, headers, Data(buf[end.upperBound...]))
+    }
+
+    private func ping(_ port: UInt16) -> String? {
+        guard let s = try? TCPSocket.connect(to: PeerAddress(ip: 0x7f00_0001, port: port), timeout: 1) else { return nil }
+        defer { s.close() }
+        s.setReceiveTimeout(1)
+        guard (try? s.send(Data("GET /ping HTTP/1.1\r\n\r\n".utf8))) != nil,
+              let d = try? s.receiveExactly(12, deadline: Date().addingTimeInterval(2)) else { return nil }
+        return String(decoding: d, as: UTF8.self)
+    }
+
+    /// iOS reclaims the listening socket of a suspended app (accept then fails). The server listens again on the same
+    /// port, so URLs the player holds keep working.
+    func testStreamServerListensAgainOnSamePort() throws {
+        let (data, content) = makeTorrent(files: [("a.mkv", 100_000)], pieceLength: 16384)
+        let desc = try TorrentDescriptor.parse(torrentData: data)
+        let seeder = try FakeSeeder(info: desc.info!, content: content)
+        defer { seeder.stop() }
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let client = TorrentClient(downloadDirectory: dir, useDHT: false, extraTrackers: [])
+        defer { client.shutdown() }
+        let torrent = try client.add(torrentData: data)
+        torrent.addPeers([PeerAddress(ip: 0x7f00_0001, port: seeder.port)], source: "test")
+        let url = client.streamURL(for: torrent, fileIndex: 0, fileName: "a.mkv")
+        let port = client.streamingPort
+        XCTAssertEqual(ping(port), "HTTP/1.1 204")
+        let generation = client.streamingServerGeneration
+
+        // What a reclaimed socket looks like on Linux: accept fails.
+        let fd = client.server.listenerFD
+        XCTAssertGreaterThanOrEqual(fd, 0)
+        _ = Glue.shutdown(fd, 2 /* SHUT_RDWR */)
+        waitUntil(3) { client.server.listenerFD != fd && client.server.listenerFD >= 0 }
+        client.applicationWillEnterForeground()
+        XCTAssertEqual(client.streamingPort, port)
+        XCTAssertGreaterThan(client.streamingServerGeneration, generation, "the player can tell its connection died")
+        XCTAssertEqual(ping(port), "HTTP/1.1 204")
+        let (http, body) = get(url, range: "1000-1999")
+        XCTAssertEqual(http?.statusCode, 206)
+        XCTAssertEqual(body, content.subdata(in: 1000..<2000))
+    }
+
+    /// A player that stops reading for longer than the send timeout (paused, app in the background) later gets the
+    /// rest of the response: it is never cut short.
+    func testResponseWaitsForPlayerThatStopsReading() throws {
+        let size = 12 << 20
+        let (data, content) = makeTorrent(files: [("a.mkv", size)], pieceLength: 262_144)
+        let desc = try TorrentDescriptor.parse(torrentData: data)
+        let seeder = try FakeSeeder(info: desc.info!, content: content)
+        defer { seeder.stop() }
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let client = TorrentClient(downloadDirectory: dir, useDHT: false, extraTrackers: [])
+        defer { client.shutdown() }
+        let torrent = try client.add(torrentData: data)
+        torrent.addPeers([PeerAddress(ip: 0x7f00_0001, port: seeder.port)], source: "test")
+
+        let (s, headers, first) = try openStream(port: client.streamingPort, path: "/stream/\(desc.infoHashHex)/0/a.mkv", range: "0-")
+        defer { s.close() }
+        var small: Int32 = 32 * 1024
+        setsockopt(s.fd, SOL_SOCKET, SO_RCVBUF, &small, socklen_t(MemoryLayout<Int32>.size))
+        XCTAssertEqual(headers["content-length"], "\(size)")
+        var body = first
+        while body.count < 1 << 20, let d = try s.receive() { body.append(d) }
+        Thread.sleep(forTimeInterval: 3)
+        let deadline = Date().addingTimeInterval(30)
+        while body.count < size && Date() < deadline {
+            if let d = try s.receive() { body.append(d) }
+        }
+        XCTAssertEqual(body.count, size)
+        XCTAssertTrue(body == content, "body differs")
+    }
+
+    /// A response that can't be completed (here: the torrent is removed) ends with a reset, so the player sees an
+    /// error and asks again instead of taking the short body for the end of the file.
+    func testUnfinishedResponseEndsWithReset() throws {
+        let (data, _) = makeTorrent(files: [("a.mkv", 100_000)], pieceLength: 16384)
+        let desc = try TorrentDescriptor.parse(torrentData: data)
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let client = TorrentClient(downloadDirectory: dir, useDHT: false, extraTrackers: [])
+        defer { client.shutdown() }
+        let torrent = try client.add(torrentData: data)
+        let (s, headers, _) = try openStream(port: client.streamingPort, path: "/stream/\(desc.infoHashHex)/0/a.mkv", range: "0-")
+        defer { s.close() }
+        XCTAssertEqual(headers[":status"], "HTTP/1.1 206 Partial Content")
+        client.remove(torrent, deleteData: true)
+        s.setReceiveTimeout(5)
+        var b: UInt8 = 0
+        let n = Glue.recv(s.fd, &b, 1, 0)
+        XCTAssertEqual(n, -1)
+        XCTAssertEqual(errno, ECONNRESET)
+    }
+
+    /// After a long suspension every connection is replaced; peers that sent data are dialed again at once (no
+    /// back-off). Going to the background saves them.
+    func testReconnectAfterSuspension() throws {
+        let (data, content) = makeTorrent(files: [("a.mkv", 64 * 16384)], pieceLength: 16384)
+        let desc = try TorrentDescriptor.parse(torrentData: data)
+        let seeder = try FakeSeeder(info: desc.info!, content: content)
+        defer { seeder.stop() }
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let client = TorrentClient(downloadDirectory: dir, useDHT: false, extraTrackers: [])
+        defer { client.shutdown() }
+        let torrent = try client.add(torrentData: data)
+        torrent.setReadahead(0, fileIndex: 0)
+        let seederAddress = PeerAddress(ip: 0x7f00_0001, port: seeder.port)
+        torrent.addPeers([seederAddress], source: "test")
+        let reader = UUID()
+        XCTAssertTrue(try torrent.waitForData(fileIndex: 0, offset: 0, length: 16384, readerID: reader, timeout: 20))
+        torrent.removeReader(reader)
+
+        client.applicationDidEnterBackground()
+        let saved = try Data(contentsOf: torrent.directory.appendingPathComponent("peers.bin"))
+        XCTAssertEqual(PeerAddress.parseCompactList(saved), [seederAddress])
+
+        torrent.lock.lock()
+        let before = torrent.peers[seederAddress].map(ObjectIdentifier.init)
+        torrent.lock.unlock()
+        XCTAssertNotNil(before)
+        torrent.reconnectAfterSuspension(suspended: 600)
+        func replaced() -> Bool {
+            torrent.lock.lock(); defer { torrent.lock.unlock() }
+            guard let p = torrent.peers[seederAddress] else { return false }
+            return ObjectIdentifier(p) != before && p.isActive
+        }
+        waitUntil(2) { replaced() }
+        XCTAssertTrue(replaced(), "the useful peer is dialed again right away")
+        XCTAssertTrue(try torrent.waitForData(fileIndex: 0, offset: 40 * 16384, length: 16384, readerID: UUID(), timeout: 10))
+    }
+
+    /// DHT nodes that answered are kept across launches.
+    func testDHTNodesPersist() throws {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: file) }
+        var d = Data()
+        for i in 0..<3 { d.append(Data(repeating: UInt8(i), count: 20)); d.append(PeerAddress(ip: 0x0102_0300 + UInt32(i), port: 6881).compact) }
+        try d.write(to: file)
+        DHT(stateFile: file).save()
+        XCTAssertEqual(try Data(contentsOf: file), d)
+    }
+
+    /// A torrent added paused stays off the network (no announce, no peer connection) until it is resumed.
+    func testAddPausedStaysOffNetworkUntilResumed() throws {
+        let (data, content) = makeTorrent(files: [("a.mkv", 70_000)], pieceLength: 16384)
+        let desc = try TorrentDescriptor.parse(torrentData: data)
+        let seeder = try FakeSeeder(info: desc.info!, content: content)
+        defer { seeder.stop() }
+        let tracker = try FakeHTTPTracker()
+        defer { tracker.stop() }
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let client = TorrentClient(downloadDirectory: dir, useDHT: false, extraTrackers: [])
+        defer { client.shutdown() }
+        let torrent = try client.add(descriptor: TorrentDescriptor(infoHash: desc.infoHash, displayName: nil,
+                                                                   trackers: ["http://127.0.0.1:\(tracker.port)/announce"],
+                                                                   info: desc.info, magnetURI: nil, torrentData: nil), paused: true)
+        XCTAssertTrue(torrent.isPaused)
+        torrent.addPeers([PeerAddress(ip: 0x7f00_0001, port: seeder.port)], source: "test")
+        Thread.sleep(forTimeInterval: 1)
+        XCTAssertEqual(tracker.announces, 0)
+        XCTAssertEqual(seeder.connections, 0)
+
+        torrent.resume()
+        waitUntil(5) { tracker.announces > 0 }
+        XCTAssertEqual(tracker.announces, 1)
+        XCTAssertTrue(try torrent.waitForData(fileIndex: 0, offset: 0, length: 70_000, readerID: UUID(), timeout: 10))
+
+        // Paused again: no announce (the tracker thread sleeps until a resume pokes it).
+        torrent.pause()
+        let before = tracker.announces
+        Thread.sleep(forTimeInterval: 1)
+        XCTAssertEqual(tracker.announces, before)
+        XCTAssertTrue(torrent.isPaused)
+    }
+
+    /// A ticker runs at the interval it returns, stops when it returns nil, and `tickSoon` runs it right away.
+    func testTickerIntervalsAndTickSoon() {
+        let loop = EventLoop()
+        defer { loop.stop() }
+        let owner = NSObject()
+        let lock = NSLock()
+        var times: [TimeInterval] = []
+        var stopAfter = Int.max
+        func count() -> Int { lock.lock(); defer { lock.unlock() }; return times.count }
+        loop.addTicker(owner: owner, interval: 0) {
+            lock.lock(); defer { lock.unlock() }
+            times.append(Date.timeIntervalSinceReferenceDate)
+            return times.count >= stopAfter ? nil : 10
+        }
+        waitUntil(1) { count() == 1 }
+        Thread.sleep(forTimeInterval: 0.3)
+        XCTAssertEqual(count(), 1, "waits for the interval the ticker returned")
+        lock.lock(); stopAfter = 2; lock.unlock()
+        let asked = Date.timeIntervalSinceReferenceDate
+        loop.tickSoon(owner: owner)
+        waitUntil(1) { count() == 2 }
+        XCTAssertEqual(count(), 2)
+        lock.lock(); let second = times.last ?? 0; lock.unlock()
+        XCTAssertLessThan(second - asked, 0.2)
+        loop.tickSoon(owner: owner)
+        Thread.sleep(forTimeInterval: 0.2)
+        XCTAssertEqual(count(), 2, "a ticker that returned nil is gone")
+    }
 }
 
 /// Minimal BitTorrent seeder on 127.0.0.1 used by the tests (supports ut_metadata and, optionally, the fast extension,
@@ -677,9 +917,17 @@ final class FakeSeeder {
         rejectOnce = options.rejectOnce
         listener = try TCPListener(port: 0)
         Thread.detachNewThread { [self] in
-            while running, let s = try? listener.accept() { Thread.detachNewThread { self.serve(s) } }
+            while running, let a = try? listener.accept() {
+                if case .socket(let s) = a {
+                    lock.lock(); connected += 1; lock.unlock()
+                    Thread.detachNewThread { self.serve(s) }
+                }
+            }
         }
     }
+
+    private var connected = 0
+    var connections: Int { lock.lock(); defer { lock.unlock() }; return connected }
 
     func stop() { running = false; listener.close() }
 
@@ -749,5 +997,44 @@ final class FakeSeeder {
                 }
             }
         }
+    }
+}
+
+/// HTTP tracker on 127.0.0.1 that counts announces and answers with no peers.
+final class FakeHTTPTracker {
+    let listener: TCPListener
+    var port: UInt16 { listener.port }
+    private let lock = NSLock()
+    private var count = 0
+    private var running = true
+    var announces: Int { lock.lock(); defer { lock.unlock() }; return count }
+
+    init() throws {
+        listener = try TCPListener(port: 0)
+        Thread.detachNewThread { [self] in
+            while running, let a = try? listener.accept() {
+                guard case .socket(let s) = a else { continue }
+                Thread.detachNewThread { self.serve(s) }
+            }
+        }
+    }
+
+    func stop() { running = false; listener.close() }
+
+    private func serve(_ s: TCPSocket) {
+        defer { s.close() }
+        s.setReceiveTimeout(2)
+        var buf = Data()
+        let deadline = Date().addingTimeInterval(5)
+        while buf.range(of: Data("\r\n\r\n".utf8)) == nil && Date() < deadline {
+            guard let d = try? s.receive(max: 4096) else { return }
+            buf.append(d)
+        }
+        guard String(decoding: buf, as: UTF8.self).hasPrefix("GET /announce") else { return }
+        lock.lock(); count += 1; lock.unlock()
+        let body = BValue.dict(["interval": .int(1800), "peers": .bytes(Data())]).encoded()
+        var reply = Data("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n".utf8)
+        reply.append(body)
+        try? s.send(reply)
     }
 }

@@ -75,10 +75,12 @@ extension Torrent {
         // What the player is blocked on, the latest seek first.
         for r in activeReaders { fileRange(r.fileIndex, r.offset, r.offset + criticalBytes, Span.now, raceHead: Torrent.raceHeadBlocks) }
         wantRanges(.now, Span.now)
-        // Container indexes (MKV cues, MP4 moov at the end) are read when a file is opened or seeked.
+        // Container indexes (MKV cues, MP4 moov at the end) are read when a file is opened or seeked: the last few
+        // hundred kilobytes (MKV cues) right after what the player waits on, the rest of the tail (a large moov) once
+        // the start is under way, so it doesn't hold back the first frame (a player reading it asks for it anyway).
         for fi in streamingFiles.sorted() where fi < info.files.count {
             let len = info.files[fi].length
-            fileRange(fi, len - Torrent.indexTailBytes, len, Span.soon)
+            fileRange(fi, len - Torrent.indexTailUrgentBytes, len, Span.soon)
         }
         let mid = min(soonBytes, 3 * criticalBytes)
         for r in activeReaders { fileRange(r.fileIndex, r.offset + criticalBytes, r.offset + mid, Span.soon, lead: criticalBytes) }
@@ -86,6 +88,10 @@ extension Torrent {
         for r in activeReaders { fileRange(r.fileIndex, r.offset + mid, r.offset + soonBytes, Span.soon, lead: mid) }
         // Read-ahead: the near part before seek-preview wants, the rest after them.
         let nearAhead: Int64 = 64 * 1024 * 1024
+        for fi in streamingFiles.sorted() where fi < info.files.count {
+            let len = info.files[fi].length
+            fileRange(fi, len - Torrent.indexTailBytes, len - Torrent.indexTailUrgentBytes, Span.readahead)
+        }
         for r in activeReaders {
             let ahead = readahead[r.fileIndex] ?? Torrent.defaultReadahead
             fileRange(r.fileIndex, r.offset + soonBytes, r.offset + min(ahead, nearAhead), Span.readahead)
@@ -142,6 +148,9 @@ extension Torrent {
         return false
     }
 
+    /// Order in which a peer answers requests (one pass sends many at the same instant).
+    static func queuedBefore(_ a: PendingRequest, _ b: PendingRequest) -> Bool { a.seq < b.seq }
+
     /// Lock held: recomputes requests for every connected peer, fastest first so they get the urgent blocks.
     func rescheduleAllLocked() {
         let active = peers.values.filter { $0.isActive }.sorted { $0.rate > $1.rate }
@@ -151,9 +160,11 @@ extension Torrent {
     /// Lock held: what to send a peer now.
     ///
     /// 1. Blocks the player waits on (`Span.now`) are spread over peers in proportion to their speed — a peer holds
-    ///    at most what it delivers in half a second — and raced to another peer when overdue. A peer that takes such
-    ///    blocks has the tail of its queue cancelled, since it serves requests in order.
-    /// 2. Then the queue is topped up to cover its rate × (round trip + 0.75 s), in span order.
+    ///    about what it delivers in half a second (its slow-start window while that speed is being found out) — and
+    ///    raced to another peer as soon as no requester is expected to deliver them before the reader gets there.
+    ///    The block a reader is blocked on goes to one more peer every `headRaceStep` while it is expected late. A
+    ///    peer that takes such blocks has the tail of its queue cancelled, since it serves requests in order.
+    /// 2. Then the queue is topped up to cover its rate × (round trip + `queueSeconds`), in span order.
     func nextActionsLocked(for peer: PeerConnection) -> PeerActions {
         var actions = PeerActions()
         if stopped { actions.disconnectReason = "stopped"; return actions }
@@ -189,20 +200,23 @@ extension Torrent {
         // A new peer is assumed decent, so blocks it doesn't deliver promptly are raced early.
         let assumedRate = rate > 0 ? max(rate, 16 * 1024) : 128 * 1024
         func eta(queued: Int) -> TimeInterval { now + peer.rtt + Double(queued + 1) * blk / assumedRate }
-        // A slow peer only takes urgent blocks it can deliver before the rest of the swarm reaches them: a block
-        // first given to a slow peer and then raced is cold on the fast peer's disk, which stalls the player.
+        // A slow peer only takes urgent blocks it can deliver well before the rest of the swarm reaches them: a block
+        // first given to a slow peer and then raced is cold on the fast peer's disk, which stalls the player. While
+        // the player reads as fast as blocks arrive (start, after a seek) that is a fraction of a second away, so a
+        // peer at half the fastest one's speed already holds up the read: it takes blocks further ahead.
         var swarmRate = 0.0, maxRate = 0.0
         for p in peers.values where p.isActive && !p.peerChoking && !p.snubbed {
             swarmRate += p.rate
             maxRate = max(maxRate, p.rate)
         }
-        let slowPeer = rate > 0 && rate < 0.25 * maxRate
+        let slowPeer = rate > 0 ? rate < 0.5 * maxRate : maxRate > 4 * assumedRate
         func tooSlow(_ s: Span, _ b: Int, queued: Int) -> Bool {
             guard slowPeer, swarmRate > 0 else { return false }
             let dist = Double(s.distance + Int64(b - s.start) * Int64(blockSize))
-            return eta(queued: queued) - now > dist / swarmRate + 1.0
+            return eta(queued: queued) - now > dist / swarmRate - Torrent.slowPeerMargin
         }
-        let anyCancelled = !peer.cancelled.isEmpty
+        // Updated as this pass cancels requests: a block cancelled moments ago must not be asked again right away.
+        var anyCancelled = !peer.cancelled.isEmpty
         func awaitingCancel(_ pp: PieceProgress, _ b: Int) -> Bool {
             anyCancelled && peer.cancelled[BlockRequest(piece: pp.index, offset: b * blockSize, length: pp.blockLength(b))] != nil
         }
@@ -212,8 +226,9 @@ extension Torrent {
             pp.requesters[b].append(me)
             pp.requestedAt[b] = now
             pp.eta[b] = e
+            peer.requestSeq += 1
             peer.pending[r] = PendingRequest(at: now, eta: e, priority: priority, deliveredBefore: peer.downloadedBytes,
-                                             queuedAhead: peer.pending.count)
+                                             queuedAhead: peer.pending.count, seq: peer.requestSeq)
             actions.requests.append(r)
         }
 
@@ -227,23 +242,52 @@ extension Torrent {
         var nowPending = 0
         for p in peer.pending.values where p.priority == Span.now { nowPending += 1 }
         // Half a second of the peer's rate (8 blocks at least): its rate is measured on what it is given, so a much
-        // smaller share would make a fast peer ramp up slowly while the player waits.
-        let share = peer.snubbed ? 0 : max(8, Int(rate * Torrent.urgentShareSeconds / blk))
+        // smaller share would make a fast peer ramp up slowly while the player waits — and while that rate is still
+        // being found out, its whole slow-start window.
+        let share = peer.snubbed ? 0 : max(8, Int(rate * Torrent.urgentShareSeconds / blk), peer.windowGrowing ? peer.window : 0)
         var tookNow = 0
         var blockedByShare = false
         // Urgent blocks already queued at this peer for a lower priority (before a seek moved the window).
         var upgraded = Set<BlockRequest>()
         var i = 0
-        // The block each reader is blocked on right now: raced to every peer with a short queue, one more every
-        // quarter second, since a seeder's disk can take seconds for one block while it serves others from cache.
-        if Double(peer.pending.count) * blk / assumedRate < 0.5 {
+        // Requests are answered in order: cancels what this peer would send before an urgent block (keeping what is
+        // likely on the wire already).
+        func trimQueue(keepSeconds: Double) {
+            let keep = max(2, Int(rate * keepSeconds / blk))
+            let others = peer.pending.filter { $0.value.priority != Span.now && !upgraded.contains($0.key) }
+            guard others.count > keep else { return }
+            for (r, _) in others.sorted(by: { Torrent.queuedBefore($0.value, $1.value) })[keep...] {
+                peer.pending[r] = nil
+                peer.cancelled[r] = now
+                anyCancelled = true
+                inProgress[r.piece]?.release(r.offset / blockSize, peer: me)
+                actions.cancels.append(r)
+            }
+            cursorsStale = true
+        }
+        // The block each reader is blocked on right now. Once nobody asked for it can deliver it promptly, it goes to
+        // one more peer every `headRaceStep` — fastest first (rescheduling goes fastest first), even a slow one when
+        // it would deliver sooner — with that peer's less urgent queue cancelled so the block comes next: a seeder's
+        // disk can take seconds for one block while it keeps serving others from its cache.
+        if !peer.snubbed {
             for (piece, b) in readerHeadsLocked(info) {
                 guard canRequest(piece), let pp = progressLocked(piece, info), b < pp.blockCount, !pp.received[b],
                       !ownedByOther(pp) else { continue }
                 let reqs = pp.requesters[b]
-                guard !reqs.contains(me), reqs.count < Torrent.maxHeadRacers,
-                      reqs.isEmpty || now - pp.requestedAt[b] > 0.25, !awaitingCancel(pp, b) else { continue }
-                assign(pp, b, priority: Span.now, eta: eta(queued: peer.pending.count))
+                guard !reqs.contains(me), !awaitingCancel(pp, b) else { continue }
+                var others = 0
+                for (r, v) in peer.pending where v.priority != Span.now && !upgraded.contains(r) { others += 1 }
+                let keep = min(others, max(2, Int(rate * 0.15 / blk)))
+                let mine = eta(queued: nowPending + tookNow + keep)
+                if reqs.isEmpty {
+                    if slowPeer && maxRate > 0 && mine - now > Torrent.deadlineSlack { continue }
+                } else {
+                    let expected = expectedArrivalLocked(pp, b, now: now)
+                    guard now - pp.requestedAt[b] > Torrent.headRaceStep, reqs.count < Torrent.maxHeadRacers,
+                          expected > now + Torrent.deadlineSlack, mine < expected - 0.1 else { continue }
+                }
+                if others > keep { trimQueue(keepSeconds: 0.15) }
+                assign(pp, b, priority: Span.now, eta: mine)
                 tookNow += 1
             }
         }
@@ -265,18 +309,24 @@ extension Torrent {
                 if awaitingCancel(pp, b) { continue }
                 let free = reqs.isEmpty
                 var race = false
-                if !free && reqs.count < Torrent.maxRacers {
+                if !free && reqs.count < Torrent.maxHeadRacers {
                     if b < s.start + s.raceHead {
-                        race = true
-                    } else if now - pp.requestedAt[b] > Torrent.criticalRaceAfter {
-                        race = now > pp.eta[b] + 0.1 || stuckLocked(reqs, pp, b)
+                        race = reqs.count < Torrent.maxRacers
+                    } else if now - pp.requestedAt[b] > Torrent.headRaceStep && !slowPeer {
+                        // Raced as soon as no requester is expected to deliver it before the reader gets there
+                        // (at the swarm's rate): waiting until it is overdue is what keeps the player waiting.
+                        let dist = Double(s.distance + Int64(b - s.start) * Int64(blockSize))
+                        let deadline = now + (swarmRate > 0 ? dist / swarmRate : 0) + Torrent.deadlineSlack
+                        let expected = expectedArrivalLocked(pp, b, now: now)
+                        race = expected > deadline && eta(queued: nowPending + tookNow) < expected - 0.1
                     }
                 }
                 guard free || race else { continue }
                 if tooSlow(s, b, queued: nowPending + tookNow) { continue }
                 if nowPending + tookNow >= share {
-                    if free { blockedByShare = true }
-                    break outer
+                    // Past its share a peer still takes blocks the requester would deliver too late.
+                    if free { blockedByShare = true; continue }
+                    if nowPending + tookNow >= 2 * share { break outer }
                 }
                 assign(pp, b, priority: Span.now, eta: eta(queued: nowPending + tookNow))
                 tookNow += 1
@@ -286,18 +336,7 @@ extension Torrent {
         if tookNow > 0 {
             // Requests are answered in order: cancel what this peer can't deliver before the urgent blocks
             // (keeping what is likely already on the wire).
-            let keep = Int(rate * 0.3 / blk)
-            let others = peer.pending.filter { $0.value.priority != Span.now && !upgraded.contains($0.key) }
-                .sorted { $0.value.at < $1.value.at }
-            if others.count > keep {
-                for (r, _) in others[keep...] {
-                    peer.pending[r] = nil
-                    peer.cancelled[r] = now
-                    inProgress[r.piece]?.release(r.offset / blockSize, peer: me)
-                    actions.cancels.append(r)
-                }
-                cursorsStale = true
-            }
+            trimQueue(keepSeconds: 0.3)
         }
         // While urgent blocks wait for a free share, don't bury this peer's queue under less urgent ones.
         if blockedByShare { return actions }
@@ -315,11 +354,12 @@ extension Torrent {
         if urgent && laterRoom < 0 {
             // Requests are answered in order: drop this peer's queued read-ahead beyond what is on the wire.
             let keep = max(2, Int(rate * 0.3 / blk))
-            let later = peer.pending.filter { $0.value.priority > Span.soon }.sorted { $0.value.at < $1.value.at }
+            let later = peer.pending.filter { $0.value.priority > Span.soon }.sorted { Torrent.queuedBefore($0.value, $1.value) }
             if later.count > keep {
                 for (r, _) in later[keep...] {
                     peer.pending[r] = nil
                     peer.cancelled[r] = now
+                    anyCancelled = true
                     inProgress[r.piece]?.release(r.offset / blockSize, peer: me)
                     actions.cancels.append(r)
                 }
@@ -328,7 +368,7 @@ extension Torrent {
         }
         // Requests are answered in order, so a deep queue delays the next urgent block; a shallow one leaves the
         // peer idle between round trips. Half a second past the round trip keeps TCP busy.
-        var target = rate <= 0 ? 24 : max(8, Int(rate * (peer.rtt + Torrent.queueSeconds) / blk) + 8)
+        var target = max(peer.window, Int(rate * (peer.rtt + Torrent.queueSeconds) / blk) + 8)
         target = min(target, peer.maxRequests)
         if peer.snubbed { target = min(target, 2) }
         var room = target - peer.pending.count
@@ -401,15 +441,29 @@ extension Torrent {
         return out
     }
 
-    /// Lock held: whether every peer asked for a block has since sent plenty of blocks requested after it — typical
-    /// of a seeder whose disk is slow to read this one while it serves others from its cache.
-    private func stuckLocked(_ requesters: [ObjectIdentifier], _ pp: PieceProgress, _ b: Int) -> Bool {
+    /// Lock held: when the first of the peers asked for a block should deliver it, from how many blocks each had to
+    /// send before it and has sent since, at its current rate. A peer that has sent plenty past it (a seeder's slow
+    /// disk), is choked or snubbed won't.
+    func expectedArrivalLocked(_ pp: PieceProgress, _ b: Int, now: TimeInterval) -> TimeInterval {
         let r = BlockRequest(piece: pp.index, offset: b * blockSize, length: pp.blockLength(b))
-        for id in requesters {
-            guard let p = peersByID[id], let pr = p.pending[r] else { continue }
-            if (p.downloadedBytes - pr.deliveredBefore) / Int64(blockSize) <= Int64(pr.queuedAhead + 8) { return false }
+        var best = TimeInterval.infinity
+        for id in pp.requesters[b] {
+            guard let p = peersByID[id], !p.snubbed, !p.peerChoking, let pr = p.pending[r] else { continue }
+            let since = Int((p.downloadedBytes - pr.deliveredBefore) / Int64(blockSize))
+            let rate: Double
+            if p.rate > 0 { rate = max(p.rate, 8 * 1024) }
+            else if since > 0 { rate = max(8 * 1024, Double(since * blockSize) / max(0.1, now - pr.at - p.rtt)) }
+            else if now - pr.at < p.rtt + 0.5 { rate = 128 * 1024 }
+            else { continue }
+            // Past its turn, the longer the peer keeps sending other blocks the less likely this one comes soon (a
+            // seeder reading it from a slow disk sends what it has cached first): a few blocks of reordering are
+            // normal, more mean a wait of unknown length, so each skipped block counts several times.
+            let ahead = pr.queuedAhead + 1 - since
+            let perBlock = Double(blockSize) / rate
+            let t = ahead > 0 ? max(now, pr.at + p.rtt) + Double(ahead) * perBlock : now + Double(1 - ahead) * 4 * perBlock
+            best = min(best, t)
         }
-        return true
+        return best
     }
 
     /// Lock held: asks a peer for metadata pieces (BEP 9) nobody was asked for recently.

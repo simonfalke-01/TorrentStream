@@ -18,10 +18,13 @@ struct PendingRequest {
     let at: TimeInterval
     let eta: TimeInterval
     var priority: Int
-    /// The peer's downloaded byte count when this was requested (diagnostics: requests are answered in order).
+    /// The peer's downloaded byte count when this was requested: requests are answered in order, so what it delivered
+    /// since tells how far it got (see `expectedArrivalLocked`).
     var deliveredBefore: Int64 = 0
     /// Requests of this peer outstanding when this one was sent.
     var queuedAhead = 0
+    /// Position in the order requests were sent to the peer.
+    var seq = 0
 }
 
 /// What the scheduler wants sent to a peer.
@@ -68,6 +71,14 @@ final class PeerConnection: LoopHandler {
     /// Recent peak download rate from this peer in bytes/s, decaying while it is slow.
     var rate: Double = 0
     var bytesAtLastSample: Int64 = 0
+    /// Requests kept outstanding while the peer's rate is still being found out. It grows by one per block received
+    /// (doubling every round trip, like TCP slow start) until a rate sample shows no gain: a queue sized from the
+    /// measured rate alone only grows as fast as the rate it limits.
+    var window = 32
+    var windowGrowing = true
+    var rateSamples = 0
+    /// Numbers requests in the order they were sent (a peer answers them in that order).
+    var requestSeq = 0
     /// Connect round trip, a floor for how soon a request can be answered.
     var rtt: TimeInterval = 0.3
     var supportsExtensions = false

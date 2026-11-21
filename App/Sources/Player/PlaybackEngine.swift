@@ -107,6 +107,9 @@ final class PlaybackEngine: ObservableObject {
     /// The streaming server's port as it is now. iOS can take the server's socket while the app is away, and the
     /// server may come back on another port; the stream's address follows it.
     var streamPort: (() -> UInt16)?
+    /// The streaming listener's generation; a stream opened under an older one is dead.
+    var streamGeneration: (() -> Int)?
+    private var openedGeneration = 0
     private let player: VLCMediaPlayer
     private var url: URL
     private var subtitleFiles: [URL]
@@ -223,6 +226,7 @@ final class PlaybackEngine: ObservableObject {
         if let start, start > 0 { media.addOption(":start-time=\(Int(start))") }
         // Opens to the first picture and holds there (input.c MainLoop pauses before the first demux).
         if paused { media.addOption(":start-paused") }
+        openedGeneration = streamGeneration?() ?? 0
         player.media = media
     }
 
@@ -757,9 +761,11 @@ final class PlaybackEngine: ObservableObject {
         foregroundAt = Date()
         videoStats = nil
         if isPlaying { activateAudioSession() }
-        // The server lost its socket while the app was away and came back elsewhere: the open stream is dead.
-        if refreshStreamURL(), hasPlayed, !didFinish {
-            PlaybackTrace.shared.mark(String(format: "foreground: stream moved; reopening at %.1fs", currentTime))
+        // The server lost its socket while the app was away: the open stream is dead even if the port is the same.
+        let moved = refreshStreamURL()
+        let relistened = (streamGeneration?() ?? openedGeneration) != openedGeneration
+        if moved || relistened, hasPlayed, !didFinish {
+            PlaybackTrace.shared.mark(String(format: "foreground: stream server restarted; reopening at %.1fs", currentTime))
             videoTrackAway = nil
             restart(from: currentTime, paused: !isPlaying)
             return

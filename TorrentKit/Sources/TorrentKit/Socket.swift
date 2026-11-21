@@ -85,6 +85,14 @@ enum Net {
         signal(SIGPIPE, SIG_IGN)
     }
 
+    /// iOS starts apps with a soft limit of 256 descriptors; peers of two torrents plus the player exceed that.
+    static func raiseFileLimit(to wanted: UInt64 = 4096) {
+        var rl = rlimit()
+        guard getrlimit(RLIMIT_NOFILE_VALUE, &rl) == 0, UInt64(rl.rlim_cur) < wanted else { return }
+        rl.rlim_cur = rlim_t(min(wanted, UInt64(rl.rlim_max)))
+        _ = setrlimit(RLIMIT_NOFILE_VALUE, &rl)
+    }
+
     /// Resolves a host name to IPv4 addresses.
     static func resolve(host: String, port: UInt16) -> [PeerAddress] {
         var hints = addrinfo()
@@ -204,6 +212,12 @@ final class TCPSocket {
     func setSendTimeout(_ seconds: Double) { Net.setTimeout(fd, option: SO_SNDTIMEO, seconds: seconds) }
 
     func send(_ data: Data) throws {
+        try send(data, keepWaiting: nil)
+    }
+
+    /// Sends everything. With `keepWaiting`, a send timeout (the receiver isn't reading: a paused player, an app
+    /// being suspended) asks it whether to go on waiting instead of failing; a receiver that went away still fails.
+    func send(_ data: Data, keepWaiting: (() -> Bool)?) throws {
         try data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             guard let base = raw.baseAddress else { return }
             var sent = 0
@@ -211,7 +225,10 @@ final class TCPSocket {
                 let n = Glue.send(fd, base + sent, raw.count - sent, SEND_FLAGS)
                 if n < 0 {
                     if errno == EINTR { continue }
-                    if errno == EAGAIN || errno == EWOULDBLOCK { throw SocketError.timeout }
+                    if errno == EAGAIN || errno == EWOULDBLOCK {
+                        if let keep = keepWaiting, !isPeerClosed(), keep() { continue }
+                        throw SocketError.timeout
+                    }
                     throw SocketError.closed
                 }
                 if n == 0 { throw SocketError.closed }
@@ -260,14 +277,29 @@ final class TCPSocket {
             fd = -1
         }
     }
+
+    /// Closes with a reset instead of an orderly end: a response cut short must read as an error (HTTP players then
+    /// reconnect at the offset they reached) rather than as the end of the file.
+    func abort() {
+        closeLock.lock()
+        defer { closeLock.unlock() }
+        if fd >= 0 {
+            var lg = linger(l_onoff: 1, l_linger: 0)
+            setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, socklen_t(MemoryLayout<linger>.size))
+            _ = Glue.close(fd)
+            fd = -1
+        }
+    }
 }
 
 #if canImport(Glibc)
 private let MSG_DONTWAIT_VALUE = Int32(MSG_DONTWAIT)
 private let SHUT_RDWR_VALUE = Int32(SHUT_RDWR)
+private let RLIMIT_NOFILE_VALUE = __rlimit_resource_t(RLIMIT_NOFILE.rawValue)
 #else
 private let MSG_DONTWAIT_VALUE = MSG_DONTWAIT
 private let SHUT_RDWR_VALUE = SHUT_RDWR
+private let RLIMIT_NOFILE_VALUE = RLIMIT_NOFILE
 #endif
 
 /// Listening TCP socket bound to the loopback interface.
@@ -280,6 +312,11 @@ final class TCPListener {
         guard fd >= 0 else { throw SocketError.failed("socket: \(Net.lastError)") }
         var one: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, socklen_t(MemoryLayout<Int32>.size))
+        #if canImport(Darwin)
+        // A listener iOS reclaimed during suspension can keep the port bound; the replacement must get the same
+        // port, since the player holds URLs with it.
+        setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, socklen_t(MemoryLayout<Int32>.size))
+        #endif
         var sa = PeerAddress(ip: 0x7f00_0001, port: requested).sockaddr
         let rc = withUnsafePointer(to: &sa) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Glue.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
@@ -294,11 +331,20 @@ final class TCPListener {
         port = UInt16(bigEndian: bound.sin_port)
     }
 
-    /// Blocks until a client connects. Returns nil for transient errors, throws for fatal ones.
-    func accept() throws -> TCPSocket? {
+    enum Accepted {
+        case socket(TCPSocket)
+        /// Interrupted, or a client that went away before being accepted.
+        case transient
+        /// The connection was aborted: what iOS also reports, endlessly, on a listener it reclaimed.
+        case aborted
+    }
+
+    /// Blocks until a client connects. Throws when the listener is unusable.
+    func accept() throws -> Accepted {
         let c = Glue.accept(fd, nil, nil)
-        if c >= 0 { return TCPSocket(fd: c) }
-        if errno == EINTR || errno == ECONNABORTED || errno == EAGAIN { return nil }
+        if c >= 0 { return .socket(TCPSocket(fd: c)) }
+        if errno == EINTR || errno == EAGAIN { return .transient }
+        if errno == ECONNABORTED { return .aborted }
         throw SocketError.failed("accept: \(Net.lastError)")
     }
 

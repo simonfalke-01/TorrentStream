@@ -543,8 +543,8 @@ final class ShowsModel: ObservableObject {
         }
     }
 
-    /// About the first ten seconds of a 1080p episode.
-    private static let warmBytes: Int64 = 12 << 20
+    /// Enough of the start for the first picture of a high-bitrate 1080p episode, with some margin.
+    private static let warmBytes: Int64 = 28 << 20
 
     /// Loads the start of the next episode once the current one's bitrate is known.
     func prefetchNext(after request: PlaybackRequest, duration: Double) {

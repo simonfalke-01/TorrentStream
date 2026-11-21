@@ -26,10 +26,16 @@ struct TorrentStreamApp: App {
                 .onOpenURL { url in model.handleOpen(url: url) }
         }
         .onChange(of: scenePhase) { _, phase in
-            if phase == .active {
-                model.client.ensureStreamingServer()
+            switch phase {
+            case .active:
+                // Same port as before the suspension, and fresh peers in place of the ones that timed out.
+                model.client.applicationWillEnterForeground()
                 model.refreshStorage()
                 model.trimCache()
+            case .background:
+                model.client.applicationDidEnterBackground()
+            default:
+                break
             }
         }
     }

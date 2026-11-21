@@ -19,7 +19,7 @@ public final class TorrentClient {
     private let extraTrackers: [String]
     let peerID: Data
     let dht: DHT?
-    private var server: StreamServer!
+    private(set) var server: StreamServer!
     private let lock = NSLock()
     private var torrentsByHash: [String: Torrent] = [:]
     private var order: [String] = []
@@ -31,6 +31,7 @@ public final class TorrentClient {
     public init(downloadDirectory: URL, useDHT: Bool = true, extraTrackers: [String] = TorrentClient.defaultTrackers,
                 streamingPort: UInt16 = 0) {
         Net.ignoreSIGPIPE()
+        Net.raiseFileLimit()
         self.downloadDirectory = downloadDirectory
         self.useDHT = useDHT
         self.extraTrackers = extraTrackers
@@ -38,8 +39,8 @@ public final class TorrentClient {
         let alnum = Array("0123456789abcdefghijklmnopqrstuvwxyz".utf8)
         for _ in 0..<12 { id.append(alnum.randomElement()!) }
         peerID = id
-        dht = useDHT ? DHT() : nil
         try? FileManager.default.createDirectory(at: downloadDirectory, withIntermediateDirectories: true)
+        dht = useDHT ? DHT(stateFile: downloadDirectory.appendingPathComponent("dht-nodes.bin")) : nil
         server = StreamServer(client: self, preferredPort: streamingPort)
         dht?.start()
         try? server.ensureRunning()
@@ -57,20 +58,21 @@ public final class TorrentClient {
         return torrentsByHash[infoHashHex]
     }
 
-    /// Adds a magnet link (or bare info-hash). Returns the existing torrent if already added.
+    /// Adds a magnet link (or bare info-hash). Returns the existing torrent if already added. With `paused`, the
+    /// torrent stays off the network (no trackers, DHT or peers) until `resume()` or playback.
     @discardableResult
-    public func add(magnet: String) throws -> Torrent {
-        try add(descriptor: TorrentDescriptor.parse(magnet: magnet))
+    public func add(magnet: String, paused: Bool = false) throws -> Torrent {
+        try add(descriptor: TorrentDescriptor.parse(magnet: magnet), paused: paused)
     }
 
     /// Adds a .torrent file. Returns the existing torrent if already added.
     @discardableResult
-    public func add(torrentData: Data) throws -> Torrent {
-        try add(descriptor: TorrentDescriptor.parse(torrentData: torrentData))
+    public func add(torrentData: Data, paused: Bool = false) throws -> Torrent {
+        try add(descriptor: TorrentDescriptor.parse(torrentData: torrentData), paused: paused)
     }
 
     @discardableResult
-    public func add(descriptor: TorrentDescriptor) throws -> Torrent {
+    public func add(descriptor: TorrentDescriptor, paused: Bool = false) throws -> Torrent {
         lock.lock()
         if let existing = torrentsByHash[descriptor.infoHashHex] { lock.unlock(); return existing }
         let dir = downloadDirectory.appendingPathComponent(descriptor.infoHashHex, isDirectory: true)
@@ -78,7 +80,7 @@ public final class TorrentClient {
         torrentsByHash[descriptor.infoHashHex] = t
         order.append(descriptor.infoHashHex)
         lock.unlock()
-        t.start(extraTrackers: extraTrackers, useDHT: useDHT)
+        t.start(extraTrackers: extraTrackers, useDHT: useDHT, paused: paused)
         return t
     }
 
@@ -92,12 +94,39 @@ public final class TorrentClient {
         if deleteData { try? FileManager.default.removeItem(at: torrent.directory) }
     }
 
-    /// Re-creates the loopback listener if the OS tore it down (e.g. after the app was suspended).
+    /// Makes sure the loopback listener answers, re-creating it on the same port if the OS tore it down (iOS reclaims
+    /// the listening sockets of suspended apps). Cheap when it worked moments ago.
     public func ensureStreamingServer() {
-        try? server.ensureRunning()
+        server.validate()
+    }
+
+    private var backgroundedAt: Date?
+
+    /// Call when the app moves to the background: saves progress, the peers worth dialing again and DHT nodes, in
+    /// case the app is not resumed.
+    public func applicationDidEnterBackground() {
+        lock.lock(); backgroundedAt = Date(); lock.unlock()
+        torrents.forEach { $0.saveState() }
+        dht?.save()
+    }
+
+    /// Call when the app becomes active again: brings the streaming server back (same port, so the player's URLs
+    /// keep working) and replaces peer connections that died during the suspension.
+    public func applicationWillEnterForeground() {
+        server.validate(maxAge: 0)
+        lock.lock()
+        let suspended = backgroundedAt.map { Date().timeIntervalSince($0) } ?? 0
+        backgroundedAt = nil
+        lock.unlock()
+        torrents.forEach { $0.reconnectAfterSuspension(suspended: suspended) }
     }
 
     public var streamingPort: UInt16 { server.port }
+
+    /// Changes each time the streaming listener is re-created (iOS reclaimed it during a suspension). The port stays
+    /// the same whenever possible, but a player connection opened before the change is dead: compare this to the value
+    /// seen when the stream was opened to decide whether to reopen it.
+    public var streamingServerGeneration: Int { server.listenerGeneration }
 
     /// HTTP URL that any media player can use to stream (and seek within) a file of the torrent.
     public func streamURL(for torrent: Torrent, fileIndex: Int, fileName: String) -> URL {

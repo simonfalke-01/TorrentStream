@@ -28,7 +28,7 @@ final class EventLoop {
     private let wakeWrite: Int32
     /// Loop-thread only.
     private var handlers: [ObjectIdentifier: LoopHandler] = [:]
-    private var tickers: [(id: ObjectIdentifier, interval: TimeInterval, next: TimeInterval, body: () -> Bool)] = []
+    private var tickers: [(id: ObjectIdentifier, next: TimeInterval, body: () -> TimeInterval?)] = []
     private var thread: Thread?
 
     init() {
@@ -63,11 +63,21 @@ final class EventLoop {
         wake()
     }
 
-    /// Calls `body` on the loop thread about every `interval` seconds until it returns false.
-    func addTicker(owner: AnyObject, interval: TimeInterval, _ body: @escaping () -> Bool) {
+    /// Calls `body` on the loop thread after `interval` seconds, then again after the interval it returns, until it
+    /// returns nil. Idle owners return long intervals, so the phone isn't woken ten times a second for nothing.
+    func addTicker(owner: AnyObject, interval: TimeInterval, _ body: @escaping () -> TimeInterval?) {
         let id = ObjectIdentifier(owner)
         post { [weak self] in
-            self?.tickers.append((id, interval, Date.timeIntervalSinceReferenceDate + interval, body))
+            self?.tickers.append((id, Date.timeIntervalSinceReferenceDate + interval, body))
+        }
+    }
+
+    /// Runs `owner`'s ticker right away (it became busy while ticking slowly).
+    func tickSoon(owner: AnyObject) {
+        let id = ObjectIdentifier(owner)
+        post { [weak self] in
+            guard let self else { return }
+            for i in self.tickers.indices where self.tickers[i].id == id { self.tickers[i].next = 0 }
         }
     }
 
@@ -109,13 +119,13 @@ final class EventLoop {
             var i = 0
             while i < tickers.count {
                 if tickers[i].next <= now {
-                    tickers[i].next = now + tickers[i].interval
-                    if !tickers[i].body() { tickers.remove(at: i); continue }
+                    guard let interval = tickers[i].body() else { tickers.remove(at: i); continue }
+                    tickers[i].next = now + interval
                 }
                 i += 1
             }
-            let nextTick = tickers.map(\.next).min() ?? now + 0.5
-            let timeout = Int32(max(0, min(0.5, nextTick - Date.timeIntervalSinceReferenceDate)) * 1000) + 1
+            let nextTick = tickers.map(\.next).min() ?? now + 1
+            let timeout = Int32(max(0, min(1, nextTick - Date.timeIntervalSinceReferenceDate)) * 1000) + 1
 
             pfds.removeAll(keepingCapacity: true)
             order.removeAll(keepingCapacity: true)
