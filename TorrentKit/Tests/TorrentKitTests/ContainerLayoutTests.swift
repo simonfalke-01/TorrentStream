@@ -202,6 +202,42 @@ final class ContainerLayoutTests: XCTestCase {
         XCTAssertEqual(body?.prefix(Int(a.lowerBound)), m.data.prefix(Int(a.lowerBound)))
     }
 
+    /// A warm-up's want spanning attachments the player can do without asks for them last: the head and the first
+    /// cluster come first.
+    func testWantedAttachmentsComeAfterTheFirstCluster() throws {
+        let m = Self.makeMKV(attachmentBytes: 300_000)
+        let a = try XCTUnwrap(m.attachments)
+        let pl = 16384
+        let data = makeTorrent(m.data, name: "ep.mkv", pieceLength: pl)
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let client = TorrentClient(downloadDirectory: dir, useDHT: false, extraTrackers: [])
+        defer { client.shutdown() }
+        let torrent = try client.add(torrentData: data)
+        let info = try XCTUnwrap(torrent.torrentInfo)
+        let layout = try XCTUnwrap(MatroskaLayout.parse(m.data))
+        torrent.lock.lock()
+        torrent.containers[0] = ContainerState(layout: layout)
+        torrent.lock.unlock()
+        torrent.want(fileIndex: 0, ranges: [0..<m.cluster + 100_000], urgency: .soon, tag: "warm")
+
+        func order(_ priority: Int) -> [Int] {
+            torrent.lock.lock(); defer { torrent.lock.unlock() }
+            torrent.rebuildOrder(info)
+            return torrent.spans.filter { $0.priority == priority }.map(\.piece)
+        }
+        let pieces = order(Span.soon)
+        let all = Array(0...Int(m.cluster + 100_000 - 1) / pl)
+        let insideAttachments = Int(a.lowerBound) / pl + 1, afterCluster = Int(m.cluster) / pl + 1
+        XCTAssertEqual(pieces.first, 0)
+        XCTAssertLessThan(try XCTUnwrap(pieces.firstIndex(of: afterCluster)), try XCTUnwrap(pieces.firstIndex(of: insideAttachments)))
+        XCTAssertEqual(Set(pieces), Set(all), "the fonts are still asked for")
+
+        // A want the player blocks on is taken as it is.
+        torrent.want(fileIndex: 0, ranges: [0..<m.cluster + 100_000], urgency: .now, tag: "warm")
+        XCTAssertEqual(order(Span.now), all)
+    }
+
     /// With `skipsUndownloadedAttachments` off, the file is served exactly as it is.
     func testAttachmentsServedAsIsWhenSkippingIsOff() throws {
         let m = Self.makeMKV(attachmentBytes: 300_000)

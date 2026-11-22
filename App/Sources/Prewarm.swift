@@ -153,6 +153,10 @@ final class Prewarmer {
     /// 1080p episode with margin.
     static let headBytes: Int64 = 28 << 20
     private static let tailBytes: Int64 = 2 << 20
+    /// Matroska ends with its Cues (tens of kilobytes): a smaller guess leaves the first megabytes to the head.
+    private static let matroskaTailBytes: Int64 = 256 << 10
+    /// The container's first elements (EBML header, SeekHead, Info, Tracks), before the index or anything else.
+    private static let leadBytes: Int64 = 512 << 10
     private static let mb: Int64 = 1 << 20
 
     init(app: AppModel) {
@@ -298,15 +302,17 @@ final class Prewarmer {
         let w = Warm(key: t.key, torrent: torrent, fileIndex: fileIndex, reason: t.reason, scope: scope)
         warms[t.key] = w
         let tag = Self.tag(t.key)
-        let tail = max(0, length - Self.tailBytes)..<length
+        let matroska = ["mkv", "mka", "mk3d", "webm"].contains(r.file.fileExtension)
+        let tail = max(0, length - (matroska ? Self.matroskaTailBytes : Self.tailBytes))..<length
+        let lead = 0..<min(length, Self.leadBytes)
 
-        // Before the index is known: the head, the tail (where Matroska Cues and many MP4 sample tables are) and,
-        // when resuming, the spot estimated by proportion.
-        var guess: [Range<Int64>] = [tail]
+        // Before the index is known, in this order: the first elements, the tail (where Matroska Cues and many MP4
+        // sample tables are), then the spot estimated by proportion when resuming, and the head.
+        var guess: [Range<Int64>] = [lead, tail]
         if let f = t.resumeFraction, f > 0 {
             let at = Int64(Double(length) * min(1, f))
-            guess.append(0..<min(length, 4 * Self.mb))
             guess.append(max(0, at - 2 * Self.mb)..<min(length, at + 10 * Self.mb))
+            guess.append(0..<min(length, 4 * Self.mb))
         } else {
             guess.append(0..<min(length, Self.headBytes))
         }
@@ -329,7 +335,8 @@ final class Prewarmer {
             let headerEnd = min(first.clusterOffset, 32 * Self.mb)
             let duration = index.duration ?? index.keyframes.last?.time ?? 0
             let rate = duration > 0 ? Double(length) / duration : 0
-            soon = [tail, 0..<min(length, headerEnd + 2 * Self.mb)]
+            // The engine leaves embedded fonts it can serve as a Void element until after the first cluster.
+            soon = [lead, tail, 0..<min(length, headerEnd + 2 * Self.mb)]
             if let at = t.resumeAt, at > 0, let gop = Self.pictures(index, at: at, length: length) {
                 soon.append(gop)
             } else {

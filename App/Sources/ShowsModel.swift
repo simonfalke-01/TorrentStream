@@ -668,6 +668,25 @@ final class ShowsModel: ObservableObject {
         return list
     }
 
+    /// The releases to try for Play: returns as soon as the best one is clear (`SourceFinder.quickSources`), without
+    /// waiting for the slower searches; the full list is kept for the versions sheet when they finish.
+    private func quickSources(_ d: ShowDetails, _ s: ShowSeason, _ e: ShowEpisode) async throws -> [EpisodeSource] {
+        let key = Self.key(d.show.id, s.id, e.number)
+        if let c = sourceCache[key], Date().timeIntervalSince(c.at) < 600 { return c.list }
+        var prefs = preferences
+        prefs.group = groups[String(d.show.id)]
+        let store = app.torrentFiles
+        let started = Date()
+        let list = try await SourceFinder(nyaa: app.nyaa).quickSources(for: d, season: s, episode: e, prefs: prefs, provisional: { partial in
+            store.prefetch(partial.prefix(2).compactMap(\.result.torrentURL))
+        }, completed: { [weak self] full in
+            Task { @MainActor in self?.sourceCache[key] = (Date(), full) }
+        })
+        PlaybackTrace.shared.timing("search settled on \(list.first?.result.title ?? "nothing")", since: started)
+        store.prefetch(list.prefix(2).compactMap(\.result.torrentURL))
+        return list
+    }
+
     /// Release and file used for an episode last time, if it was saved.
     func savedSource(_ d: ShowDetails, _ s: ShowSeason, _ e: ShowEpisode) -> SavedSource? {
         savedSources[Self.key(d.show.id, s.id, e.number)]
@@ -718,7 +737,7 @@ final class ShowsModel: ObservableObject {
         if let source {
             candidates = [source]
         } else {
-            candidates = Array(try await sources(d, s, e).prefix(4))
+            candidates = Array(try await quickSources(d, s, e).prefix(4))
         }
         PlaybackTrace.shared.mark("resolve: \(candidates.count) candidates; first: \(candidates.first?.result.title ?? "none")")
         guard !candidates.isEmpty else { throw ShowError.noSources }
@@ -738,6 +757,11 @@ final class ShowsModel: ObservableObject {
             PlaybackTrace.shared.mark("resolve: playing \(f.displayPath) (\(f.length / 1_000_000) MB, pieces \(info.pieceLength / 1024) KB)")
             let saved = SavedSource(infoHash: t.infoHashHex, fileIndex: f.index, magnet: c.result.magnet ?? t.magnetLink,
                                     torrentURL: c.result.torrentURL, group: c.group, isBatch: c.isBatch)
+            if source == nil, savedSources[key] == nil {
+                // Found by searching: kept so a later launch opens it without searching again.
+                planned[key] = PlannedSource(source: saved, at: Date())
+                save()
+            }
             return ResolvedEpisode(torrent: t, file: f, source: saved)
         }
         throw ShowError.unplayable

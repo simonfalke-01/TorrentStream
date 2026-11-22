@@ -108,6 +108,26 @@ final class SourceKitTests: XCTestCase {
         XCTAssertGreaterThan(s("A - 01 [Dual Audio] (1080p)", SourcePreferences(preferDub: true)), s("A - 01 (1080p)", SourcePreferences(preferDub: true)))
     }
 
+    func testConfidentPick() {
+        func src(_ name: String, seeders: Int, batch: Bool = false) -> EpisodeSource {
+            EpisodeSource(result: Self.result(name, seeders: seeders), release: ReleaseName.parse(name), traits: .parse(name),
+                          isBatch: batch, score: 0)
+        }
+        let prefs = SourcePreferences()
+        let good = src("[SubsPlease] A - 01 (1080p) [ABCD1234].mkv", seeders: 40)
+        XCTAssertTrue(SourceFinder.isConfident(good, prefs: prefs, episodeSearched: false))
+        XCTAssertTrue(SourceFinder.isConfident(src("[SubsPlease] A - 01 (1080p)", seeders: 12), prefs: prefs, episodeSearched: true))
+        // Before the episode's own search answers: only a large single-episode swarm.
+        XCTAssertFalse(SourceFinder.isConfident(src("[SubsPlease] A - 01 (1080p)", seeders: 12), prefs: prefs, episodeSearched: false))
+        XCTAssertFalse(SourceFinder.isConfident(src("[Group] A (01-12) (1080p)", seeders: 200, batch: true), prefs: prefs,
+                                                episodeSearched: false))
+        XCTAssertFalse(SourceFinder.isConfident(src("[SubsPlease] A - 01 (1080p)", seeders: 3), prefs: prefs, episodeSearched: true))
+        XCTAssertFalse(SourceFinder.isConfident(src("[SubsPlease] A - 01 (720p)", seeders: 100), prefs: prefs, episodeSearched: true))
+        XCTAssertFalse(SourceFinder.isConfident(good, prefs: SourcePreferences(group: "Erai-raws"), episodeSearched: true))
+        XCTAssertTrue(SourceFinder.isConfident(good, prefs: SourcePreferences(group: "SubsPlease"), episodeSearched: true))
+        XCTAssertFalse(SourceFinder.isConfident(good, prefs: SourcePreferences(preferDub: true), episodeSearched: true))
+    }
+
     static func result(_ title: String, seeders: Int) -> NyaaResult {
         let html = """
         <table class="torrent-list"><tbody><tr class="default">

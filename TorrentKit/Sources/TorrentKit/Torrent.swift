@@ -558,7 +558,10 @@ public final class Torrent {
         tickingSlowly = idle
         var layoutFiles: [Int] = []
         if let info = info {
-            layoutFiles = (streamingFiles.sorted() + (prefetchTarget.map { [$0.fileIndex] } ?? [])).filter { layoutPendingLocked($0, info) }
+            // Matroska files a want asks for too: their layout puts embedded fonts after what the first frame needs.
+            let wanted = Set(wants.values.map(\.fileIndex)).subtracting(streamingFiles).filter { $0 >= 0 && $0 < info.files.count }
+            layoutFiles = (streamingFiles.sorted() + (prefetchTarget.map { [$0.fileIndex] } ?? []) + wanted.sorted())
+                .filter { layoutPendingLocked($0, info) }
         }
         lock.unlock()
 
@@ -970,6 +973,22 @@ public final class Torrent {
             metadataPieces = Array(repeating: nil, count: metadataPieces.count)
         }
         metadataRequestedAt.removeAll()
+    }
+
+    /// Gives a torrent added by magnet or info-hash its metainfo from a .torrent file fetched meanwhile, so it can
+    /// join the swarm (trackers, DHT, peers) while the file downloads instead of after. Returns whether the torrent
+    /// has its metainfo now; false when `info` belongs to another torrent.
+    @discardableResult
+    public func installInfo(_ info: TorrentInfo) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard info.infoHash == infoHash else { return false }
+        guard self.info == nil, !stopped else { return self.info != nil }
+        log("\(infoHashHex.prefix(8)): metainfo installed from the .torrent file")
+        try? info.rawInfo.write(to: infoFile)
+        setInfo(info)
+        metadataRequestedAt.removeAll()
+        requestRescheduleLocked()
+        return true
     }
 
     /// Called with lock held.

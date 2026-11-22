@@ -75,7 +75,8 @@ public final class TorrentClient {
         try add(descriptor: TorrentDescriptor.parse(magnet: magnet), paused: paused)
     }
 
-    /// Adds a .torrent file. Returns the existing torrent if already added.
+    /// Adds a .torrent file. Returns the existing torrent if already added, giving it the file's metainfo if it was
+    /// added by magnet and has none yet.
     @discardableResult
     public func add(torrentData: Data, paused: Bool = false) throws -> Torrent {
         try add(descriptor: TorrentDescriptor.parse(torrentData: torrentData), paused: paused)
@@ -84,7 +85,11 @@ public final class TorrentClient {
     @discardableResult
     public func add(descriptor: TorrentDescriptor, paused: Bool = false) throws -> Torrent {
         lock.lock()
-        if let existing = torrentsByHash[descriptor.infoHashHex] { lock.unlock(); return existing }
+        if let existing = torrentsByHash[descriptor.infoHashHex] {
+            lock.unlock()
+            if let info = descriptor.info, existing.torrentInfo == nil { existing.installInfo(info) }
+            return existing
+        }
         let dir = downloadDirectory.appendingPathComponent(descriptor.infoHashHex, isDirectory: true)
         let t = Torrent(descriptor: descriptor, client: self, directory: dir, peerID: peerID)
         torrentsByHash[descriptor.infoHashHex] = t

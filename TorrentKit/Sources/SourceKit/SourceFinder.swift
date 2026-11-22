@@ -39,44 +39,143 @@ public final class SourceFinder: @unchecked Sendable {
     }
 
     /// `provisional` is called with the releases ranked so far each time one of the searches answers before the
-    /// last, so the caller can start fetching the likely winners' .torrent files while the rest are still running.
+    /// last (and before a second round of searches), so the caller can start fetching the likely winners' .torrent
+    /// files while the rest are still running.
     public func sources(for details: ShowDetails, season: ShowSeason, episode: ShowEpisode,
                         prefs: SourcePreferences,
                         provisional: (@Sendable ([EpisodeSource]) -> Void)? = nil) async throws -> [EpisodeSource] {
+        try await run(details: details, season: season, episode: episode, prefs: prefs) { partial, _ in provisional?(partial) }
+    }
+
+    /// Like `sources`, but returns as soon as a confident pick is ranked first (`isConfident`): once the episode's
+    /// own search has answered, or earlier when an answer already on hand (the season-wide search a warm-up made)
+    /// holds a single-episode release with a large swarm. The other searches go on; `completed` gets the full list
+    /// (also when it is what's returned).
+    public func quickSources(for details: ShowDetails, season: ShowSeason, episode: ShowEpisode,
+                             prefs: SourcePreferences,
+                             provisional: (@Sendable ([EpisodeSource]) -> Void)? = nil,
+                             completed: (@Sendable ([EpisodeSource]) -> Void)? = nil) async throws -> [EpisodeSource] {
+        let gate = Gate()
+        return try await withCheckedThrowingContinuation { cont in
+            gate.set(cont)
+            Task {
+                do {
+                    let list = try await self.run(details: details, season: season, episode: episode, prefs: prefs) { partial, specific in
+                        provisional?(partial)
+                        if let top = partial.first, Self.isConfident(top, prefs: prefs, episodeSearched: specific) {
+                            gate.finish(.success(partial))
+                        }
+                    }
+                    gate.finish(.success(list))
+                    completed?(list)
+                } catch {
+                    gate.finish(.failure(error))
+                }
+            }
+        }
+    }
+
+    /// A release worth starting without waiting for the remaining searches: the wanted resolution (and audio, and
+    /// the show's group when one was chosen) with a healthy swarm. Before the episode's own search answered, only a
+    /// single-episode release with a large swarm qualifies, since that search may still find a better one.
+    static func isConfident(_ s: EpisodeSource, prefs: SourcePreferences, episodeSearched: Bool) -> Bool {
+        guard s.traits.resolution == (prefs.resolution ?? 1080) else { return false }
+        if let g = prefs.group, ReleaseName.normalize(g) != ReleaseName.normalize(s.release.group ?? "") { return false }
+        if prefs.preferDub && !s.traits.hasEnglishAudio { return false }
+        if episodeSearched { return s.result.seeders >= 10 }
+        return !s.isBatch && s.result.seeders >= 30
+    }
+
+    private final class Gate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var cont: CheckedContinuation<[EpisodeSource], Error>?
+        func set(_ c: CheckedContinuation<[EpisodeSource], Error>) { lock.lock(); cont = c; lock.unlock() }
+        func finish(_ r: Result<[EpisodeSource], Error>) {
+            lock.lock(); let c = cont; cont = nil; lock.unlock()
+            c?.resume(with: r)
+        }
+    }
+
+    /// `partial` gets the ranking so far and whether the episode's own search (the first query) has answered.
+    private func run(details: ShowDetails, season: ShowSeason, episode: ShowEpisode, prefs: SourcePreferences,
+                     partial: @escaping @Sendable ([EpisodeSource], Bool) -> Void) async throws -> [EpisodeSource] {
         let queries = Self.queries(details: details, season: season, episode: episode)
-        var results = try await search(queries) { partial in
-            provisional?(Self.rank(partial, details: details, season: season, episode: episode, prefs: prefs))
+        var results = try await search(queries) { found, answered in
+            partial(Self.rank(found, details: details, season: season, episode: episode, prefs: prefs), answered.contains(0))
         }
         var sources = Self.rank(results, details: details, season: season, episode: episode, prefs: prefs)
         if sources.count < 3 {
             let extra = Self.fallbackQueries(details: details, season: season, episode: episode).filter { !queries.contains($0) }
-            if !extra.isEmpty, let more = try? await search(extra, partial: nil) {
-                results += more
-                sources = Self.rank(results, details: details, season: season, episode: episode, prefs: prefs)
+            if !extra.isEmpty {
+                // What the first round found may already do.
+                if !sources.isEmpty { partial(sources, true) }
+                if let more = try? await search(extra, partial: nil) {
+                    results += more
+                    sources = Self.rank(results, details: details, season: season, episode: episode, prefs: prefs)
+                }
             }
         }
         return sources
     }
 
-    /// Runs searches side by side. Fails only when every one fails.
-    private func search(_ queries: [NyaaQuery], partial: (([NyaaResult]) -> Void)?) async throws -> [NyaaResult] {
-        try await withThrowingTaskGroup(of: Result<[NyaaResult], Error>.self) { group in
-            for q in queries {
+    /// Answers by query, kept a few minutes: a show page's warm-up searches the whole season, and an episode tapped
+    /// next reuses that answer.
+    private final class AnswerCache: @unchecked Sendable {
+        private let lock = NSLock()
+        private var answers: [NyaaQuery: (at: Date, results: [NyaaResult])] = [:]
+
+        func get(_ q: NyaaQuery) -> [NyaaResult]? {
+            lock.lock(); defer { lock.unlock() }
+            guard let a = answers[q], Date().timeIntervalSince(a.at) < SourceFinder.answerLifetime else { return nil }
+            return a.results
+        }
+
+        func put(_ q: NyaaQuery, _ results: [NyaaResult]) {
+            lock.lock(); defer { lock.unlock() }
+            let now = Date()
+            answers = answers.filter { now.timeIntervalSince($0.value.at) < SourceFinder.answerLifetime }
+            answers[q] = (now, results)
+        }
+
+        func clear() { lock.lock(); answers.removeAll(); lock.unlock() }
+    }
+
+    private static let answers = AnswerCache()
+    static let answerLifetime: TimeInterval = 300
+
+    /// Forgets the search answers kept, so the next search asks Nyaa again.
+    public static func forgetSearches() { answers.clear() }
+
+    /// Runs searches side by side, answers kept from a moment ago first. Fails only when every one fails. `partial`
+    /// gets what was found so far and which queries (by position) answered, each time before the last.
+    private func search(_ queries: [NyaaQuery], partial: (([NyaaResult], Set<Int>) -> Void)?) async throws -> [NyaaResult] {
+        var out: [NyaaResult] = []
+        var answered = Set<Int>()
+        for (i, q) in queries.enumerated() {
+            if let r = Self.answers.get(q) { out += r; answered.insert(i) }
+        }
+        if answered.count == queries.count { return out }
+        if !out.isEmpty { partial?(out, answered) }
+        let pending = queries.enumerated().filter { !answered.contains($0.offset) }
+        return try await withThrowingTaskGroup(of: (Int, Result<[NyaaResult], Error>).self) { group in
+            for (i, q) in pending {
                 group.addTask {
-                    do { return .success(try await self.nyaa.search(q).results) } catch { return .failure(error) }
+                    do {
+                        let r = try await self.nyaa.search(q).results
+                        Self.answers.put(q, r)
+                        return (i, .success(r))
+                    } catch { return (i, .failure(error)) }
                 }
             }
-            var out: [NyaaResult] = []
             var lastError: Error?
-            var anySuccess = false
-            var answered = 0
-            for try await r in group {
-                answered += 1
+            var anySuccess = !answered.isEmpty
+            for try await (i, r) in group {
+                answered.insert(i)
                 switch r {
                 case .success(let list):
                     out += list
                     anySuccess = true
-                    if answered < queries.count, !list.isEmpty { partial?(out) }
+                    if answered.count < queries.count, !list.isEmpty { partial?(out, answered) }
                 case .failure(let e): lastError = e
                 }
             }

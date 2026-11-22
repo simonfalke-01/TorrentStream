@@ -219,6 +219,26 @@ final class TorrentKitTests: XCTestCase {
         XCTAssertEqual(try torrent.readData(fileIndex: 0, offset: 60_000, length: 10_000), content.subdata(in: 60_000..<70_000))
     }
 
+    /// A torrent joined by magnet while its .torrent file downloads gets its metainfo from the file when that comes
+    /// first, without waiting for a peer to send it.
+    func testTorrentFileCompletesAMagnet() throws {
+        let (data, _) = makeTorrent(files: [("a.mkv", 70_000)], pieceLength: 16384)
+        let desc = try TorrentDescriptor.parse(torrentData: data)
+        let (other, _) = makeTorrent(files: [("b.mkv", 50_000)], pieceLength: 16384)
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let client = TorrentClient(downloadDirectory: dir, useDHT: false, extraTrackers: [])
+        defer { client.shutdown() }
+        let torrent = try client.add(magnet: "magnet:?xt=urn:btih:\(desc.infoHashHex)")
+        XCTAssertNil(torrent.torrentInfo)
+        XCTAssertFalse(torrent.installInfo(try XCTUnwrap(TorrentDescriptor.parse(torrentData: other).info)), "another torrent's")
+        XCTAssertNil(torrent.torrentInfo)
+        let same = try client.add(torrentData: data)
+        XCTAssertTrue(same === torrent)
+        XCTAssertEqual(torrent.torrentInfo?.files.first?.displayPath, "sub/a.mkv")
+        XCTAssertNotNil(torrent.waitForInfo(timeout: 0.1))
+    }
+
     /// Pieces restored from a resume file are served by `availableData` right away (no re-hash while their files are
     /// intact); anything touching a missing piece (here: recorded, but its file was truncated) is nil, and asking never
     /// registers a reader.

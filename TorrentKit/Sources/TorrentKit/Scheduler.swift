@@ -94,9 +94,21 @@ extension Torrent {
         for (id, r) in readers { readers[id]?.settledUntil = settledUntilLocked(r, info, now: now) }
         let activeReaders = readers.values.filter { $0.fileIndex < info.files.count }.sorted { $0.updated > $1.updated }
         let sortedWants = wants.values.filter { $0.fileIndex >= 0 && $0.fileIndex < info.files.count }.sorted { $0.seq > $1.seq }
+        // Embedded fonts the player can do without (served as a Void element while missing) come last in a want, after
+        // the first cluster that follows them: a warm-up's first megabytes go to what the first frame waits on.
+        var wantSkipped: [Int: Range<Int64>] = [:]
+        for w in sortedWants where w.urgency != .now && wantSkipped[w.fileIndex] == nil {
+            if let a = skippedAttachmentsLocked(w.fileIndex, info) { wantSkipped[w.fileIndex] = a }
+        }
         func wantRanges(_ u: RangeUrgency, _ priority: Int) {
             for w in sortedWants where w.urgency == u {
                 for r in w.ranges {
+                    if let a = wantSkipped[w.fileIndex], u != .now, r.lowerBound < a.upperBound, r.upperBound > a.upperBound {
+                        fileRange(w.fileIndex, r.lowerBound, min(r.upperBound, a.lowerBound), priority)
+                        fileRange(w.fileIndex, a.upperBound, r.upperBound, priority)
+                        fileRange(w.fileIndex, max(r.lowerBound, a.lowerBound), a.upperBound, priority)
+                        continue
+                    }
                     fileRange(w.fileIndex, r.lowerBound, r.upperBound, priority, raceHead: priority == Span.now ? Torrent.raceHeadBlocks : 0)
                 }
             }

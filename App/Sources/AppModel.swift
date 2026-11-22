@@ -291,11 +291,46 @@ final class AppModel: ObservableObject {
         }
         let fetchStart = Date()
         var fetched: Data?
+        var wasCached = false
+        if let url = torrentURL { wasCached = await torrentFiles.cached(url) != nil }
+        // Without the .torrent on disk, the swarm is joined by info-hash at once (trackers, DHT, connections) and the
+        // file's metainfo is installed when its download finishes, so the two overlap instead of adding up.
+        var joined: Torrent?
+        if torrentURL != nil, !wasCached,
+           let link = magnet ?? infoHash.map({ "magnet:?xt=urn:btih:\($0)" }), let t = try? client.add(magnet: link) {
+            joined = t
+            didAddSource(t)
+            PlaybackTrace.shared.mark("joined the swarm while the .torrent downloads")
+        }
         if let url = torrentURL {
-            let wasCached = await torrentFiles.cached(url) != nil
-            fetched = try? await torrentFiles.data(for: url)
-            PlaybackTrace.shared.mark(String(format: "torrent file %@ in %.2fs", fetched == nil ? "failed" : (wasCached ? "on disk" : "fetched"),
+            if let joined {
+                // Peers sometimes send the metadata before the file arrives: whichever comes first. The file is still
+                // kept when it lands, for later launches.
+                let hash = joined.infoHashHex
+                let download = TorrentDownload()
+                Task { [weak self, store = torrentFiles] in
+                    let data = try? await store.data(for: url)
+                    if let self, let data, (try? TorrentDescriptor.parse(torrentData: data))?.infoHashHex == hash {
+                        // Returns the torrent added by info-hash, now with the file's metainfo (unless it has it).
+                        _ = try? self.client.add(torrentData: data)
+                        try? data.write(to: self.torrentFileURL(hash))
+                        download.data = data
+                    }
+                    download.done = true
+                }
+                while !download.done, joined.torrentInfo == nil { try? await Task.sleep(nanoseconds: 50_000_000) }
+                fetched = download.data
+            } else {
+                fetched = try? await torrentFiles.data(for: url)
+            }
+            PlaybackTrace.shared.mark(String(format: "torrent file %@ in %.2fs", fetched == nil
+                                                 ? (joined?.torrentInfo != nil ? "beaten by the peers' metadata" : "failed")
+                                                 : (wasCached ? "on disk" : "fetched"),
                                              Date().timeIntervalSince(fetchStart)))
+        }
+        if let joined {
+            if joined.torrentInfo == nil { PlaybackTrace.shared.mark("metadata comes from peers") }
+            return joined
         }
         if let data = fetched {
             let hash = (try? TorrentDescriptor.parse(torrentData: data))?.infoHashHex
@@ -315,6 +350,12 @@ final class AppModel: ObservableObject {
             return t
         }
         return nil
+    }
+
+    /// A .torrent download raced against the peers' metadata (`addSource`).
+    private final class TorrentDownload {
+        var data: Data?
+        var done = false
     }
 
     private func didAddSource(_ t: Torrent) {
@@ -924,7 +965,9 @@ final class AppModel: ObservableObject {
             let status = t.status()
             let wanted = status.files.filter { $0.wanted }.map { $0.file.index }
             return SavedEntry(infoHash: t.infoHashHex, magnet: t.descriptor.magnetURI,
-                              hasTorrentFile: t.descriptor.torrentData != nil, wantedFiles: wanted,
+                              hasTorrentFile: t.descriptor.torrentData != nil
+                                  || FileManager.default.fileExists(atPath: torrentFileURL(t.infoHashHex).path),
+                              wantedFiles: wanted,
                               paused: status.isPaused, addedAt: addedAt[t.infoHashHex],
                               isSource: sourceHashes.contains(t.infoHashHex) ? true : nil)
         }
