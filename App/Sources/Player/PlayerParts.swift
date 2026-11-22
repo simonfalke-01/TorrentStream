@@ -166,22 +166,23 @@ struct StreamScrubber: View {
                     .shadow(color: .black.opacity(0.3), radius: 3)
                     .offset(x: width * shown - thumb / 2)
             }
-            .overlay(alignment: .leading) {
+            .frame(maxHeight: .infinity)
+            // Laid out against the scrubber's whole frame, bottom edges together, then lifted by a fixed amount:
+            // the bubble's bottom ends `bubbleGap` above the bar's middle whatever its height, so it can only
+            // ever extend upwards, over the video.
+            .overlay(alignment: .bottomLeading) {
                 if let s = scrub, duration > 0 {
                     bubble(s)
-                        // Its own size, not the bar's: offered only the bar's height, the card was squeezed, its
-                        // caption drawn over the picture and the rest spilled below the bar off the screen.
+                        // Its own size, not the bar's: offered only the bar's height, the card was squeezed.
                         .fixedSize()
                         .alignmentGuide(.leading) { d in
                             let x = width * s - d.width / 2
                             return -min(max(x, 0), max(width - d.width, 0))
                         }
-                        // Bottom edge a fixed gap above the bar, however tall the bubble is.
-                        .alignmentGuide(VerticalAlignment.center) { d in d.height + bubbleGap }
+                        .offset(y: -(height / 2 + bubbleGap))
                         .allowsHitTesting(false)
                 }
             }
-            .frame(maxHeight: .infinity)
             .contentShape(.rect)
             .gesture(
                 DragGesture(minimumDistance: 0)

@@ -127,3 +127,93 @@ final class SecondarySubtitles: ObservableObject {
         return try? (body as NSData).decompressed(using: .zlib) as Data
     }
 }
+
+/// The subtitle line already on screen where playback lands. libVLC reads a Matroska file's subtitles from the
+/// keyframe it seeks to (demux/mkv SegmentSeeker::get_seekpoints takes subtitle seekpoints at or after the video
+/// keyframe), so a line that began before that keyframe never shows and the screen stays empty until the next
+/// one. The app draws that line itself, from the same track, until it ends.
+@MainActor
+final class CarriedSubtitle: ObservableObject {
+    @Published private(set) var text: String?
+
+    private static let tag = "player.subtitle.carry"
+    private var reader: MatroskaSubtitleReader?
+    private var torrent: Torrent?
+    private var fileIndex = 0
+    private var cues: [SubtitleCue] = []
+    private var task: Task<Void, Never>?
+    private var time: Double = 0
+    private var landedAt: Double?
+
+    func prepare(_ request: PlaybackRequest) {
+        guard reader == nil, request.file.fileExtension == "mkv" else { return }
+        let torrent = request.torrent
+        let index = request.file.index
+        self.torrent = torrent
+        fileIndex = index
+        reader = MatroskaSubtitleReader(fileLength: request.file.length, decompress: { SecondarySubtitles.inflate($0) }) { offset, length in
+            torrent.availableData(fileIndex: index, offset: offset, length: length)
+        }
+    }
+
+    /// The Matroska track number of a libVLC subtitle track: libVLC names a file's own tracks "spu/<TrackNumber>"
+    /// (es_out.c EsOutCreateStrId with the demuxer's i_id); added files and closed captions are named otherwise.
+    static func trackNumber(_ id: String) -> Int? {
+        let parts = id.split(separator: "/")
+        guard parts.count == 2, parts[0] == "spu" else { return nil }
+        return Int(parts[1])
+    }
+
+    /// Playback landed at `time`, read from `keyframe` on, with `track` showing (nil: none of the file's own).
+    /// - Parameters:
+    ///   - delay: the subtitle delay, in seconds.
+    ///   - bytes: where the lines before the keyframe are, fetched soon so they can be read.
+    func landed(at time: Double, keyframe: Double, track: Int?, delay: Double, bytes: Range<Int64>?) {
+        task?.cancel()
+        task = nil
+        cues = []
+        if text != nil { text = nil }
+        torrent?.clearWants(tag: Self.tag)
+        landedAt = time
+        guard let track, let reader, keyframe <= time + 0.05 else { return }
+        if let bytes, let torrent { torrent.want(fileIndex: fileIndex, ranges: [bytes], urgency: .soon, tag: Self.tag) }
+        task = Task { [weak self] in
+            // Lines last a few seconds; past that there's nothing left to carry.
+            for _ in 0..<10 {
+                let found = (try? await reader.cues(track: track, from: time - delay, to: time - delay)) ?? []
+                guard !Task.isCancelled, let self else { return }
+                let carried = found
+                    .filter { $0.start + delay < keyframe - 0.05 && $0.end + delay > time }
+                    .map { SubtitleCue(start: $0.start + delay, end: $0.end + delay, text: $0.text) }
+                if !carried.isEmpty || found.contains(where: { $0.start + delay >= keyframe - 0.05 }) {
+                    self.torrent?.clearWants(tag: Self.tag)
+                    self.cues = carried
+                    self.update(time: self.time)
+                    return
+                }
+                try? await Task.sleep(for: .milliseconds(400))
+                if Task.isCancelled || self.time > time + 4 { return }
+            }
+            self?.torrent?.clearWants(tag: Self.tag)
+        }
+    }
+
+    func update(time: Double) {
+        self.time = time
+        guard !cues.isEmpty else { return }
+        // Moved back before the spot without a landing (a reopen still on its way): the line no longer belongs.
+        if let at = landedAt, time < at - 1 { cues = [] }
+        let now = cues.filter { $0.start <= time && time < $0.end }.map(\.text)
+        let joined = now.isEmpty ? nil : now.joined(separator: "\n")
+        if joined != text { text = joined }
+        if joined == nil, cues.allSatisfy({ $0.end <= time }) { cues = [] }
+    }
+
+    func clear() {
+        task?.cancel()
+        task = nil
+        cues = []
+        if text != nil { text = nil }
+        torrent?.clearWants(tag: Self.tag)
+    }
+}

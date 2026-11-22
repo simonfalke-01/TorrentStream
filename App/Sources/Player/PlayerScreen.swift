@@ -209,6 +209,8 @@ private struct PlayerChrome: View {
     @State private var catalogSkips: [SkipSegment] = []
     /// The opening and ending found in the episode's audio.
     @StateObject private var contentSkips = ContentSkipsModel()
+    /// The subtitle line libVLC skips over at a seek.
+    @StateObject private var carried = CarriedSubtitle()
 
     /// Seconds played without stalling; the next episode is fetched only once playback has settled.
     @State private var steadySeconds = 0
@@ -312,6 +314,7 @@ private struct PlayerChrome: View {
         .onAppear {
             if request.resumeAt != nil { flashResumed() }
             upNext = nextItem()
+            carried.prepare(request)
             scheduleHide()
             contentSkips.start(request) { [shows, request] in shows.preparedNext(after: request) }
         }
@@ -322,6 +325,7 @@ private struct PlayerChrome: View {
             request.torrent.clearWants(tag: Self.skipsTag)
             request.torrent.clearWants(tag: Self.jumpsTag)
             contentSkips.stop()
+            carried.clear()
             countdownTask?.cancel()
             hideTask?.cancel()
             sleepTask?.cancel()
@@ -331,7 +335,7 @@ private struct PlayerChrome: View {
         .onChange(of: engine.didFinish) { _, done in
             if done { handleFinish() } else { cancelCountdown() }
         }
-        .onChange(of: engine.isPlaying) { _, playing in
+        .onChange(of: engine.wantsToPlay) { _, playing in
             if playing { scheduleHide() } else if !locked { reveal(autoHide: false) }
         }
         .onChange(of: engine.duration > 0, initial: true) { _, known in
@@ -341,9 +345,11 @@ private struct PlayerChrome: View {
             loadSkips()
         }
         .onChange(of: Int(engine.currentTime)) {
+            // The catalog's episode list may arrive after the player opened.
+            if upNext == nil, Int(engine.currentTime) % 5 == 0 { upNext = nextItem() }
             // Going back before the ending brings the card back the next time the ending comes round.
             if nextDismissed, !engine.didFinish, engine.duration > 0,
-               engine.currentTime < (creditsStart ?? engine.duration) - 2 {
+               engine.currentTime < (nextCardStart ?? engine.duration) - 2 {
                 nextDismissed = false
             }
             guard engine.isPlaying, !engine.isBuffering, engine.duration > 0 else { return }
@@ -364,7 +370,15 @@ private struct PlayerChrome: View {
             stats.isWaiting = waiting
             PlaybackTrace.shared.mark(waiting ? "waiting for data" : "playing")
         }
-        .onChange(of: Int(engine.currentTime * 4)) { secondary.update(time: engine.currentTime) }
+        .onChange(of: Int(engine.currentTime * 4)) {
+            secondary.update(time: engine.currentTime)
+            carried.update(time: engine.currentTime)
+        }
+        .onChange(of: engine.landing, initial: true) { _, landing in carrySubtitle(landing) }
+        .onChange(of: engine.currentSubtitle) {
+            // The track libVLC chose as the file opened: the line at the spot is that track's.
+            if let l = engine.landing, abs(engine.currentTime - l.time) < 3 { carrySubtitle(l) } else { carried.clear() }
+        }
         // PiP shows only the video layer; the second line is drawn into its frames there.
         .onChange(of: secondary.text, initial: true) { _, text in engine.output.setSecondarySubtitle(text) }
         .onChange(of: panel) { _, p in if p == nil { scheduleHide() } else { hideTask?.cancel() } }
@@ -422,25 +436,16 @@ private struct PlayerChrome: View {
             let zoom = fillZoom(screen: size)
             ZStack {
                 VideoSurface(output: engine.output)
-                // Until a seek's first new picture, the bar's preview of the spot stands in for the old one, so
-                // the jump shows at once. Only past a beat: a seek answered at once shows no stand-in.
-                if let target = engine.seekPending, let still = previews.image(at: target, tolerance: 10) {
-                    AfterDelay(delay: 0.12) {
-                        Image(uiImage: still)
-                            .resizable()
-                            .scaledToFit()
-                    }
-                    .id(target)
-                    .transition(.opacity)
+                    .scaleEffect(zoom)
+                    .frame(width: size.width, height: size.height)
+                    // Clip to the full screen here; clipping after ignoresSafeArea would cut the picture to the safe
+                    // area and leave a black strip over the home indicator.
+                    .clipped()
+                    .animation(Motion.role(Motion.standard, reduce: reduceMotion), value: zoom)
+                if let line = carried.text, engine.hasFirstFrame, elsewhere == nil {
+                    carriedLine(line, screen: size, zoom: zoom)
                 }
             }
-            .scaleEffect(zoom)
-            .frame(width: size.width, height: size.height)
-            // Clip to the full screen here; clipping after ignoresSafeArea would cut the picture to the safe
-            // area and leave a black strip over the home indicator.
-            .clipped()
-            .animation(Motion.role(Motion.standard, reduce: reduceMotion), value: zoom)
-            .animation(Motion.role(Motion.fast, reduce: reduceMotion), value: engine.seekPending == nil)
         }
         .ignoresSafeArea()
         .overlay {
@@ -452,6 +457,28 @@ private struct PlayerChrome: View {
         }
         .animation(Motion.role(Motion.standard, reduce: reduceMotion), value: engine.hasFirstFrame)
         .accessibilityHidden(true)
+    }
+
+    /// A line libVLC skipped over at a seek, drawn where libVLC draws its own: centered near the foot of the
+    /// picture, white with a dark edge, sized to the picture and the subtitle size setting.
+    private func carriedLine(_ text: String, screen size: CGSize, zoom: CGFloat) -> some View {
+        let v = engine.videoSize
+        let fit = v.width > 0 && v.height > 0 ? min(size.width / v.width, size.height / v.height) : 1
+        let pictureHeight = (v.height > 0 ? v.height * fit : size.height) * zoom
+        let pictureBottom = min(size.height, (size.height + pictureHeight) / 2)
+        let saved = UserDefaults.standard.integer(forKey: SettingsKey.subtitleSize)
+        let scale = CGFloat(SubtitleSize(rawValue: saved)?.rawValue ?? SubtitleSize.medium.rawValue) / 100
+        return Text(text)
+            .font(.system(size: max(14, pictureHeight * 0.05 * scale), weight: .semibold))
+            .multilineTextAlignment(.center)
+            .foregroundStyle(.white)
+            .shadow(color: .black.opacity(0.9), radius: 1)
+            .shadow(color: .black.opacity(0.9), radius: 1)
+            .shadow(color: .black.opacity(0.5), radius: 3)
+            .frame(maxWidth: size.width * 0.86)
+            .padding(.bottom, size.height - pictureBottom + pictureHeight * 0.05)
+            .frame(width: size.width, height: size.height, alignment: .bottom)
+            .allowsHitTesting(false)
     }
 
     private func fillZoom(screen size: CGSize) -> CGFloat {
@@ -849,25 +876,46 @@ private struct PlayerChrome: View {
 
     private var activeSkip: SkipSegment? {
         let t = engine.currentTime
-        // At the credits the Next Episode card is the way on; without one, skip them like anything else.
-        let nextCovers = upNext != nil && !nextDismissed
+        // Where the Next Episode card is up, it's the way on; anything it doesn't cover is skipped like the rest,
+        // so credits with a scene after them get Skip Credits, landing on that scene.
+        let cardFrom = upNext != nil && !nextDismissed ? nextCardStart : nil
         return skips.first { s in
             t >= s.start && t < s.end - 1
-                && !((s.kind == .credits || s.kind == .preview) && nextCovers)
+                && !((s.kind == .credits || s.kind == .preview) && cardFrom.map { s.start >= $0 - 1 } == true)
         }
     }
 
-    /// Where the ending starts, once it's known; until then the card waits for the end of the episode.
-    private var creditsStart: Double? {
-        SkipResolver.nextEpisodeCue(skips, duration: engine.duration)
+    /// The ending: the first credits in the second half.
+    private var credits: SkipSegment? {
+        skips.filter { $0.kind == .credits && $0.start > engine.duration / 2 }.min { $0.start < $1.start }
     }
 
-    /// While the controls are up, the toolbar's Next button stands in for the card, which would otherwise crowd
-    /// the play controls; once the episode has ended they're gone and the card returns.
+    /// Story after the ending and before the preview or the end of the file (a post-credits scene), if long
+    /// enough to be more than a logo.
+    private var epilogue: Range<Double>? {
+        guard let c = credits else { return nil }
+        let preview = skips.filter { $0.kind == .preview && $0.start >= c.end - 5 }.map(\.start).min()
+        let end = preview ?? engine.duration
+        return end - c.end >= Self.epilogueMinimum ? c.end..<end : nil
+    }
+
+    private static let epilogueMinimum: Double = 8
+
+    /// Where the Next Episode card comes up: at the ending; after a scene that follows it, at the preview (or the
+    /// very end); with no ending known, for the last moments of the episode.
+    private var nextCardStart: Double? {
+        let d = engine.duration
+        guard d > 0 else { return nil }
+        guard let c = credits else { return d > 600 ? d - 30 : nil }
+        if let e = epilogue { return e.upperBound < d - 1 ? e.upperBound : nil }
+        return c.start
+    }
+
+    /// The card stays up with the controls: it sits above them, and it's the one thing to do at the ending.
     private var showsNextCard: Bool {
         guard upNext != nil, !nextDismissed, panel == nil, !locked, engine.errorText == nil else { return false }
         if engine.didFinish { return true }
-        guard !showControls, let start = creditsStart, scrub == nil else { return false }
+        guard let start = nextCardStart, scrub == nil else { return false }
         return engine.currentTime >= start
     }
 
@@ -926,11 +974,40 @@ private struct PlayerChrome: View {
     private func updateSkips() {
         let chapters = engine.duration > 0
             ? engine.chapters.map { (name: $0.name, start: $0.start, end: $0.end) } : []
+        let duration = engine.duration
         skips = SkipResolver.segments(catalog: catalogSkips, content: contentSkips.content,
-                                      chapters: chapters, duration: engine.duration)
+                                      chapters: chapters, duration: duration)
+            .filter { Self.plausible($0, duration: duration) }
         // Skipping lands where each segment ends; have those bytes before the button is pressed.
         let ends = skips.map(\.end).filter { $0 > engine.currentTime && $0 < engine.duration - 1 }
         request.torrent.want(fileIndex: request.file.index, ranges: ends.map(seekRange), urgency: .soon, tag: Self.skipsTag)
+    }
+
+    /// Openings and recaps come early, endings and previews late, and each lasts a while: a match anywhere else
+    /// (an opening song played again over the climax, a chapter misnamed) isn't offered.
+    private static func plausible(_ s: SkipSegment, duration: Double) -> Bool {
+        guard duration > 0, s.end - s.start >= 5, s.start < duration - 1 else { return false }
+        switch s.kind {
+        case .intro: return s.start <= duration * 0.5
+        case .recap: return s.start <= duration * 0.35
+        case .credits: return s.start >= duration * 0.5
+        case .preview: return s.start >= duration * 0.6
+        }
+    }
+
+    /// The line on screen where playback landed, which libVLC won't show (see `CarriedSubtitle`).
+    private func carrySubtitle(_ landing: PlaybackLanding?) {
+        guard let landing else { return }
+        carried.prepare(request)
+        guard let track = CarriedSubtitle.trackNumber(engine.currentSubtitle),
+              let keyframe = landing.keyframe ?? previews.keyframeTime(atOrBefore: landing.time + 0.05) else {
+            carried.clear()
+            return
+        }
+        let delay = engine.subtitleDelay
+        // The reader looks ten seconds back for lines still showing.
+        let bytes = previews.bytes(from: landing.time - delay - 11, to: keyframe, limit: 6 << 20)
+        carried.landed(at: landing.time, keyframe: keyframe, track: track, delay: delay, bytes: bytes)
     }
 
     // MARK: seeking ahead of the player
@@ -944,7 +1021,8 @@ private struct PlayerChrome: View {
     private func prefetchJumpTargets() {
         let now = engine.currentTime
         var spots = engine.chapters.map(\.start)
-        if let c = creditsStart { spots.append(c) }
+        if let c = credits { spots.append(c.start) }
+        if let e = epilogue { spots.append(e.lowerBound) }
         spots = spots.filter { $0 > now + 30 && $0 < engine.duration - 5 }
         guard !spots.isEmpty,
               let ranges = previews.seekPoints(every: 0, extra: spots, seconds: 3, limit: 24), !ranges.isEmpty else { return }
@@ -1080,6 +1158,7 @@ private struct PlayerChrome: View {
 
     private func handleFinish() {
         reveal(autoHide: false)
+        if upNext == nil { upNext = nextItem() }
         if sleep == .endOfEpisode {
             setSleep(.off)
             return
@@ -1233,12 +1312,20 @@ private struct PlayerChrome: View {
         if autoHide { scheduleHide() } else { hideTask?.cancel() }
     }
 
+    /// Hides the controls a few seconds on while the viewer means to play; a panel open or a finger on the
+    /// timeline holds them until it's done.
     private func scheduleHide() {
         hideTask?.cancel()
         hideTask = Task { @MainActor in
             try? await Task.sleep(for: .seconds(4))
-            guard !Task.isCancelled, engine.isPlaying, panel == nil, scrub == nil, !engine.didFinish else { return }
-            showControls = false
+            while !Task.isCancelled {
+                guard engine.wantsToPlay, !engine.didFinish, !locked else { return }
+                if panel == nil, scrub == nil, versions == nil, !importing {
+                    showControls = false
+                    return
+                }
+                try? await Task.sleep(for: .seconds(1))
+            }
         }
     }
 

@@ -79,11 +79,24 @@ enum SubtitleSize: Int, CaseIterable, Identifiable {
     }
 }
 
+/// Where playback jumped to (a seek, a skip, a reopen, the resume point), for whatever has to follow it.
+struct PlaybackLanding: Equatable {
+    let id: Int
+    /// Seconds into the file.
+    let time: Double
+    /// The keyframe libVLC starts reading at, when the landing is known to be one.
+    let keyframe: Double?
+}
+
 /// libVLC behind a small observable surface: time, state, tracks, chapters, the video's size, Picture in
 /// Picture and a connected TV.
 @MainActor
 final class PlaybackEngine: ObservableObject {
     @Published private(set) var isPlaying = false
+    /// What the viewer asked for: play, or stay paused. Unlike `isPlaying` it doesn't follow libVLC through a
+    /// seek or a stall, so the controls hide and show on it.
+    @Published private(set) var wantsToPlay = true
+    @Published private(set) var landing: PlaybackLanding?
     @Published private(set) var isBuffering = true
     @Published private(set) var currentTime: Double = 0
     @Published private(set) var duration: Double = 0
@@ -105,9 +118,8 @@ final class PlaybackEngine: ObservableObject {
     /// libVLC has drawn its first picture (or, for a file without video, started playing). Until then the player
     /// shows the episode's artwork where the video goes.
     @Published private(set) var hasFirstFrame = false
-    /// A seek the picture hasn't caught up with yet, in seconds: the player shows that spot's preview over the
-    /// old frame until libVLC draws the new one.
-    @Published private(set) var seekPending: Double?
+    /// A seek the picture hasn't caught up with yet, in seconds, followed for the playback log.
+    private var seekPending: Double?
 
     /// The keyframe nearest a time, within a distance (both in seconds), when the file's index is known. Seeks and
     /// skips land on keyframes when one is close: libVLC then decodes nothing before the spot, and the bytes there
@@ -209,7 +221,10 @@ final class PlaybackEngine: ObservableObject {
         // spot has to be decoded, and the bytes there are the ones the warm-up fetched.
         let start = resumeAt.map { r in KeyframeIndexCache.shared.keyframeTime(atOrBefore: r, for: request, within: 10) ?? r }
         load(from: start, initial: true)
-        if let r = resumeAt { currentTime = start ?? r }
+        if let r = resumeAt {
+            currentTime = start ?? r
+            land(at: start ?? r, keyframe: nil)
+        }
 
         output.onPiPReady = { [weak self] in
             MainActor.assumeIsolated { self?.canPictureInPicture = true }
@@ -334,6 +349,17 @@ final class PlaybackEngine: ObservableObject {
         subtitlesAddedAt = Date()
     }
 
+    /// libVLC's time for the input open now, in seconds into the file. An input opened with `:start-time` counts
+    /// from that start (player/timer.c takes the input's start offset off every time it reports), so it's added back.
+    private func fileSeconds(_ ms: Int32) -> Double { Double(ms) / 1000 + clipStart }
+
+    private var landings = 0
+
+    private func land(at time: Double, keyframe: Double?) {
+        landings += 1
+        landing = PlaybackLanding(id: landings, time: time, keyframe: keyframe)
+    }
+
     // MARK: lifecycle
 
     func start() {
@@ -409,6 +435,8 @@ final class PlaybackEngine: ObservableObject {
             }
         }
         if restarting, Date().timeIntervalSince(restartBegan) > 20 { restarting = false }
+        // Until the reopened input reports, what it reports is the old one's (or nothing): keep showing the spot.
+        if restarting { seekDeadline = max(seekDeadline, Date().addingTimeInterval(1)) }
         if recoveries > 0, state == .playing, Date().timeIntervalSince(lastRecovery) > 60 { recoveries = 0 }
 
         // A stream that stops short of the end didn't finish: the read from the torrent was cut off (a cold
@@ -424,7 +452,7 @@ final class PlaybackEngine: ObservableObject {
                 PlaybackTrace.shared.mark(String(format: "stream \(state == .error ? "failed" : "ended early") at %.1fs of %.0fs; reopening (try %d)",
                                                  at, duration, recoveries))
                 isBuffering = true
-                restart(from: at, after: recoveries == 1 ? 0 : Double(recoveries), paused: !isPlaying)
+                restart(from: at, after: recoveries == 1 ? 0 : Double(recoveries), paused: !wantsToPlay)
                 return
             }
         }
@@ -439,6 +467,7 @@ final class PlaybackEngine: ObservableObject {
                 output.invalidatePlaybackState()
             }
             isPlaying = false
+            wantsToPlay = false
             isBuffering = false
             if duration > 0 { currentTime = duration }
             return
@@ -475,7 +504,7 @@ final class PlaybackEngine: ObservableObject {
             }
         }
 
-        let now = Double(t) / 1000
+        let now = fileSeconds(t)
         if let target = seekTarget {
             if abs(now - target) < 2.5 || Date() > seekDeadline { seekTarget = nil } else { currentTime = target }
         }
@@ -588,7 +617,7 @@ final class PlaybackEngine: ObservableObject {
         videoStats = nil
         guard videoRepairs < 3, let track = player.videoTracks.first(where: { $0.isSelected }) else {
             PlaybackTrace.shared.mark(String(format: "video: still frozen; reopening at %.1fs", currentTime))
-            restart(from: currentTime, paused: !isPlaying)
+            restart(from: currentTime, paused: !wantsToPlay)
             return
         }
         PlaybackTrace.shared.mark("video: frozen; rebuilding the picture (try \(videoRepairs))")
@@ -662,6 +691,7 @@ final class PlaybackEngine: ObservableObject {
 
     func play() {
         if didFinish { replay(); return }
+        wantsToPlay = true
         activateAudioSession()
         pauseRequestedAt = nil
         resumeAfterInterruption = false
@@ -677,6 +707,7 @@ final class PlaybackEngine: ObservableObject {
     }
 
     func pause() {
+        wantsToPlay = false
         playRequest = nil
         resumeAfterInterruption = false
         pauseRequestedAt = Date()
@@ -684,7 +715,7 @@ final class PlaybackEngine: ObservableObject {
         player.pause()
         isPlaying = false
     }
-    func togglePlay() { isPlaying ? pause() : play() }
+    func togglePlay() { wantsToPlay && !didFinish ? pause() : play() }
 
     /// - Parameter fast: land on the nearest keyframe instead of decoding up to the exact time. Right for a
     ///   scrub, where the viewer picked a rough spot; wrong for skipping an intro or opening a chapter, unless a
@@ -698,13 +729,15 @@ final class PlaybackEngine: ObservableObject {
         }
         // On a keyframe, nothing before the spot is decoded and the bytes are the ones fetched ahead.
         var keyed = fast
+        var onKeyframe = false
         if let k = keyframeNear?(target, fast ? 6 : 0.75) {
             target = k
             keyed = true
+            onKeyframe = true
         }
         PlaybackTrace.shared.mark(String(format: "seek to %.1fs%@ from %.1fs", target, keyed ? " (keyframe)" : "", currentTime))
         move(to: target, fast: keyed)
-        markSeek(target, tolerance: fast && target == seconds ? 10 : 2.5)
+        markSeek(target, tolerance: fast && target == seconds ? 10 : 2.5, keyframe: onKeyframe ? target : nil)
     }
 
     /// Skips from where playback is (or is going), as one absolute seek: libVLC's relative jumps are applied from
@@ -720,7 +753,7 @@ final class PlaybackEngine: ObservableObject {
         let target = max(0, min(from + seconds, duration - 1))
         if let k = keyframeNear?(target, 2.5), abs(k - from) >= 5, (k - from) * seconds > 0 {
             move(to: k, fast: true)
-            markSeek(k)
+            markSeek(k, keyframe: k)
         } else {
             move(to: target, fast: false)
             markSeek(target)
@@ -731,7 +764,7 @@ final class PlaybackEngine: ObservableObject {
     /// reached in it (libVLC adds the start to every seek), so the stream is opened again there.
     private func move(to target: Double, fast: Bool) {
         if target < clipStart - 0.5 {
-            restart(from: target, paused: !isPlaying)
+            restart(from: target, paused: !wantsToPlay)
             return
         }
         if setTime(target - clipStart, fast: fast) { return }
@@ -739,7 +772,8 @@ final class PlaybackEngine: ObservableObject {
         if span > 0 { player.position = (target - clipStart) / span }
     }
 
-    private func markSeek(_ target: Double, tolerance: Double = 2.5) {
+    private func markSeek(_ target: Double, tolerance: Double = 2.5, keyframe: Double? = nil) {
+        land(at: target, keyframe: keyframe)
         seekTarget = target
         seekDeadline = Date().addingTimeInterval(4)
         seekStarted = Date()
@@ -765,7 +799,8 @@ final class PlaybackEngine: ObservableObject {
     private func checkFrames() {
         guard let media = player.media else { return }
         let stats = media.statistics
-        let t = Double(player.time.intValue) / 1000
+        let ms = player.time.intValue
+        let t = ms > 0 ? fileSeconds(ms) : 0
         if !hasFirstFrame {
             if !tracedFirstBytes, stats.readBytes > 0 {
                 tracedFirstBytes = true
@@ -774,9 +809,9 @@ final class PlaybackEngine: ObservableObject {
             }
             // A file without video counts once it plays; so does one whose counters never move, once its clock has
             // run a while, so the artwork can't stay over a playing picture.
-            if timeSeen == nil, t > 0 { timeSeen = t }
+            if timeSeen == nil, ms > 0 { timeSeen = t }
             let ranOn = timeSeen.map { t - $0 > 1.5 } ?? false
-            let audioOnly = t > 0 && Date().timeIntervalSince(mediaSetAt) > 1.5 && stats.decodedVideo == 0
+            let audioOnly = ms > 0 && Date().timeIntervalSince(mediaSetAt) > 1.5 && stats.decodedVideo == 0
             if stats.displayedPictures > 0 || audioOnly || ranOn {
                 hasFirstFrame = true
                 PlaybackTrace.shared.mark(String(format: "player: first frame %.2fs after media set",
@@ -785,7 +820,7 @@ final class PlaybackEngine: ObservableObject {
         }
         if let target = seekPending {
             let waited = Date().timeIntervalSince(seekAskedAt)
-            let there = abs(t - target) < seekTolerance
+            let there = ms > 0 && abs(t - target) < seekTolerance
             // Paused, libVLC's counters don't move; the time reaching the spot is the sign.
             let paused = !player.isPlaying && !isPlaying
             // Pictures from before the jump may still be counted until the input gets there.
@@ -837,6 +872,7 @@ final class PlaybackEngine: ObservableObject {
     /// - Parameter paused: open to the picture at `start` and wait there, rather than play.
     private func restart(from start: Double, after delay: Double = 0, paused: Bool = false) {
         didFinish = false
+        wantsToPlay = !paused
         restarting = true
         restartBegan = Date()
         restartPaused = paused
@@ -905,8 +941,8 @@ final class PlaybackEngine: ObservableObject {
     /// Paused, nothing draws, so the last frame stays: switching the track off then left a black screen to come
     /// back to, and a video output that had to be rebuilt from the next keyframe while paused.
     func appDidEnterBackground() {
-        leftWhilePlaying = isPlaying
-        guard isPlaying else {
+        leftWhilePlaying = wantsToPlay
+        guard wantsToPlay else {
             PlaybackTrace.shared.mark("background: paused, picture kept")
             return
         }
@@ -924,21 +960,21 @@ final class PlaybackEngine: ObservableObject {
     func appWillEnterForeground() {
         foregroundAt = Date()
         videoStats = nil
-        if isPlaying { activateAudioSession() }
+        if wantsToPlay { activateAudioSession() }
         // The server lost its socket while the app was away: the open stream is dead even if the port is the same.
         let moved = refreshStreamURL()
         let relistened = (streamGeneration?() ?? openedGeneration) != openedGeneration
         if moved || relistened, hasPlayed, !didFinish {
             PlaybackTrace.shared.mark(String(format: "foreground: stream server restarted; reopening at %.1fs", currentTime))
             videoTrackAway = nil
-            restart(from: currentTime, paused: !isPlaying)
+            restart(from: currentTime, paused: !wantsToPlay)
             return
         }
         guard let id = videoTrackAway else { return }
         videoTrackAway = nil
         // Paused while away (Lock Screen, an interruption): a video output rebuilt while paused can stay black,
         // so open the stream again to the picture where it stopped.
-        if !isPlaying, hasPlayed, !didFinish, !restarting {
+        if !wantsToPlay, hasPlayed, !didFinish, !restarting {
             PlaybackTrace.shared.mark(String(format: "foreground: paused with video off; reopening to the picture at %.1fs", currentTime))
             restart(from: currentTime, paused: true)
             return
@@ -974,7 +1010,7 @@ final class PlaybackEngine: ObservableObject {
         if began {
             // iOS may deliver an interruption from while the app was suspended only once it's back.
             let stale = !leftWhilePlaying && Date().timeIntervalSince(foregroundAt) < 3
-            guard isPlaying, !stale else { return }
+            guard wantsToPlay, !stale else { return }
             PlaybackTrace.shared.mark("audio interrupted; pausing")
             pause()
             resumeAfterInterruption = true

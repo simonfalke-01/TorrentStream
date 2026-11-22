@@ -107,6 +107,24 @@ final class SeekPreviews: ObservableObject {
         return k[j].time
     }
 
+    /// The keyframe at or before `seconds`: where libVLC starts reading for a seek there.
+    func keyframeTime(atOrBefore seconds: Double) -> Double? {
+        guard let k = keyframes, let i = KeyframeIndexCache.lastIndex(k, atOrBefore: seconds) else { return nil }
+        return k[i].time
+    }
+
+    /// The file's bytes from the keyframe at or before `start` up to the keyframe at or after `end`, at most `limit`
+    /// bytes (the end kept). Nil until an index is known.
+    func bytes(from start: Double, to end: Double, limit: Int64) -> Range<Int64>? {
+        guard let k = keyframes, end > start else { return nil }
+        let i = KeyframeIndexCache.lastIndex(k, atOrBefore: start) ?? 0
+        var j = KeyframeIndexCache.lastIndex(k, atOrBefore: end) ?? 0
+        if k[j].time < end { j += 1 }
+        let hi = j < k.count ? min(k[j].clusterOffset, fileLength) : fileLength
+        let lo = max(min(k[i].clusterOffset, hi), hi - limit)
+        return lo < hi ? lo..<hi : nil
+    }
+
     /// The previewed keyframe nearest `seconds`, if one is within `within` seconds. A scrub landing there shows the
     /// picture the bar just showed, from bytes already fetched for it.
     func previewedKeyframeTime(near seconds: Double, within: Double) -> Double? {
