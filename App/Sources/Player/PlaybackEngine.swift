@@ -486,11 +486,14 @@ final class PlaybackEngine: ObservableObject {
             output.invalidatePlaybackState()
         }
         let waitingForPlay = playRequest.map { !playing && Date().timeIntervalSince($0.at) > 0.5 } ?? false
+        // A seek whose picture hasn't come yet is a wait like any other, shown as one at once.
+        let waitingForSeek = seekPending != nil && wantsToPlay && Date().timeIntervalSince(seekAskedAt) > 0.3
         isBuffering = state == .opening
             || (!hasPlayed && state == .nothingSpecial)
             || (playing && idle > 1.25)
             || (restarting && !restartPaused)
             || waitingForPlay
+            || waitingForSeek
 
         let len = player.media?.length.intValue ?? 0
         // A stream reopened with :start-time reports its length less the start; the length doesn't change, so
@@ -825,7 +828,9 @@ final class PlaybackEngine: ObservableObject {
             let paused = !player.isPlaying && !isPlaying
             // Pictures from before the jump may still be counted until the input gets there.
             if !there { seekBaseline = max(seekBaseline, stats.displayedPictures) }
-            if (there && stats.displayedPictures > seekBaseline) || (paused && (there || waited > 1.5)) || waited > 8 {
+            // Time running on from the spot also means the picture is there, should the counters lag.
+            let movingOn = there && t - target > 0.6
+            if (there && stats.displayedPictures > seekBaseline) || movingOn || (paused && (there || waited > 1.5)) || waited > 8 {
                 seekPending = nil
                 PlaybackTrace.shared.mark(String(format: "seek: new picture at %.1fs after %.2fs", t, waited))
             }
