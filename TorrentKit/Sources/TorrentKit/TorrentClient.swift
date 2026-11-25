@@ -158,6 +158,12 @@ public final class TorrentClient {
         dht?.save()
     }
 
+    /// Call before `applicationWillEnterForeground` when the app kept running the whole time it was in the background:
+    /// its peers are still connected and are kept.
+    public func stayedAwakeInBackground() {
+        lock.lock(); backgroundedAt = nil; lock.unlock()
+    }
+
     /// Call when the app becomes active again: brings the streaming server back (same port, so the player's URLs
     /// keep working) and replaces peer connections that died during the suspension.
     public func applicationWillEnterForeground() {

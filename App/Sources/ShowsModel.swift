@@ -85,12 +85,15 @@ enum ShowError: LocalizedError {
     case noSources
     case unplayable
     case notAired
+    /// The release has no file for the episode.
+    case notInRelease
 
     var errorDescription: String? {
         switch self {
         case .noSources: return "No one is sharing this episode right now."
         case .unplayable: return "None of the versions found would start. Try another version."
         case .notAired: return "This episode hasn't aired yet."
+        case .notInRelease: return "This version doesn't have this episode."
         }
     }
 }
@@ -817,10 +820,11 @@ final class ShowsModel: ObservableObject {
         guard let t = await app.addSource(torrentURL: choice.torrentURL, magnet: choice.magnet, infoHash: choice.infoHash) else {
             throw ShowError.unplayable
         }
-        guard let info = await Self.info(t, timeout: 30), let f = Self.pickFile(info, s, e, isMovie: isMovie) else {
+        guard let info = await Self.info(t, timeout: 30) else {
             app.discardSource(t)
             throw ShowError.unplayable
         }
+        guard let f = Self.pickFile(info, s, e, isMovie: isMovie) else { throw ShowError.notInRelease }
         return ResolvedEpisode(torrent: t, file: f, source: SavedSource(infoHash: t.infoHashHex, fileIndex: f.index,
                                                                       magnet: choice.magnet ?? t.magnetLink,
                                                                       torrentURL: choice.torrentURL, group: choice.group,

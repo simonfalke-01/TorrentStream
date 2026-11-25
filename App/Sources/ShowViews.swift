@@ -740,15 +740,23 @@ struct VersionsView: View {
             ContentUnavailableView("No Versions Available", systemImage: "film.stack",
                                    description: Text("No one is sharing this episode right now."))
         case .loaded(let list):
+            let rest = list.dropFirst()
+            let singles = rest.filter { !$0.isBatch }
+            let packs = rest.filter(\.isBatch)
             List {
                 Section {
-                    row(list[0])
+                    row(list[0], scope: true)
                 } header: {
                     Text(heading)
                 }
-                ForEach(groups(Array(list.dropFirst())), id: \.title) { group in
-                    Section(group.title) {
-                        ForEach(group.sources) { row($0) }
+                if !singles.isEmpty {
+                    Section(target.details.show.isMovie ? "Other Versions" : "Single Episode") {
+                        ForEach(singles) { row($0) }
+                    }
+                }
+                if !packs.isEmpty {
+                    Section(forDownload ? "Whole Season" : "Season Pack") {
+                        ForEach(packs) { row($0) }
                     }
                 }
             }
@@ -761,21 +769,8 @@ struct VersionsView: View {
         return "\(ShowsModel.episodeLabel(d, target.season, target.episode)), Best Match"
     }
 
-    private func groups(_ list: [EpisodeSource]) -> [(title: String, sources: [EpisodeSource])] {
-        let order: [(String, (Int?) -> Bool)] = [
-            ("4K", { ($0 ?? 0) >= 2160 }),
-            ("1080p", { $0 == 1080 }),
-            ("720p", { $0 == 720 }),
-            ("480p", { ($0 ?? 0) > 0 && ($0 ?? 0) < 720 }),
-            ("Other", { $0 == nil }),
-        ]
-        return order.compactMap { title, test in
-            let matching = list.filter { test($0.traits.resolution) }
-            return matching.isEmpty ? nil : (title, matching)
-        }
-    }
-
-    private func row(_ s: EpisodeSource) -> some View {
+    /// `scope`: says whether it's one episode or a season pack, where no section does.
+    private func row(_ s: EpisodeSource, scope: Bool = false) -> some View {
         Button {
             onSelect(s)
         } label: {
@@ -794,7 +789,7 @@ struct VersionsView: View {
                     HStack(spacing: Space.m) {
                         AvailabilityLabel(seeders: s.result.seeders)
                         Text(Format.bytes(s.result.size))
-                        if s.isBatch { Text("Full Season") }
+                        if scope && !target.details.show.isMovie { Text(s.isBatch ? "Season Pack" : "Single Episode") }
                     }
                     .font(.footnote)
                     .foregroundStyle(.secondary)

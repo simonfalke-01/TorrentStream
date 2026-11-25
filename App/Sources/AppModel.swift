@@ -650,6 +650,7 @@ final class AppModel: ObservableObject {
     }
 
     func isPlaying(hash: String) -> Bool { playing[hash] != nil }
+    var isPlayingAnything: Bool { !playing.isEmpty }
 
     /// What getting likely episodes ready may load beyond the essentials (their head, index and resume point): a
     /// twentieth of the cache, at least 64 MB.

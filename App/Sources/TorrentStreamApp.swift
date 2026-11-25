@@ -34,11 +34,11 @@ struct TorrentStreamApp: App {
         .onChange(of: scenePhase) { _, phase in
             switch phase {
             case .active:
+                downloads.enteredForeground()
                 // Same port as before the suspension, and fresh peers in place of the ones that timed out.
                 model.client.applicationWillEnterForeground()
                 model.refreshStorage()
                 model.trimCache()
-                downloads.enteredForeground()
             case .background:
                 model.client.applicationDidEnterBackground()
                 downloads.enteredBackground()

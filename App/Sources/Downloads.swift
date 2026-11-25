@@ -32,14 +32,14 @@ final class DownloadsModel: ObservableObject {
     private unowned let app: AppModel
     private unowned let shows: ShowsModel
     private let fileURL: URL
-    /// Releases being found, by show.
     /// Releases being found, by record. A show's episodes without a chosen version go one at a time, so they can
     /// share a season pack once one is found; a chosen version is found straight away.
-    private var finders: [String: (show: Int, chosen: Bool, token: UUID)] = [:]
+    private var finders: [String: (show: Int, choice: DownloadChoice?, token: UUID)] = [:]
     private var ticker: Task<Void, Never>?
     /// Torrent objects each download's file was marked wanted on, so it's marked once per torrent.
     private var marked: [String: ObjectIdentifier] = [:]
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
+    private let keeper = BackgroundKeeper()
 
     /// Live transfer numbers, kept apart so only the download manager redraws every second.
     let activity = DownloadActivity()
@@ -131,13 +131,28 @@ final class DownloadsModel: ObservableObject {
         return ShowsModel.key(d.show.id, s.id, e.number)
     }
 
-    /// Downloads a version the viewer picked, replacing the release an earlier download of the episode used.
+    /// Downloads a version the viewer picked. A season pack becomes the season's download: every aired episode of the
+    /// season not already on the device comes from it. Releases earlier downloads used are let go.
     func download(_ d: ShowDetails, _ s: ShowSeason, _ e: ShowEpisode, version: EpisodeSource) {
         guard e.isAired else { return }
         let choice = Self.choice(version)
         shows.prefer(version, show: d.show.id)
+        let isMovie = d.show.isMovie || s.media.isMovie
+        let episodes = version.isBatch && !isMovie
+            ? s.episodes.filter { ep in
+                ep.isAired && (ep.number == e.number || library[ShowsModel.key(d.show.id, s.id, ep.number)]?.state != .completed)
+            }
+            : [e]
+        for ep in episodes { apply(choice, d, s, ep) }
+        changed()
+        findNext()
+    }
+
+    private func apply(_ choice: DownloadChoice, _ d: ShowDetails, _ s: ShowSeason, _ e: ShowEpisode) {
         let key = ShowsModel.key(d.show.id, s.id, e.number)
         if let old = library[key] {
+            // Already coming from this version: left as it is.
+            if old.choice == choice && old.state != .failed { return }
             if let rel = old.release {
                 library.update(key) { $0.release = nil }
                 letGo(rel)
@@ -159,8 +174,6 @@ final class DownloadsModel: ObservableObject {
             rec.priority = 1
             _ = library.add(rec)
         }
-        changed()
-        findNext()
     }
 
     private static func choice(_ v: EpisodeSource) -> DownloadChoice {
@@ -293,8 +306,16 @@ final class DownloadsModel: ObservableObject {
     // MARK: finding releases
 
     private func findNext() {
-        for r in library.records where r.state == .queued && r.choice != nil { startFinding(r) }
-        while let r = library.nextToFind(skipping: Set(finders.values.filter { !$0.chosen }.map(\.show))) {
+        // Episodes sharing a season pack wait for the first to add it, then open it together.
+        for r in library.records where r.state == .queued {
+            guard let c = r.choice, !(c.isBatch && finders.values.contains(where: { $0.choice == c })) else { continue }
+            startFinding(r)
+        }
+        // Shows with an episode waiting on its pack are passed over too: the pack may hold their other episodes.
+        let busy = Set(finders.values.filter { $0.choice == nil }.map(\.show))
+            .union(library.records.filter { $0.state == .queued && $0.choice != nil }.map(\.show.id))
+        while let r = library.nextToFind(skipping: busy.union(finders.values.filter { $0.choice == nil }.map(\.show))),
+              r.choice == nil {
             startFinding(r)
         }
     }
@@ -303,7 +324,7 @@ final class DownloadsModel: ObservableObject {
         library.update(r.id) { $0.state = .finding }
         guard let r = library[r.id] else { return }
         let token = UUID()
-        finders[r.id] = (r.show.id, r.choice != nil, token)
+        finders[r.id] = (r.show.id, r.choice, token)
         Task { [weak self] in
             await self?.find(r)
             if self?.finders[r.id]?.token == token { self?.finders[r.id] = nil }
@@ -336,6 +357,15 @@ final class DownloadsModel: ObservableObject {
                          DownloadRelease(infoHash: res.torrent.infoHashHex, fileIndex: res.file.index, magnet: res.source.magnet,
                                          torrentURL: res.source.torrentURL, group: res.source.group,
                                          isBatch: res.source.isBatch, length: res.file.length))
+            } catch ShowError.notInRelease where choice.isBatch {
+                // A season pack without this episode: the best release is found for it instead.
+                guard stillWanted(r) else { return }
+                library.update(r.id) {
+                    $0.choice = nil
+                    $0.state = .queued
+                }
+                changed()
+                return
             } catch {
                 return fail(r.id, "This version couldn’t be opened. Choose another version and try again.")
             }
@@ -432,6 +462,9 @@ final class DownloadsModel: ObservableObject {
         let downloading = library.records.filter { $0.state == .downloading }
         holdPaused(downloading)
         guard !downloading.isEmpty else {
+            if keeper.isRunning && !library.records.contains(where: { $0.state.isPending }) {
+                keeper.stop(playing: app.isPlayingAnything)
+            }
             stopReciprocating(except: [])
             samples = [:]
             activity.update([:], files: [:])
@@ -522,6 +555,9 @@ final class DownloadsModel: ObservableObject {
         }
         activity.update(stats, files: files)
         if next != fractions { fractions = next }
+        if keeper.isRunning && !library.records.contains(where: { $0.state.isPending }) {
+            keeper.stop(playing: app.isPlayingAnything)
+        }
         if stateChanged {
             changed()
             app.refreshStorage()
@@ -587,7 +623,10 @@ final class DownloadsModel: ObservableObject {
 
     /// iOS gives a backgrounded app a little time; downloads use it rather than stopping at once.
     func enteredBackground() {
-        guard backgroundTask == .invalid, library.records.contains(where: { $0.state.isPending }) else { return }
+        guard library.records.contains(where: { $0.state.isPending }) else { return }
+        // Downloads go on while other apps are used: iOS keeps an app playing audio running.
+        if !app.isPlayingAnything { keeper.start() }
+        guard backgroundTask == .invalid else { return }
         backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "Downloads") { [weak self] in
             MainActor.assumeIsolated {
                 // Out of time: progress is saved before the app is suspended.
@@ -597,7 +636,10 @@ final class DownloadsModel: ObservableObject {
         }
     }
 
+    /// Call before the engine is told the app is back, so peers are kept when the app never stopped.
     func enteredForeground() {
+        if keeper.stayedAwake { app.client.stayedAwakeInBackground() }
+        keeper.stop(playing: app.isPlayingAnything)
         endBackgroundTask()
         startTicking()
         findNext()
