@@ -43,6 +43,8 @@ final class DownloadsModel: ObservableObject {
     let activity = DownloadActivity()
     /// Releases told to upload while they fetch, so peers keep sending to them.
     private var reciprocating: Set<String> = []
+    /// Each download's file size on disk over the last few seconds, to split a season pack's speed between episodes.
+    private var samples: [String: [(at: TimeInterval, bytes: Int64)]] = [:]
 
     /// Space left free on the phone beyond what a download needs.
     private static let spareSpace: Int64 = 1_000_000_000
@@ -395,7 +397,8 @@ final class DownloadsModel: ObservableObject {
         holdPaused(downloading)
         guard !downloading.isEmpty else {
             stopReciprocating(except: [])
-            activity.update([:])
+            samples = [:]
+            activity.update([:], files: [:])
             return library.records.contains { $0.state == .paused && $0.release != nil && fractions[$0.id] == nil }
         }
         // Every download fetches at once, at full speed, streaming or not.
@@ -442,6 +445,11 @@ final class DownloadsModel: ObservableObject {
                 finished.insert(rel.infoHash)
                 stateChanged = true
             } else {
+                let now = ProcessInfo.processInfo.systemUptime
+                var h = samples[r.id] ?? []
+                h.append((now, done))
+                while h.count > 2 && now - h[1].at >= 6 { h.removeFirst() }
+                samples[r.id] = h
                 // Steps of half a percent, so pages redraw when the ring would move.
                 next[r.id] = (Double(done) / Double(max(1, length)) * 200).rounded(.down) / 200
             }
@@ -460,7 +468,23 @@ final class DownloadsModel: ObservableObject {
             stats[h] = .init(rate: t.isPaused ? 0 : st.downloadRate, peers: st.connectedPeers,
                              waiting: t.isPaused)
         }
-        activity.update(stats)
+        // A release several episodes fetch from is shared out by what each one's file grew by lately.
+        var files: [String: Double] = [:]
+        let fetching = library.records.filter { $0.state == .downloading }
+        samples = samples.filter { id, _ in fetching.contains { $0.id == id } }
+        for (h, stat) in stats {
+            let mine = fetching.filter { $0.release?.infoHash == h }
+            let grew = mine.map { r -> Int64 in
+                guard let s = samples[r.id], let first = s.first, let last = s.last else { return 0 }
+                return max(0, last.bytes - first.bytes)
+            }
+            let sum = grew.reduce(0, +)
+            for (r, g) in zip(mine, grew) {
+                // An episode none of whose data has come in yet isn't credited with the others' speed.
+                files[r.id] = mine.count == 1 ? stat.rate : sum > 0 ? stat.rate * Double(g) / Double(sum) : 0
+            }
+        }
+        activity.update(stats, files: files)
         if next != fractions { fractions = next }
         if stateChanged {
             changed()
@@ -561,10 +585,21 @@ final class DownloadActivity: ObservableObject {
         var waiting: Bool
     }
 
+    /// By release.
     @Published private(set) var stats: [String: Stat] = [:]
+    /// Each download's own speed, by record: episodes in one season pack share the release's.
+    @Published private(set) var files: [String: Double] = [:]
 
-    func update(_ new: [String: Stat]) {
+    func update(_ new: [String: Stat], files newFiles: [String: Double]) {
         if new != stats { stats = new }
+        if newFiles != files { files = newFiles }
+    }
+
+    /// The release's peers with this download's own speed.
+    func stat(_ r: DownloadRecord) -> Stat? {
+        guard let h = r.release?.infoHash, var s = stats[h] else { return nil }
+        if let rate = files[r.id] { s.rate = rate }
+        return s
     }
 
     /// Every fetching release together.

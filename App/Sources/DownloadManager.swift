@@ -110,7 +110,7 @@ private struct ActiveDownloadRow: View {
         .padding(.vertical, Space.xxs)
     }
 
-    private var stat: DownloadActivity.Stat? { record.release.flatMap { activity.stats[$0.infoHash] } }
+    private var stat: DownloadActivity.Stat? { activity.stat(record) }
 
     private var fraction: Double { downloads.fractions[record.id] ?? 0 }
 
@@ -335,7 +335,7 @@ private struct DetailList: View {
     @EnvironmentObject var downloads: DownloadsModel
     @EnvironmentObject var shows: ShowsModel
 
-    private var stat: DownloadActivity.Stat? { record.release.flatMap { activity.stats[$0.infoHash] } }
+    private var stat: DownloadActivity.Stat? { activity.stat(record) }
 
     var body: some View {
         let b = downloads.bytes(record)

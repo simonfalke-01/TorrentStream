@@ -56,7 +56,10 @@ enum Metrics {
 
 enum Format {
     static func bytes(_ v: Int64) -> String {
-        ByteCountFormatter.string(fromByteCount: v, countStyle: .file)
+        let f = ByteCountFormatter()
+        f.countStyle = .file
+        f.allowsNonnumericFormatting = false
+        return f.string(fromByteCount: v)
     }
 
     static func time(_ ms: Int64) -> String {
