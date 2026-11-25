@@ -133,6 +133,19 @@ final class NetworkTests: XCTestCase {
         for id in [1, 5] { all[id] = ShowCatalog.node(media(id, start: 2000 + id, relations: [])) }
         XCTAssertFalse(ShowCatalog.chainContinues(from: start, known: all))
     }
+
+    /// Kitsu search lists shows AniList flags adult (Ishuzoku Reviewers); opening one must still load its episodes.
+    func testDetailsReadAdultFlaggedShow() {
+        let m: [String: Any] = [
+            "id": 110270, "format": "TV", "status": "FINISHED", "episodes": 12, "isAdult": true,
+            "title": ["romaji": "Ishuzoku Reviewers", "english": "Interspecies Reviewers"],
+            "startDate": ["year": 2020], "relations": ["edges": []],
+        ]
+        XCTAssertNil(ShowCatalog.show(m), "lists keep filtering adult entries")
+        let (nodes, _) = ShowCatalog.nodes(m)
+        XCTAssertEqual(nodes[110270]?.show.title, "Interspecies Reviewers")
+        XCTAssertEqual(nodes[110270]?.show.episodes, 12)
+    }
 }
 
 private final class Counter: @unchecked Sendable {

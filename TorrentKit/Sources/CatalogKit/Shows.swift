@@ -594,7 +594,8 @@ public final class ShowCatalog: @unchecked Sendable {
     }
 
     static func node(_ m: [String: Any]) -> Node? {
-        guard let show = show(m), m["relations"] != nil else { return nil }
+        // A show the user opened always loads, even one AniList flags adult (Interspecies Reviewers); only lists filter those.
+        guard let show = show(m, allowAdult: true), m["relations"] != nil else { return nil }
         let edges = ((m["relations"] as? [String: Any])?["edges"] as? [[String: Any]]) ?? []
         func related(_ type: String) -> Int? {
             let nodes = edges.filter { $0["relationType"] as? String == type }.compactMap { $0["node"] as? [String: Any] }
@@ -772,7 +773,11 @@ public final class ShowCatalog: @unchecked Sendable {
     // MARK: parsing
 
     static func show(_ m: [String: Any]) -> Show? {
-        guard let id = m["id"] as? Int, (m["isAdult"] as? Bool) != true else { return nil }
+        (m["isAdult"] as? Bool) == true ? nil : show(m, allowAdult: true)
+    }
+
+    static func show(_ m: [String: Any], allowAdult: Bool) -> Show? {
+        guard let id = m["id"] as? Int, allowAdult || (m["isAdult"] as? Bool) != true else { return nil }
         let titles = m["title"] as? [String: Any] ?? [:]
         let romaji = titles["romaji"] as? String
         let english = titles["english"] as? String
