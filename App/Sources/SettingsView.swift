@@ -5,6 +5,7 @@ import TorrentKit
 struct SettingsView: View {
     @EnvironmentObject var model: AppModel
     @EnvironmentObject var shows: ShowsModel
+    @EnvironmentObject var downloads: DownloadsModel
     @Environment(\.dismiss) private var dismiss
     @AppStorage(SettingsKey.subtitleSize) private var subtitleSize = SubtitleSize.medium.rawValue
     @AppStorage(SettingsKey.resumePlayback) private var resumePlayback = true
@@ -17,6 +18,7 @@ struct SettingsView: View {
     @AppStorage(SettingsKey.preferredResolution) private var resolution = 1080
     @AppStorage(SettingsKey.preferDub) private var preferDub = false
     @State private var confirmClear = false
+    @State private var confirmRemoveDownloads = false
 
     var body: some View {
         NavigationStack {
@@ -107,6 +109,17 @@ struct SettingsView: View {
                 }
 
                 Section {
+                    LabeledContent("In Use", value: Format.bytes(model.downloadsUsed))
+                        .monospacedDigit()
+                    Button("Remove All Downloads…", role: .destructive) { confirmRemoveDownloads = true }
+                        .disabled(downloads.library.records.isEmpty)
+                } header: {
+                    Text("Downloads")
+                } footer: {
+                    Text("Downloaded episodes stay until you remove them, and don’t count toward the cache.")
+                }
+
+                Section {
                     LabeledContent("Version", value: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "")
                     ShareLink(item: PlaybackTrace.shared.flush()) {
                         Text("Share Playback Log")
@@ -128,6 +141,12 @@ struct SettingsView: View {
                 Button("Cancel", role: .cancel) {}
             } message: {
                 Text("Shows in My List and your progress stay.")
+            }
+            .confirmationDialog("Remove every download?", isPresented: $confirmRemoveDownloads, titleVisibility: .visible) {
+                Button("Remove All Downloads", role: .destructive) { downloads.removeEverything() }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Episodes stream again when you play them.")
             }
         }
     }

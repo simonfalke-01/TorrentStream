@@ -125,7 +125,10 @@ final class AppModel: ObservableObject {
     @Published var schedulePath: [Route] = []
     @Published var listPath: [Route] = []
     @Published var selectedTab: AppTab = .home
+    /// Streaming cache on disk, downloads not included.
     @Published private(set) var storageUsed: Int64 = 0
+    /// Releases holding downloads, which `downloadsUsed` measures.
+    @Published private(set) var downloadsUsed: Int64 = 0
     /// Posters and synopses by `CatalogQuery.key`.
     @Published private(set) var catalog: [String: CatalogEntry] = [:]
 
@@ -186,8 +189,7 @@ final class AppModel: ObservableObject {
         HTTP.preconnect([nyaa.baseURL.appendingPathComponent("static/favicon.png"),
                          URL(string: "https://kitsu.app/api/edge")!, URL(string: "https://api.ani.zip/mappings")!])
         refresh()
-        refreshStorage()
-        trimCache()
+        // Storage is measured and trimmed once downloads have said which releases they keep (`setPinned`).
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
         }
@@ -367,7 +369,7 @@ final class AppModel: ObservableObject {
     /// Drops a source that turned out not to play the episode, unless something is using it.
     func discardSource(_ t: Torrent) {
         let hash = t.infoHashHex
-        guard sourceHashes.contains(hash), playing[hash] == nil else { return }
+        guard sourceHashes.contains(hash), playing[hash] == nil, !pinned.contains(hash) else { return }
         removeSource(hash)
         persist()
     }
@@ -399,6 +401,33 @@ final class AppModel: ObservableObject {
     /// An episode source by info hash, woken if dormant.
     func sourceTorrent(_ hash: String) -> Torrent? {
         client.torrent(infoHashHex: hash) ?? wakeSource(hash)
+    }
+
+    /// A torrent the app still has, in the engine or dormant.
+    func hasTorrent(_ hash: String) -> Bool {
+        client.torrent(infoHashHex: hash) != nil || dormant[hash] != nil
+    }
+
+    // MARK: downloads
+
+    /// Releases holding downloads. Never evicted, trimmed or counted against the cache.
+    private(set) var pinned: Set<String> = []
+    /// Releases with downloads still coming, which warm-ups leave running.
+    private(set) var downloading: Set<String> = []
+
+    /// Called by downloads whenever the releases they use change.
+    func setPinned(_ hashes: Set<String>, downloading: Set<String>) {
+        self.downloading = downloading
+        guard hashes != pinned else { return }
+        pinned = hashes
+        refreshStorage()
+    }
+
+    /// A release no download uses any more: its data goes, or becomes ordinary cache while a player has it open.
+    func releaseDownload(_ hash: String) {
+        pinned.remove(hash)
+        if let t = client.torrent(infoHashHex: hash) { t.setAllWanted(false) }
+        if playing[hash] == nil { evict([hash]) } else { refreshStorage() }
     }
 
     private func removeSource(_ hash: String) {
@@ -608,6 +637,16 @@ final class AppModel: ObservableObject {
     /// A player is open.
     var isPlayingAnything: Bool { !playing.isEmpty }
 
+    /// Files open in players.
+    private var streams: [String: (torrent: Torrent, file: TorrentFile, count: Int)] = [:]
+
+    /// A player needs the network for what it shows: downloads in other releases wait so it gets the bandwidth.
+    var isStreamingFromNetwork: Bool {
+        streams.values.contains { ($0.torrent.downloadedBytes(fileIndex: $0.file.index) ?? 0) < $0.file.length }
+    }
+
+    func isPlaying(hash: String) -> Bool { playing[hash] != nil }
+
     /// What getting likely episodes ready may load beyond the essentials (their head, index and resume point): a
     /// twentieth of the cache, at least 64 MB.
     var warmBudget: Int64 { max(64 << 20, cacheLimit / 20) }
@@ -616,20 +655,24 @@ final class AppModel: ObservableObject {
     /// one last. Titles stay in My List with their episodes and positions; they stream again when played.
     func trimCache() {
         guard playing.isEmpty else { return }
+        let pinned = self.pinned
         // Sources that were found but never played, beyond the most recent few, only take up slots.
         let sources = (client.torrents.map(\.infoHashHex).filter { sourceHashes.contains($0) } + dormant.keys)
+            .filter { !pinned.contains($0) }
             .sorted { lastUse($0) > lastUse($1) }
         if sources.count > AppModel.maxSources {
             for hash in sources[AppModel.maxSources...] { removeSource(hash) }
             persist()
         }
         let byLastUse = (client.torrents.filter { $0.torrentInfo != nil }.map(\.infoHashHex) + dormant.keys)
+            .filter { !pinned.contains($0) }
             .sorted { lastUse($0) < lastUse($1) }
         guard !byLastUse.isEmpty else { return }
         let dir = client.downloadDirectory
         let limit = cacheLimit
         Task.detached(priority: .utility) {
-            let total = AppModel.allocatedSize(of: dir)
+            let kept = pinned.reduce(Int64(0)) { $0 + AppModel.allocatedSize(of: dir.appendingPathComponent($1, isDirectory: true)) }
+            let total = AppModel.allocatedSize(of: dir) - kept
             let free = (try? dir.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?
                 .volumeAvailableCapacityForImportantUsage ?? 0
             // Never more than a quarter of the space the phone has left.
@@ -650,7 +693,7 @@ final class AppModel: ObservableObject {
 
     /// Clears every title's cached video. My List and watch history are kept.
     func clearCache() {
-        evict(client.torrents.map(\.infoHashHex) + dormant.keys)
+        evict((client.torrents.map(\.infoHashHex) + dormant.keys).filter { !pinned.contains($0) })
     }
 
     private func lastUse(_ hash: String) -> Date {
@@ -685,7 +728,7 @@ final class AppModel: ObservableObject {
     /// Deletes a title's data and adds it back with its file list, so nothing changes for the user.
     /// Episode sources are removed outright; they are found again when played.
     private func evict(_ hashes: [String]) {
-        for hash in hashes where playing[hash] == nil {
+        for hash in hashes where playing[hash] == nil && !pinned.contains(hash) {
             if sourceHashes.contains(hash) {
                 removeSource(hash)
                 continue
@@ -735,6 +778,8 @@ final class AppModel: ObservableObject {
     func playbackStarted(_ request: PlaybackRequest) {
         let torrent = request.torrent
         playing[torrent.infoHashHex, default: 0] += 1
+        let k = key(torrent, request.file.index)
+        streams[k] = (torrent: torrent, file: request.file, count: (streams[k]?.count ?? 0) + 1)
         // Other episode sources go quiet; the next episode's is woken by its prefetch.
         for t in client.torrents where sourceHashes.contains(t.infoHashHex) && t !== torrent && playing[t.infoHashHex] == nil {
             if !t.isPaused { t.pause() }
@@ -778,6 +823,10 @@ final class AppModel: ObservableObject {
         defaults.set(Date(), forKey: watchedAtKey(torrent.infoHashHex))
         let hash = torrent.infoHashHex
         if let n = playing[hash] { playing[hash] = n > 1 ? n - 1 : nil }
+        let k = key(torrent, file.index)
+        if let s = streams[k] {
+            if s.count > 1 { streams[k]?.count -= 1 } else { streams[k] = nil }
+        }
         persist()
         refresh()
         refreshStorage()
@@ -936,10 +985,21 @@ final class AppModel: ObservableObject {
 
     func refreshStorage() {
         let dir = client.downloadDirectory
+        let pinned = self.pinned
         Task.detached(priority: .utility) {
+            let kept = pinned.reduce(Int64(0)) { $0 + AppModel.allocatedSize(of: dir.appendingPathComponent($1, isDirectory: true)) }
             let total = AppModel.allocatedSize(of: dir)
-            await MainActor.run { self.storageUsed = total }
+            await MainActor.run {
+                self.storageUsed = max(0, total - kept)
+                self.downloadsUsed = kept
+            }
         }
+    }
+
+    /// Space the phone has left for files the app needs, when it can tell.
+    var availableCapacity: Int64? {
+        (try? client.downloadDirectory.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?
+            .volumeAvailableCapacityForImportantUsage
     }
 
     nonisolated private static func allocatedSize(of dir: URL) -> Int64 {

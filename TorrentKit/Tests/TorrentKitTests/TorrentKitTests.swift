@@ -199,6 +199,9 @@ final class TorrentKitTests: XCTestCase {
         XCTAssertTrue(torrent.hasPrefix(fileIndex: 1, bytes: head))
         Thread.sleep(forTimeInterval: 1)
         XCTAssertEqual(downloaded(1), Int64(138 * pieceLength))
+        XCTAssertEqual(torrent.downloadedBytes(fileIndex: 1), downloaded(1))
+        XCTAssertEqual(torrent.downloadedBytes(fileIndex: 0), torrent.status().files[0].file.length)
+        XCTAssertNil(torrent.downloadedBytes(fileIndex: 99))
         XCTAssertFalse(torrent.status().files[1].isComplete)
     }
 

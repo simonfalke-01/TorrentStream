@@ -30,11 +30,13 @@ struct ShowView: View {
     let show: Show
     @EnvironmentObject var model: AppModel
     @EnvironmentObject var shows: ShowsModel
+    @EnvironmentObject var downloads: DownloadsModel
     @State private var seasonID: Int?
     @State private var launch: EpisodeLaunch?
     @State private var versions: EpisodeTarget?
     @State private var loadError: String?
     @State private var synopsisExpanded = false
+    @State private var confirmingRemoval = false
 
     private var details: ShowDetails? { shows.details[shows.rootID(show)] }
     /// The first season once loaded, which names the show.
@@ -87,6 +89,15 @@ struct ShowView: View {
                 launch = EpisodeLaunch(show: target.details.show, seasonID: target.season.id,
                                        episode: target.episode.number, source: source)
             }
+        }
+        .confirmationDialog(main.isMovie ? "Remove the download of \(main.title)?" : "Remove every download of \(main.title)?",
+                            isPresented: $confirmingRemoval, titleVisibility: .visible) {
+            Button(main.isMovie ? "Remove Download" : "Remove Downloads", role: .destructive) {
+                downloads.removeAll(show: details?.show ?? main)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("It streams again when you play it.")
         }
     }
 
@@ -176,6 +187,14 @@ struct ShowView: View {
                 .buttonStyle(.plain)
                 .accessibilityLabel(inList ? "Remove from My List" : "Add to My List")
                 .sensoryFeedback(.selection, trigger: inList)
+
+                // A movie downloads from here; a show's episodes each have their own button.
+                if let d = details, d.show.isMovie, let key = downloads.movieKey(d) {
+                    DownloadControl(status: downloads.status(key), prominent: true,
+                                    onDownload: { downloads.downloadMovie(d) },
+                                    onRemove: { downloads.remove(key) },
+                                    onRetry: { downloads.retry(key) })
+                }
             }
 
             if let caption = resumeCaption(next) {
@@ -247,9 +266,7 @@ struct ShowView: View {
     // MARK: episodes
 
     private func episodes(_ d: ShowDetails) -> some View {
-        let next = shows.upNext(d)
-        let fallback = next?.season.id ?? d.seasons.first?.id
-        let selected = seasonID.flatMap(d.season(id:)) ?? fallback.flatMap(d.season(id:))
+        let selected = selectedSeason(d)
 
         return VStack(alignment: .leading, spacing: Space.m) {
             HStack(alignment: .firstTextBaseline) {
@@ -286,16 +303,36 @@ struct ShowView: View {
         }
     }
 
+    /// The season picked, else the one the Play button is in.
+    private func selectedSeason(_ d: ShowDetails) -> ShowSeason? {
+        let fallback = shows.upNext(d)?.season.id ?? d.seasons.first?.id
+        return seasonID.flatMap(d.season(id:)) ?? fallback.flatMap(d.season(id:))
+    }
+
     private func episodeButton(_ d: ShowDetails, _ s: ShowSeason, _ e: ShowEpisode) -> some View {
         let p = shows.progress(d.show, s, e)
+        let key = ShowsModel.key(d.show.id, s.id, e.number)
+        let download = downloads.status(key)
         return Button {
             launch = EpisodeLaunch(show: d.show, seasonID: s.id, episode: e.number)
         } label: {
-            ShowEpisodeRow(episode: e, minutes: s.media.duration, progress: p)
+            ShowEpisodeRow(episode: e, minutes: s.media.duration, progress: p,
+                           trailingInset: e.isAired ? Metrics.indicator + Space.m : 0)
         }
         // The finger landing is a strong hint: start on that episode before the tap completes.
         .buttonStyle(TouchDownButtonStyle { shows.warmTouched(d, s, e) })
         .disabled(!e.isAired)
+        // Centred on the still, its symbol's edge lined up with the page margin.
+        .overlay(alignment: .topTrailing) {
+            if e.isAired {
+                DownloadControl(status: download,
+                                onDownload: { downloads.download(d, s, e) },
+                                onRemove: { downloads.remove(key) },
+                                onRetry: { downloads.retry(key) })
+                    .padding(.top, Space.s + (ShowEpisodeRow.thumbHeight - Metrics.touchTarget) / 2)
+                    .offset(x: (Metrics.touchTarget - Metrics.indicator) / 2)
+            }
+        }
         .contextMenu {
             if e.isAired {
                 Button { launch = EpisodeLaunch(show: d.show, seasonID: s.id, episode: e.number) } label: {
@@ -303,6 +340,22 @@ struct ShowView: View {
                 }
                 Button { versions = EpisodeTarget(details: d, season: s, episode: e) } label: {
                     Label("Choose Version…", systemImage: "slider.horizontal.3")
+                }
+                Section {
+                    switch download {
+                    case .notDownloaded:
+                        Button { downloads.download(d, s, e) } label: {
+                            Label("Download Episode", systemImage: "arrow.down.circle")
+                        }
+                    case .completed:
+                        Button(role: .destructive) { downloads.remove(key) } label: {
+                            Label("Remove Download", systemImage: "trash")
+                        }
+                    default:
+                        Button(role: .destructive) { downloads.remove(key) } label: {
+                            Label("Cancel Download", systemImage: "xmark")
+                        }
+                    }
                 }
                 Section {
                     if p?.isWatched == true {
@@ -366,6 +419,9 @@ struct ShowView: View {
                 }
             }
         }
+        if let d = details {
+            downloadsMenu(d)
+        }
         if shows.history.contains(where: { $0.show.id == shows.rootID(show) }) {
             Button { shows.removeFromContinueWatching(show) } label: {
                 Label("Remove from Continue Watching", systemImage: "minus.circle")
@@ -374,6 +430,47 @@ struct ShowView: View {
         if let url = URL(string: "https://anilist.co/anime/\(main.id)") {
             ShareLink(item: url) { Label("Share", systemImage: "square.and.arrow.up") }
         }
+    }
+
+    /// Download the season shown or the whole show, and remove what's downloaded.
+    @ViewBuilder
+    private func downloadsMenu(_ d: ShowDetails) -> some View {
+        let toFetch: (ShowSeason) -> Int = { s in
+            s.episodes.filter { e in
+                guard e.isAired else { return false }
+                let status = downloads.status(d, s, e)
+                if case .failed = status { return true }
+                return status == .notDownloaded
+            }.count
+        }
+        let season = selectedSeason(d)
+        let others = d.seasons.filter { $0.id != season?.id }.contains { toFetch($0) > 0 }
+        let hasDownloads = !downloads.summary(d.show).isEmpty
+        Section {
+            if !d.show.isMovie {
+                if let season, toFetch(season) > 0 {
+                    Button { started(downloads.download(season: season, of: d)) } label: {
+                        Label(d.seasons.count > 1 ? "Download Season \(season.number)" : "Download All Episodes",
+                              systemImage: "arrow.down.circle")
+                    }
+                }
+                if d.seasons.count > 1, others {
+                    Button { started(downloads.downloadAll(d)) } label: {
+                        Label("Download All Episodes", systemImage: "arrow.down.circle")
+                    }
+                }
+            }
+            if hasDownloads {
+                Button(role: .destructive) { confirmingRemoval = true } label: {
+                    Label(d.show.isMovie ? "Remove Download" : "Remove Downloads", systemImage: "trash")
+                }
+            }
+        }
+    }
+
+    private func started(_ count: Int) {
+        guard count > 0 else { return }
+        model.showToast("Downloading \(Format.episodes(count))", systemImage: "arrow.down.circle.fill")
     }
 }
 
@@ -384,8 +481,12 @@ struct ShowEpisodeRow: View {
     let episode: ShowEpisode
     let minutes: Int?
     let progress: EpisodeProgress?
+    /// Room kept clear on the right of the name, for a button laid over the row.
+    var trailingInset: CGFloat = 0
 
-    private let thumbWidth: CGFloat = 128
+    static let thumbWidth: CGFloat = 128
+    static let thumbHeight: CGFloat = thumbWidth * 9 / 16
+    private var thumbWidth: CGFloat { Self.thumbWidth }
 
     var body: some View {
         let watched = progress?.isWatched == true
@@ -422,6 +523,7 @@ struct ShowEpisodeRow: View {
                     }
                 }
                 .padding(.top, Space.xxs)
+                .padding(.trailing, trailingInset)
                 Spacer(minLength: 0)
             }
             // The synopsis spans the row's full width, under the still, as a quieter third tier.
@@ -460,6 +562,8 @@ struct ShowPosterCard: View {
     var showsCaption = false
     /// A short line under the title in the accent color, such as "New Episode".
     var note: String? = nil
+    /// A quieter line under the title, such as "3 Episodes".
+    var detail: String? = nil
     let onPlay: () -> Void
 
     var body: some View {
@@ -470,12 +574,16 @@ struct ShowPosterCard: View {
                 VStack(alignment: .leading, spacing: Space.xxs) {
                     Text(show.title)
                         .font(.footnote.weight(.medium))
-                        .lineLimit(2, reservesSpace: !showsCaption && note == nil)
+                        .lineLimit(2, reservesSpace: !showsCaption && note == nil && detail == nil)
                         .multilineTextAlignment(.leading)
                     if let note {
                         Text(note)
                             .font(.caption.weight(.semibold))
                             .foregroundStyle(.tint)
+                    } else if let detail {
+                        Text(detail)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     } else if showsCaption, let caption = show.caption {
                         Text(caption)
                             .font(.caption)

@@ -115,6 +115,8 @@ final class ShowsModel: ObservableObject {
     @Published private(set) var addedAt: [Int: Date] = [:]
 
     private unowned let app: AppModel
+    /// Episodes kept on the device, which play from there.
+    weak var downloads: DownloadsModel?
     private let catalog = ShowCatalog()
     private let defaults = UserDefaults.standard
     private let baseURL: URL
@@ -700,6 +702,14 @@ final class ShowsModel: ObservableObject {
         let key = Self.key(d.show.id, s.id, e.number)
         let isMovie = d.show.isMovie || s.media.isMovie
         if source == nil {
+            if let rel = downloads?.release(forKey: key) {
+                PlaybackTrace.shared.mark("resolve: playing the download")
+                if let r = await open(SavedSource(infoHash: rel.infoHash, fileIndex: rel.fileIndex, magnet: rel.magnet,
+                                                  torrentURL: rel.torrentURL, group: rel.group, isBatch: rel.isBatch)) {
+                    return r
+                }
+                PlaybackTrace.shared.mark("resolve: the download didn't open")
+            }
             if let r = prepared[key], app.client.torrent(infoHashHex: r.torrent.infoHashHex) != nil {
                 if r.torrent.isPaused { r.torrent.resume() }
                 PlaybackTrace.shared.mark("resolve: ready ahead of time (\(r.torrent.infoHashHex.prefix(8)))")

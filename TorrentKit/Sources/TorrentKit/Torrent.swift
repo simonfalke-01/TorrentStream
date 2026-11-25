@@ -1473,21 +1473,31 @@ public final class Torrent {
         return s.url(for: info.files[fileIndex])
     }
 
+    /// Verified bytes of one file, without the rest of `status()`. Nil before the metadata.
+    public func downloadedBytes(fileIndex: Int) -> Int64? {
+        lock.lock(); defer { lock.unlock() }
+        guard let info = info, fileIndex >= 0, fileIndex < info.files.count else { return nil }
+        return downloadedBytesLocked(info.files[fileIndex], info)
+    }
+
+    private func downloadedBytesLocked(_ f: TorrentFile, _ info: TorrentInfo) -> Int64 {
+        var bytes: Int64 = 0
+        guard f.length > 0 else { return 0 }
+        for p in info.pieces(for: f) where have[p] {
+            let ps = Int64(p) * Int64(info.pieceLength)
+            let pe = ps + Int64(info.pieceSize(p))
+            bytes += min(pe, f.offset + f.length) - max(ps, f.offset)
+        }
+        return bytes
+    }
+
     public func status() -> TorrentStatus {
         lock.lock(); defer { lock.unlock() }
         var files: [FileStatus] = []
         var downloaded: Int64 = 0
         if let info = info {
             for f in info.files {
-                var bytes: Int64 = 0
-                if f.length > 0 {
-                    for p in info.pieces(for: f) where have[p] {
-                        let ps = Int64(p) * Int64(info.pieceLength)
-                        let pe = ps + Int64(info.pieceSize(p))
-                        bytes += min(pe, f.offset + f.length) - max(ps, f.offset)
-                    }
-                }
-                files.append(FileStatus(file: f, downloadedBytes: bytes, wanted: wantedFiles.contains(f.index)))
+                files.append(FileStatus(file: f, downloadedBytes: downloadedBytesLocked(f, info), wanted: wantedFiles.contains(f.index)))
             }
             for p in 0..<info.pieceCount where have[p] { downloaded += Int64(info.pieceSize(p)) }
         }

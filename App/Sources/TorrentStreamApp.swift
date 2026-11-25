@@ -7,12 +7,17 @@ struct TorrentStreamApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var model: AppModel
     @StateObject private var shows: ShowsModel
+    @StateObject private var downloads: DownloadsModel
     @Environment(\.scenePhase) private var scenePhase
 
     init() {
         let m = AppModel()
+        let s = ShowsModel(app: m)
+        let d = DownloadsModel(app: m, shows: s)
+        s.downloads = d
         _model = StateObject(wrappedValue: m)
-        _shows = StateObject(wrappedValue: ShowsModel(app: m))
+        _shows = StateObject(wrappedValue: s)
+        _downloads = StateObject(wrappedValue: d)
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
         // Posters and backdrops are fetched often; keep them around between launches.
         URLCache.shared = URLCache(memoryCapacity: 50_000_000, diskCapacity: 300_000_000)
@@ -23,6 +28,7 @@ struct TorrentStreamApp: App {
             RootView()
                 .environmentObject(model)
                 .environmentObject(shows)
+                .environmentObject(downloads)
                 .onOpenURL { url in model.handleOpen(url: url) }
         }
         .onChange(of: scenePhase) { _, phase in
@@ -32,8 +38,10 @@ struct TorrentStreamApp: App {
                 model.client.applicationWillEnterForeground()
                 model.refreshStorage()
                 model.trimCache()
+                downloads.enteredForeground()
             case .background:
                 model.client.applicationDidEnterBackground()
+                downloads.enteredBackground()
             default:
                 break
             }

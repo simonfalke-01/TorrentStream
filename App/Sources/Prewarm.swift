@@ -262,7 +262,7 @@ final class Prewarmer {
     /// Pauses a source no warm-up, launch or player uses any more, so it stops taking connections.
     private func quiet(_ torrent: Torrent) {
         guard !warms.values.contains(where: { $0.torrent === torrent }), torrent !== launched,
-              !app.isPlaying(torrent), !torrent.isPaused else { return }
+              !app.isPlaying(torrent), !app.downloading.contains(torrent.infoHashHex), !torrent.isPaused else { return }
         torrent.pause()
     }
 
