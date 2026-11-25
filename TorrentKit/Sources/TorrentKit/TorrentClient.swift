@@ -201,13 +201,6 @@ public final class TorrentClient {
         lock.lock(); defer { lock.unlock() }
         if starving { starvingTorrents.insert(ObjectIdentifier(torrent)) } else { starvingTorrents.remove(ObjectIdentifier(torrent)) }
     }
-
-    /// Whether a torrent other than `torrent` has a player waiting on data.
-    func otherTorrentStarving(excluding torrent: Torrent) -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        let me = ObjectIdentifier(torrent)
-        return starvingTorrents.contains { $0 != me }
-    }
 }
 
 public enum MediaKind {

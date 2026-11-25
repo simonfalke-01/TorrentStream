@@ -21,10 +21,8 @@ enum DownloadStatus: Equatable {
 /// release, the same way Play finds one; the file is then fetched in full in the background and its release is kept
 /// out of the streaming cache until the download is removed.
 ///
-/// Releases are found for up to `maxFinders` shows at once (a show's episodes one at a time), and up to
-/// `maxActiveReleases` fetch at once, in the order shows were added
-/// and then episode order, so the first episodes are ready first. While a player streams something that isn't on
-/// the device yet, other releases wait so it has the bandwidth.
+/// Releases are found for every show at once (a show's episodes one at a time), and every release fetches at
+/// once at full speed, streaming or not, with nothing held back.
 @MainActor
 final class DownloadsModel: ObservableObject {
     @Published private(set) var library: DownloadLibrary
@@ -46,8 +44,6 @@ final class DownloadsModel: ObservableObject {
     /// Releases told to upload while they fetch, so peers keep sending to them.
     private var reciprocating: Set<String> = []
 
-    private static let maxActiveReleases = 4
-    private static let maxFinders = 3
     /// Space left free on the phone beyond what a download needs.
     private static let spareSpace: Int64 = 1_000_000_000
 
@@ -283,7 +279,7 @@ final class DownloadsModel: ObservableObject {
     // MARK: finding releases
 
     private func findNext() {
-        while finders.count < Self.maxFinders, let r = library.nextToFind(skipping: Set(finders.keys)) {
+        while let r = library.nextToFind(skipping: Set(finders.keys)) {
             let show = r.show.id
             finders[show] = Task { [weak self] in
                 await self?.find(r)
@@ -402,13 +398,9 @@ final class DownloadsModel: ObservableObject {
             activity.update([:])
             return library.records.contains { $0.state == .paused && $0.release != nil && fractions[$0.id] == nil }
         }
-        let streaming = app.isStreamingFromNetwork
+        // Every download fetches at once, at full speed, streaming or not.
         let ordered = Self.order(downloading)
-        var active: [String] = []
-        for r in ordered {
-            guard let h = r.release?.infoHash, !active.contains(h) else { continue }
-            if active.count < Self.maxActiveReleases || app.isPlaying(hash: h) { active.append(h) }
-        }
+        let active = Set(ordered.compactMap { $0.release?.infoHash })
         var next = fractions
         var stateChanged = false
         var finished: Set<String> = []
@@ -435,11 +427,7 @@ final class DownloadsModel: ObservableObject {
                     t.setWanted(true, fileIndex: rel.fileIndex)
                     marked[r.id] = ObjectIdentifier(t)
                 }
-                if streaming && !app.isPlaying(hash: rel.infoHash) {
-                    if !t.isPaused { t.pause() }
-                } else if t.isPaused {
-                    t.resume()
-                }
+                if t.isPaused { t.resume() }
             }
             guard let done = t.downloadedBytes(fileIndex: rel.fileIndex),
                   let length = rel.length ?? t.torrentInfo?.files.first(where: { $0.index == rel.fileIndex })?.length else { continue }

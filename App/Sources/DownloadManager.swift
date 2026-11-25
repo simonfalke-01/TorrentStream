@@ -172,11 +172,12 @@ private struct StorageFooter: View {
     @EnvironmentObject var downloads: DownloadsModel
 
     var body: some View {
-        if let free = downloads.freeBytes, free > 0 {
-            Text("Downloads use \(Format.bytes(downloads.storedBytes)). \(Format.bytes(free)) available on this device.")
-        } else {
-            Text("Downloads use \(Format.bytes(downloads.storedBytes)).")
+        HStack {
+            Text("\(Format.bytes(downloads.storedBytes)) Used")
+            Spacer()
+            if let free = downloads.freeBytes, free > 0 { Text("\(Format.bytes(free)) Free") }
         }
+        .monospacedDigit()
     }
 }
 
@@ -235,10 +236,8 @@ enum DownloadText {
         case .completed: return b.total.map(Format.bytes) ?? "Downloaded"
         case .downloading:
             guard let stat else { return amount ?? "Starting" }
-            if stat.waiting { return "Waiting for the stream to finish" }
-            if stat.rate < 1 {
-                return stat.peers == 0 ? "Looking for peers" : "Connecting to \(Format.count(stat.peers)) peers"
-            }
+            if stat.peers == 0 { return "Finding peers" }
+            if stat.rate < 1 { return "0 KB/s, \(Format.count(stat.peers)) peers" }
             var parts = ["\(Format.bytes(Int64(stat.rate)))/s"]
             if let total = b.total, let left = Format.remaining(Double(max(0, total - b.done)) / stat.rate) {
                 parts.append(left)
@@ -395,9 +394,11 @@ private struct DetailList: View {
                 Section {
                     ForEach(peers.prefix(30), id: \.address) { PeerRow(peer: $0) }
                 } header: {
-                    Text("Peers")
-                } footer: {
-                    if peers.count > 30 { Text("The 30 fastest of \(Format.count(peers.count)).") }
+                    HStack {
+                        Text("Peers")
+                        Spacer()
+                        Text(Format.count(peers.count)).monospacedDigit()
+                    }
                 }
             }
         }

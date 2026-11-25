@@ -263,8 +263,6 @@ extension Torrent {
         }
         let choked = peer.peerChoking
         if choked && peer.allowedFast.isEmpty { return actions }
-        // Next-episode prefetches and background downloads hold back while another torrent's player starves.
-        if !isForegroundLocked, let c = client, c.otherTorrentStarving(excluding: self) { return actions }
 
         let me = ObjectIdentifier(peer)
         let blk = Double(blockSize)
@@ -482,7 +480,9 @@ extension Torrent {
         var inFlight = 0
         for p in peersByID.values { inFlight += p.pending.count }
         let swarmRTT = swarmRate > 0 ? rateRTT / swarmRate : 0.3
-        let budget = max(Torrent.minInFlightBlocks, Int(swarmRate * (swarmRTT + Torrent.inFlightSeconds) / blk))
+        // Nothing plays from a plain download, so nothing waits behind its queues: request as deep as the peers take.
+        let playing = !readers.isEmpty
+        let budget = playing ? max(Torrent.minInFlightBlocks, Int(swarmRate * (swarmRTT + Torrent.inFlightSeconds) / blk)) : Int.max / 4
         let urgent = urgentMissingLocked()
         var soonRoom = (urgent ? budget / 2 : budget) - inFlight
         var laterRoom = (urgent ? budget / 4 : budget) - inFlight
@@ -501,7 +501,9 @@ extension Torrent {
         }
         // Requests are answered in order, so a deep queue delays the next urgent block; a shallow one leaves the
         // peer idle between round trips. A little past the time it takes to answer keeps TCP busy.
-        var target = max(peer.window, Int(rate * ((peer.answerTime ?? peer.rtt) + Torrent.queueSeconds) / blk) + 8)
+        var target = playing
+            ? max(peer.window, Int(rate * ((peer.answerTime ?? peer.rtt) + Torrent.queueSeconds) / blk) + 8)
+            : max(peer.window, Torrent.downloadMinQueue, Int(rate * ((peer.answerTime ?? peer.rtt) + Torrent.downloadQueueSeconds) / blk))
         target = min(target, peer.maxRequests)
         if peer.snubbed { target = min(target, 2) }
         var room = target - peer.pending.count

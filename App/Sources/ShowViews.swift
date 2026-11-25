@@ -745,9 +745,6 @@ struct VersionsView: View {
                     row(list[0])
                 } header: {
                     Text(heading)
-                } footer: {
-                    Text(forDownload ? "Tap a version to download it. It replaces any download of this episode."
-                                     : "Picked for you from the fastest versions. The one you tap plays next time.")
                 }
                 ForEach(groups(Array(list.dropFirst())), id: \.title) { group in
                     Section(group.title) {

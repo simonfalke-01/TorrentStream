@@ -239,7 +239,7 @@ public final class Torrent {
     var activityBytes: Int64 = 0
 
     /// Connected peers. A loop thread multiplexes them, so this costs memory, not threads.
-    var maxPeers = 110
+    var maxPeers = 200
     /// Downloads upload to the peers that send to them most (and one at random), as BitTorrent clients reward: most
     /// leechers only unchoke peers that upload. Streaming keeps the uplink free and doesn't.
     var reciprocates = false
@@ -249,15 +249,15 @@ public final class Torrent {
     var optimisticPeer: ObjectIdentifier?
     var lastOptimisticAt: TimeInterval = 0
     var uploadedTotal: Int64 = 0
-    static let uploadSlots = 4
+    static let uploadSlots = 8
     static let chokeRoundInterval: TimeInterval = 10
     static let optimisticInterval: TimeInterval = 30
-    static let streamingMaxPeers = 110
-    static let downloadMaxPeers = 180
+    static let streamingMaxPeers = 200
+    static let downloadMaxPeers = 300
     /// Tracker lists are mostly unreachable peers, so many connection attempts run at once, and given up quickly: a
     /// live peer answers a SYN within a round trip (one retransmission fits).
     var maxConnecting = 240
-    static let connectTimeout: TimeInterval = 1.5
+    static let connectTimeout: TimeInterval = 3
     static let handshakeTimeout: TimeInterval = 6
     /// Bytes past a reader that are fetched before anything else, block by block, and raced between peers early.
     var criticalBytes: Int64 = 2 * 1024 * 1024
@@ -293,6 +293,9 @@ public final class Torrent {
     static let queueSeconds = 0.15
     static let inFlightSeconds = 0.15
     static let minInFlightBlocks = 96
+    /// Per-peer request queue for a torrent nothing plays from: seconds of the peer's rate, and a floor.
+    static let downloadQueueSeconds = 3.0
+    static let downloadMinQueue = 64
 
     init(descriptor: TorrentDescriptor, client: TorrentClient, directory: URL, peerID: Data) {
         self.descriptor = descriptor

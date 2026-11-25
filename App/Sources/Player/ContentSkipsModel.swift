@@ -88,10 +88,9 @@ final class ContentSkipsModel: ObservableObject {
     }
 
     /// The first time a season is watched there is no earlier episode to find the ending with, and the next one is
-    /// only prefetched at its start: fetch the end of it too, in the background and not on a metered network.
+    /// only prefetched at its start: fetch the end of it too, in the background.
     private func fetchNextEnding(_ found: ContentSkips?) async {
-        guard !tailWanted, let n = next, let series, let session, let found, found.credits == .unknown,
-              NetworkCost.shared.isCheap else { return }
+        guard !tailWanted, let n = next, let series, let session, let found, found.credits == .unknown else { return }
         let heard = await Self.library.episodes(series: series).contains { entry in
             entry.key != session.episode && entry.key != n.ref.episode
                 && entry.value.print.coverage(from: entry.value.duration / 2, to: entry.value.duration) > 0.9
@@ -126,27 +125,3 @@ private struct TorrentFileBytes: @unchecked Sendable {
     }
 }
 
-/// Whether the network is one to fetch extra data on: not cellular or a personal hotspot, not Low Data Mode.
-private final class NetworkCost: @unchecked Sendable {
-    static let shared = NetworkCost()
-    private let monitor = NWPathMonitor()
-    private let lock = NSLock()
-    private var cheap = false
-
-    private init() {
-        monitor.pathUpdateHandler = { [weak self] path in
-            guard let self else { return }
-            let cheap = path.status == .satisfied && !path.isExpensive && !path.isConstrained
-            self.lock.lock()
-            self.cheap = cheap
-            self.lock.unlock()
-        }
-        monitor.start(queue: DispatchQueue(label: "ContentSkips.network", qos: .utility))
-    }
-
-    var isCheap: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return cheap
-    }
-}

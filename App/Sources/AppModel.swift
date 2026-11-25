@@ -785,7 +785,9 @@ final class AppModel: ObservableObject {
         let k = key(torrent, request.file.index)
         streams[k] = (torrent: torrent, file: request.file, count: (streams[k]?.count ?? 0) + 1)
         // Other episode sources go quiet; the next episode's is woken by its prefetch.
-        for t in client.torrents where sourceHashes.contains(t.infoHashHex) && t !== torrent && playing[t.infoHashHex] == nil {
+        // Downloads keep going at full speed.
+        for t in client.torrents where sourceHashes.contains(t.infoHashHex) && t !== torrent && playing[t.infoHashHex] == nil
+            && !downloading.contains(t.infoHashHex) {
             if !t.isPaused { t.pause() }
         }
         if let d = knownDuration(torrent: torrent, file: request.file) { durationKnown(request, seconds: d) }

@@ -870,8 +870,8 @@ final class TorrentKitTests: XCTestCase {
         XCTAssertFalse(banned.contains(honestAddress))
     }
 
-    /// Background downloads (next-episode prefetch) of one torrent hold back while another torrent's player waits.
-    func testBackgroundTorrentYieldsToStarvingPlayer() throws {
+    /// A download keeps its full speed while another torrent's player waits: nothing is held back.
+    func testBackgroundTorrentDownloadsWhileAnotherStarves() throws {
         let (dataA, _) = makeTorrent(files: [("a.mkv", 4 * 16384)], pieceLength: 16384)
         let (dataB, contentB) = makeTorrent(files: [("b.mkv", 8 * 16384), ("c.mkv", 1)], pieceLength: 16384)
         let descB = try TorrentDescriptor.parse(torrentData: dataB)
@@ -886,12 +886,6 @@ final class TorrentKitTests: XCTestCase {
         client.setStarving(a, true)
         b.addPeers([PeerAddress(ip: 0x7f00_0001, port: seeder.port)], source: "test")
         b.prefetch(fileIndex: 0, bytes: 4 * 16384)
-        waitUntil(5) { b.status().connectedPeers == 1 }
-        Thread.sleep(forTimeInterval: 1)
-        XCTAssertEqual(b.status().files[0].downloadedBytes, 0)
-        XCTAssertEqual(seeder.servedRequests, 0)
-
-        client.setStarving(a, false)
         waitUntil { b.hasPrefix(fileIndex: 0, bytes: 4 * 16384) }
         XCTAssertTrue(b.hasPrefix(fileIndex: 0, bytes: 4 * 16384))
     }
