@@ -24,6 +24,26 @@ public struct DownloadRelease: Codable, Hashable, Sendable {
     }
 }
 
+/// A release the viewer picked for a download, before its file is known.
+public struct DownloadChoice: Codable, Hashable, Sendable {
+    public var title: String
+    public var infoHash: String?
+    public var magnet: String?
+    public var torrentURL: URL?
+    public var group: String?
+    public var isBatch: Bool
+
+    public init(title: String, infoHash: String? = nil, magnet: String? = nil, torrentURL: URL? = nil, group: String? = nil,
+                isBatch: Bool = false) {
+        self.title = title
+        self.infoHash = infoHash
+        self.magnet = magnet
+        self.torrentURL = torrentURL
+        self.group = group
+        self.isBatch = isBatch
+    }
+}
+
 public enum DownloadState: String, Codable, Hashable, Sendable {
     /// Waiting for its turn to find a release.
     case queued
@@ -31,7 +51,7 @@ public enum DownloadState: String, Codable, Hashable, Sendable {
     case finding
     /// The file is being fetched.
     case downloading
-    /// Held by the viewer. Nothing sets this yet; it is here for a downloads screen.
+    /// Held by the viewer.
     case paused
     case completed
     case failed
@@ -65,13 +85,16 @@ public struct DownloadRecord: Codable, Hashable, Identifiable, Sendable {
     public var failure: String?
     public var addedAt: Date
     public var completedAt: Date?
-    /// Higher starts first. Everything is 0 today.
+    /// Higher starts first. A version the viewer picked is 1, everything else 0.
     public var priority: Int
+    /// The release the viewer picked; nil lets the app choose.
+    public var choice: DownloadChoice?
 
     public init(id: String, show: Show, seasonID: Int, season: Int, episode: Int, episodeTitle: String? = nil,
                 thumbnailURL: URL? = nil, isMovie: Bool = false, release: DownloadRelease? = nil,
                 state: DownloadState = .queued, failure: String? = nil, addedAt: Date = Date(),
-                completedAt: Date? = nil, priority: Int = 0) {
+                completedAt: Date? = nil, priority: Int = 0, choice: DownloadChoice? = nil) {
+        self.choice = choice
         self.id = id
         self.show = show
         self.seasonID = seasonID
@@ -90,7 +113,7 @@ public struct DownloadRecord: Codable, Hashable, Identifiable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case id, show, seasonID, season, episode, episodeTitle, thumbnailURL, isMovie, release, state, failure, addedAt,
-             completedAt, priority
+             completedAt, priority, choice
     }
 
     /// Fields added later have defaults, so older files keep reading.
@@ -110,6 +133,7 @@ public struct DownloadRecord: Codable, Hashable, Identifiable, Sendable {
         addedAt = try c.decodeIfPresent(Date.self, forKey: .addedAt) ?? Date()
         completedAt = try c.decodeIfPresent(Date.self, forKey: .completedAt)
         priority = try c.decodeIfPresent(Int.self, forKey: .priority) ?? 0
+        choice = try? c.decodeIfPresent(DownloadChoice.self, forKey: .choice)
     }
 }
 
@@ -119,6 +143,7 @@ public struct DownloadSummary: Hashable, Sendable {
     public var completed = 0
     public var pending = 0
     public var failed = 0
+    public var paused = 0
     public var isEmpty: Bool { total == 0 }
     public init() {}
 }
@@ -168,7 +193,7 @@ public struct DownloadLibrary: Sendable {
             switch r.state {
             case .completed: s.completed += 1
             case .failed: s.failed += 1
-            case .paused: break
+            case .paused: s.paused += 1
             default: s.pending += 1
             }
         }

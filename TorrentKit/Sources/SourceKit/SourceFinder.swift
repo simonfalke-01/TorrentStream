@@ -187,8 +187,20 @@ public final class SourceFinder: @unchecked Sendable {
     // MARK: queries
 
     static let category = NyaaCategory.find("1_2")
+    /// Sukebei's anime category.
+    static let adultCategory = NyaaCategory(id: "1_1", title: "Anime")
 
+    /// Adult shows are searched on Nyaa and on Sukebei, where uncensored releases go.
     static func queries(details: ShowDetails, season: ShowSeason, episode: ShowEpisode) -> [NyaaQuery] {
+        withSukebei(nyaaQueries(details: details, season: season, episode: episode), details: details, season: season)
+    }
+
+    static func withSukebei(_ queries: [NyaaQuery], details: ShowDetails, season: ShowSeason) -> [NyaaQuery] {
+        guard details.show.isAdult == true || season.media.isAdult == true else { return queries }
+        return queries + queries.map { NyaaQuery(text: $0.text, category: adultCategory, adult: true) }
+    }
+
+    private static func nyaaQueries(details: ShowDetails, season: ShowSeason, episode: ShowEpisode) -> [NyaaQuery] {
         let seasonName = searchWords(ShowNames.seasonless(season.media.romaji ?? season.media.title))
         let baseName = searchWords(ShowNames.seasonless(details.show.romaji ?? details.show.title))
         if details.show.isMovie || season.media.isMovie {
@@ -203,6 +215,10 @@ public final class SourceFinder: @unchecked Sendable {
     }
 
     static func fallbackQueries(details: ShowDetails, season: ShowSeason, episode: ShowEpisode) -> [NyaaQuery] {
+        withSukebei(nyaaFallbackQueries(details: details, season: season, episode: episode), details: details, season: season)
+    }
+
+    private static func nyaaFallbackQueries(details: ShowDetails, season: ShowSeason, episode: ShowEpisode) -> [NyaaQuery] {
         let names = [season.media.english, details.show.english].compactMap { $0 }
             + season.media.synonyms.prefix(1)
         let words = unique(names.map { searchWords(ShowNames.seasonless($0)) }).filter { !$0.isEmpty }

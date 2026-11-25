@@ -98,6 +98,11 @@ final class PeerConnection: LoopHandler {
     var answerTime: TimeInterval?
     var supportsExtensions = false
     var supportsFast = false
+    /// The peer wants to download from us.
+    var peerInterested = false
+    /// We refuse its requests; unchoked only while a download reciprocates.
+    var amChoking = true
+    var uploadedBytes: Int64 = 0
     var utMetadataID: Int?
     var utPexID: Int?
     var maxRequests = 250
@@ -289,15 +294,21 @@ final class PeerConnection: LoopHandler {
         switch id {
         case 0: torrent.peerChokedLocked(self)
         case 1: torrent.peerUnchokedLocked(self)
-        case 2, 3: break // we don't upload, so their interest doesn't matter
+        case 2: peerInterested = true
+        case 3: peerInterested = false
         case 4:
             guard payload.count >= 4 else { return nil }
             torrent.peerHaveLocked(self, piece: Self.u32(payload, 0))
         case 5:
             torrent.peerBitfieldLocked(self, data: Data(payload))
         case 6:
-            // We never unchoke, so requests are refused; with the fast extension that has to be said explicitly.
-            if supportsFast && payload.count >= 12 {
+            // Served while we unchoke the peer (downloads reciprocate); refused otherwise, which the fast extension
+            // has to say explicitly.
+            guard payload.count >= 12 else { return nil }
+            let r = BlockRequest(piece: Self.u32(payload, 0), offset: Self.u32(payload, 4), length: Self.u32(payload, 8))
+            if !amChoking, outbuf.count - outStart < Self.maxQueuedUpload, let data = torrent.uploadBlockLocked(r) {
+                enqueuePiece(r, data)
+            } else if supportsFast {
                 var m: [UInt8] = [0x10]
                 m.append(contentsOf: Array(payload[0..<12]))
                 enqueueMessage(m)
@@ -404,6 +415,31 @@ final class PeerConnection: LoopHandler {
     }
 
     func enqueueKeepAlive() { enqueue([0, 0, 0, 0]) }
+
+    /// Output waiting past this means the peer's link is full; further requests are refused until it drains.
+    static let maxQueuedUpload = 1024 * 1024
+
+    private static func be32(_ v: Int) -> [UInt8] {
+        [UInt8(truncatingIfNeeded: v >> 24), UInt8(truncatingIfNeeded: v >> 16), UInt8(truncatingIfNeeded: v >> 8), UInt8(truncatingIfNeeded: v)]
+    }
+
+    /// Loop thread: tells the peer whether it may request from us.
+    func setChoking(_ choke: Bool) {
+        guard amChoking != choke else { return }
+        amChoking = choke
+        enqueueMessage([choke ? 0 : 1])
+    }
+
+    func enqueueHave(_ piece: Int) { enqueueMessage([4] + Self.be32(piece)) }
+
+    private func enqueuePiece(_ r: BlockRequest, _ data: Data) {
+        var m: [UInt8] = [7]
+        m.reserveCapacity(9 + data.count)
+        m += Self.be32(r.piece) + Self.be32(r.offset)
+        m.append(contentsOf: data)
+        enqueueMessage(m)
+        uploadedBytes += Int64(data.count)
+    }
 
     private func enqueueMessage(_ body: [UInt8]) {
         let n = body.count

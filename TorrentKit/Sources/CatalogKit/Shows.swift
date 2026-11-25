@@ -32,11 +32,15 @@ public struct Show: Codable, Hashable, Identifiable, Sendable {
     /// Next episode to air and when, for shows still airing.
     public var nextEpisode: Int?
     public var nextAiringAt: Date?
+    /// AniList's adult flag, once read from AniList. Its releases are also on Sukebei.
+    public var isAdult: Bool?
 
     public init(id: Int, title: String, malID: Int? = nil, romaji: String? = nil, english: String? = nil,
                 synonyms: [String] = [], format: String? = nil, status: String? = nil, episodes: Int? = nil,
                 duration: Int? = nil, year: Int? = nil, score: Int? = nil, overview: String? = nil, genres: [String] = [],
-                posterURL: URL? = nil, bannerURL: URL? = nil, nextEpisode: Int? = nil, nextAiringAt: Date? = nil) {
+                posterURL: URL? = nil, bannerURL: URL? = nil, nextEpisode: Int? = nil, nextAiringAt: Date? = nil,
+                isAdult: Bool? = nil) {
+        self.isAdult = isAdult
         self.id = id
         self.title = title
         self.malID = malID
@@ -233,13 +237,65 @@ public final class ShowCatalog: @unchecked Sendable {
     /// limit, and falls back to AniList when Kitsu can't be reached. Kitsu often takes over a second, so when it
     /// hasn't answered after `hedgeDelay` and AniList's request budget has room, AniList is asked too and whichever
     /// answers first is used.
+    ///
+    /// Neither of those lists adult titles (Kitsu hides them from signed-out apps), so AniList is asked for those
+    /// alongside; they join the list when they answer in time.
     public func search(_ text: String) async throws -> [Show] {
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !t.isEmpty else { return [] }
-        return try await hedged(primary: { try await self.kitsuSearch(t) },
-                                fallback: { try await self.anilistSearch(t) },
-                                delay: Self.hedgeDelay,
-                                hedgeAllowed: { (AniListBudget.shared.spare ?? .max) > 6 })
+        let adult = Task { () -> [Show] in
+            guard (AniListBudget.shared.spare ?? .max) > 3 else { return [] }
+            return (try? await self.anilistSearch(t, adult: true)) ?? []
+        }
+        let main: [Show]
+        do {
+            main = try await withTaskCancellationHandler {
+                try await hedged(primary: { try await self.kitsuSearch(t) },
+                                 fallback: { try await self.anilistSearch(t) },
+                                 delay: Self.hedgeDelay,
+                                 hedgeAllowed: { (AniListBudget.shared.spare ?? .max) > 6 })
+            } onCancel: { adult.cancel() }
+        } catch {
+            let extra = Task.isCancelled ? [] : await adult.value
+            if extra.isEmpty { throw error }
+            return Self.merged(main: [], adult: extra, query: t)
+        }
+        let extra = (await withTaskCancellationHandler {
+            await Self.within(Self.adultWait) { await adult.value }
+        } onCancel: { adult.cancel() }) ?? []
+        return Self.merged(main: main, adult: extra, query: t)
+    }
+
+    /// How long a search waits for adult titles once the main answer is in.
+    static let adultWait: TimeInterval = 1.2
+
+    /// Both lists, each show once. Titles the query names exactly come first, then ones it starts, then the rest,
+    /// each group in the order found.
+    static func merged(main: [Show], adult: [Show], query: String) -> [Show] {
+        let q = ReleaseName.normalize(query)
+        func rank(_ s: Show) -> Int {
+            let names = ([s.title] + s.names).map(ReleaseName.normalize)
+            if names.contains(q) { return 0 }
+            if names.contains(where: { $0.hasPrefix(q) }) { return 1 }
+            return 2
+        }
+        var seen = Set<Int>()
+        let all = (main + adult).filter { seen.insert($0.id).inserted }
+        return all.enumerated().sorted { a, b in
+            let ra = rank(a.element), rb = rank(b.element)
+            return ra != rb ? ra < rb : a.offset < b.offset
+        }.map(\.element)
+    }
+
+    /// `work`'s answer, or nil when it takes longer than `seconds`.
+    static func within<T: Sendable>(_ seconds: TimeInterval, _ work: @escaping @Sendable () async -> T) async -> T? {
+        await withTaskGroup(of: T?.self) { group in
+            group.addTask { await work() }
+            group.addTask { try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000)); return nil }
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            return first
+        }
     }
 
     static let hedgeDelay: TimeInterval = 0.7
@@ -353,16 +409,17 @@ public final class ShowCatalog: @unchecked Sendable {
         )
     }
 
-    func anilistSearch(_ t: String) async throws -> [Show] {
+    /// Titles matching `t`: general ones, or with `adult` only adult ones.
+    func anilistSearch(_ t: String, adult: Bool = false) async throws -> [Show] {
         let query = """
         query ($q: String) {
-          r: Page(perPage: 30) { media(search: $q, type: ANIME, sort: SEARCH_MATCH, isAdult: false, format_in: [TV, TV_SHORT, ONA, OVA, MOVIE]) { ...S } }
+          r: Page(perPage: \(adult ? 10 : 30)) { media(search: $q, type: ANIME, sort: SEARCH_MATCH, isAdult: \(adult), format_in: [TV, TV_SHORT, ONA, OVA, MOVIE]) { ...S } }
         }
         fragment S on Media { \(Self.fields) }
         """
         let data = try await graphQL(query, variables: ["q": t])
         let media = ((data["r"] as? [String: Any])?["media"] as? [[String: Any]]) ?? []
-        return media.compactMap(Self.show)
+        return media.compactMap { Self.show($0, allowAdult: adult) }
     }
 
     /// The whole show an entry belongs to: earlier and later seasons in order, with episode titles where known.
@@ -803,7 +860,8 @@ public final class ShowCatalog: @unchecked Sendable {
             posterURL: ((cover?["extraLarge"] as? String) ?? (cover?["large"] as? String)).flatMap(URL.init(string:)),
             bannerURL: (m["bannerImage"] as? String).flatMap(URL.init(string:)),
             nextEpisode: next?["episode"] as? Int,
-            nextAiringAt: (next?["airingAt"] as? Int).map { Date(timeIntervalSince1970: TimeInterval($0)) }
+            nextAiringAt: (next?["airingAt"] as? Int).map { Date(timeIntervalSince1970: TimeInterval($0)) },
+            isAdult: m["isAdult"] as? Bool
         )
     }
 

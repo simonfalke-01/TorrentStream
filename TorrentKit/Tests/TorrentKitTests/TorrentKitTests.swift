@@ -149,6 +149,32 @@ final class TorrentKitTests: XCTestCase {
         XCTAssertTrue(torrent.magnetLink.hasPrefix("magnet:?xt=urn:btih:\(desc.infoHashHex)"))
     }
 
+    /// A download that reciprocates still completes, and its peers are listed while connected.
+    func testReciprocatingDownloadCompletesAndListsPeers() throws {
+        let (data, content) = makeTorrent(files: [("clip.mp4", 200_000)], pieceLength: 16384)
+        let desc = try TorrentDescriptor.parse(torrentData: data)
+        let seeder = try FakeSeeder(info: desc.info!, content: content)
+        defer { seeder.stop() }
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let client = TorrentClient(downloadDirectory: dir, useDHT: false, extraTrackers: [])
+        defer { client.shutdown() }
+        let torrent = try client.add(torrentData: data)
+        torrent.setReciprocating(true)
+        torrent.setWanted(true, fileIndex: 0)
+        torrent.addPeers([PeerAddress(ip: 0x7f00_0001, port: seeder.port)], source: "test")
+        var listed = false
+        let deadline = Date().addingTimeInterval(20)
+        while !(torrent.status().files.first?.isComplete ?? false) && Date() < deadline {
+            if !torrent.peerSnapshots().isEmpty { listed = true }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        XCTAssertTrue(torrent.status().files.first?.isComplete ?? false)
+        XCTAssertTrue(listed || !torrent.peerSnapshots().isEmpty)
+        XCTAssertEqual(try Data(contentsOf: XCTUnwrap(torrent.localURL(fileIndex: 0))), content)
+        torrent.setReciprocating(false)
+    }
+
     func testStreamingFetchesOnlyReadaheadAndPrefetch() throws {
         // 256 pieces: with a 512 KB urgent window and 1 MB of near read-ahead the reader needs 64, the container-index
         // tail the last 128.

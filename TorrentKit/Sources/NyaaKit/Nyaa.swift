@@ -73,14 +73,17 @@ public struct NyaaQuery: Hashable, Sendable {
     public var filter: NyaaFilter
     public var sort: NyaaSort
     public var ascending: Bool
+    /// Searches Sukebei, Nyaa's adult site, instead.
+    public var adult: Bool
 
     public init(text: String, category: NyaaCategory = .all, filter: NyaaFilter = .all,
-                sort: NyaaSort = .seeders, ascending: Bool = false) {
+                sort: NyaaSort = .seeders, ascending: Bool = false, adult: Bool = false) {
         self.text = text
         self.category = category
         self.filter = filter
         self.sort = sort
         self.ascending = ascending
+        self.adult = adult
     }
 
     public func url(base: URL, page: Int) -> URL {
@@ -145,6 +148,8 @@ public enum NyaaError: LocalizedError {
 
 public final class NyaaClient: @unchecked Sendable {
     public static let defaultBaseURL = URL(string: "https://nyaa.si")!
+    /// Sukebei, where adult anime is released.
+    public static let adultBaseURL = URL(string: "https://sukebei.nyaa.si")!
 
     public let baseURL: URL
     private let session: URLSession
@@ -155,9 +160,10 @@ public final class NyaaClient: @unchecked Sendable {
     }
 
     public func search(_ query: NyaaQuery, page: Int = 1) async throws -> NyaaPage {
-        let data = try await get(query.url(base: baseURL, page: page))
+        let base = query.adult ? Self.adultBaseURL : baseURL
+        let data = try await get(query.url(base: base, page: page))
         guard let html = String(data: data, encoding: .utf8) else { throw NyaaError.unreadable }
-        return try NyaaParser.parse(html: html, base: baseURL)
+        return try NyaaParser.parse(html: html, base: base)
     }
 
     /// Downloads the .torrent file, which gives the file list immediately instead of waiting for peers.

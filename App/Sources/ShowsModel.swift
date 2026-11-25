@@ -777,6 +777,23 @@ final class ShowsModel: ObservableObject {
         throw ShowError.unplayable
     }
 
+    /// The episode's file in a release the viewer picked to download.
+    func resolve(_ d: ShowDetails, _ s: ShowSeason, _ e: ShowEpisode, choice: DownloadChoice) async throws -> ResolvedEpisode {
+        guard e.isAired else { throw ShowError.notAired }
+        let isMovie = d.show.isMovie || s.media.isMovie
+        guard let t = await app.addSource(torrentURL: choice.torrentURL, magnet: choice.magnet, infoHash: choice.infoHash) else {
+            throw ShowError.unplayable
+        }
+        guard let info = await Self.info(t, timeout: 30), let f = Self.pickFile(info, s, e, isMovie: isMovie) else {
+            app.discardSource(t)
+            throw ShowError.unplayable
+        }
+        return ResolvedEpisode(torrent: t, file: f, source: SavedSource(infoHash: t.infoHashHex, fileIndex: f.index,
+                                                                      magnet: choice.magnet ?? t.magnetLink,
+                                                                      torrentURL: choice.torrentURL, group: choice.group,
+                                                                      isBatch: choice.isBatch))
+    }
+
     /// A ready-to-play request for an episode, resuming where the viewer stopped unless told otherwise.
     func request(_ d: ShowDetails, _ s: ShowSeason, _ e: ShowEpisode, source: EpisodeSource?, resumeAt: Double?,
                  status: @escaping (String) -> Void) async throws -> PlaybackRequest {

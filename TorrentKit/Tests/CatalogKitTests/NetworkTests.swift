@@ -145,6 +145,16 @@ final class NetworkTests: XCTestCase {
         let (nodes, _) = ShowCatalog.nodes(m)
         XCTAssertEqual(nodes[110270]?.show.title, "Interspecies Reviewers")
         XCTAssertEqual(nodes[110270]?.show.episodes, 12)
+        XCTAssertEqual(nodes[110270]?.show.isAdult, true)
+    }
+
+    /// Adult titles join a search after the main answer; the title typed exactly comes first.
+    func testSearchMergesAdultTitlesByMatch() {
+        let main = [Show(id: 1, title: "Panty & Stocking with Garterbelt"), Show(id: 2, title: "Overflowing Love"),
+                    Show(id: 3, title: "Binbougami ga!")]
+        let adult = [Show(id: 113417, title: "Overflow", romaji: "Overflow", isAdult: true), Show(id: 2, title: "Overflowing Love")]
+        XCTAssertEqual(ShowCatalog.merged(main: main, adult: adult, query: " overflow").map(\.id), [113417, 2, 1, 3])
+        XCTAssertEqual(ShowCatalog.merged(main: main, adult: [], query: "garterbelt").map(\.id), [1, 2, 3])
     }
 }
 

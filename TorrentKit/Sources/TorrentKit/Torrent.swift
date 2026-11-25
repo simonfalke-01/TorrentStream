@@ -53,6 +53,19 @@ final class PieceProgress {
     }
 }
 
+/// One connected peer, for display.
+public struct PeerSnapshot: Hashable, Sendable {
+    public let address: String
+    /// What the peer's software calls itself; may be empty.
+    public let client: String
+    /// Bytes per second it is sending.
+    public let downloadRate: Double
+    /// How much of the torrent it has, 0...1.
+    public let progress: Double
+    /// Not sending to us right now.
+    public let isChoking: Bool
+}
+
 public struct FileStatus: Identifiable, Hashable {
     public let file: TorrentFile
     public let downloadedBytes: Int64
@@ -225,6 +238,20 @@ public final class Torrent {
 
     /// Connected peers. A loop thread multiplexes them, so this costs memory, not threads.
     var maxPeers = 110
+    /// Downloads upload to the peers that send to them most (and one at random), as BitTorrent clients reward: most
+    /// leechers only unchoke peers that upload. Streaming keeps the uplink free and doesn't.
+    var reciprocates = false
+    /// Pieces verified since the last tick, announced to peers while reciprocating.
+    var verifiedForHave: [Int] = []
+    var lastChokeRound: TimeInterval = 0
+    var optimisticPeer: ObjectIdentifier?
+    var lastOptimisticAt: TimeInterval = 0
+    var uploadedTotal: Int64 = 0
+    static let uploadSlots = 4
+    static let chokeRoundInterval: TimeInterval = 10
+    static let optimisticInterval: TimeInterval = 30
+    static let streamingMaxPeers = 110
+    static let downloadMaxPeers = 180
     /// Tracker lists are mostly unreachable peers, so many connection attempts run at once, and given up quickly: a
     /// live peer answers a SYN within a round trip (one retransmission fits).
     var maxConnecting = 240
@@ -277,6 +304,50 @@ public final class Torrent {
 
     var isStopped: Bool { lock.lock(); defer { lock.unlock() }; return stopped }
     public var isPaused: Bool { lock.lock(); defer { lock.unlock() }; return paused }
+
+    /// Downloading in full: upload in return and keep more peers. Off for streaming.
+    public func setReciprocating(_ on: Bool) {
+        lock.lock(); defer { lock.unlock() }
+        guard reciprocates != on else { return }
+        reciprocates = on
+        maxPeers = on ? Torrent.downloadMaxPeers : Torrent.streamingMaxPeers
+        lastChokeRound = 0
+        verifiedForHave.removeAll()
+        tickSoonLocked()
+    }
+
+    /// Lock held: who to choke or unchoke now. Without reciprocating, everyone unchoked is choked again.
+    private func chokeRoundLocked(now: TimeInterval) -> [(PeerConnection, Bool)] {
+        let active = handshaked.compactMap { peersByID[$0] }.filter(\.isActive)
+        var unchoke = Set<ObjectIdentifier>()
+        if reciprocates {
+            guard now - lastChokeRound >= Torrent.chokeRoundInterval else { return [] }
+            lastChokeRound = now
+            let interested = active.filter(\.peerInterested)
+            for p in interested.sorted(by: { $0.rate > $1.rate }).prefix(Torrent.uploadSlots) { unchoke.insert(ObjectIdentifier(p)) }
+            let stillThere = optimisticPeer.map { id in interested.contains { ObjectIdentifier($0) == id } } ?? false
+            if !stillThere || now - lastOptimisticAt >= Torrent.optimisticInterval {
+                optimisticPeer = interested.filter { !unchoke.contains(ObjectIdentifier($0)) }.randomElement().map(ObjectIdentifier.init)
+                lastOptimisticAt = now
+            }
+            if let o = optimisticPeer { unchoke.insert(o) }
+        }
+        return active.compactMap { p in
+            let choke = !unchoke.contains(ObjectIdentifier(p))
+            return p.amChoking == choke ? nil : (p, choke)
+        }
+    }
+
+    /// Lock held: a block a peer we unchoked asked for, if we have it.
+    func uploadBlockLocked(_ r: BlockRequest) -> Data? {
+        guard reciprocates, !paused, let info = info, let storage = storage, r.piece >= 0, r.piece < info.pieceCount,
+              have[r.piece], r.length > 0, r.length <= 32 * 1024, r.offset >= 0, r.offset + r.length <= info.pieceSize(r.piece)
+        else { return nil }
+        let at = Int64(r.piece) * Int64(info.pieceLength) + Int64(r.offset)
+        guard let data = try? storage.read(offset: at, length: r.length) else { return nil }
+        uploadedTotal += Int64(r.length)
+        return data
+    }
 
     /// Disconnects from the swarm and stops all network activity until `resume()` (or a playback request).
     public func pause() {
@@ -490,8 +561,17 @@ public final class Torrent {
         }
 
         var doDHT = false, poke = false
+        var chokes: [(PeerConnection, Bool)] = []
+        var haves: [Int] = []
+        var haveTargets: [PeerConnection] = []
         if now - lastSlowTick >= 1 {
             lastSlowTick = now
+            chokes = chokeRoundLocked(now: now)
+            if !verifiedForHave.isEmpty {
+                haves = verifiedForHave
+                verifiedForHave.removeAll()
+                haveTargets = handshaked.compactMap { peersByID[$0] }.filter(\.isActive)
+            }
             rateMeter.add(bytesSinceTick)
             bytesSinceTick = 0
             currentRate = rateMeter.rate()
@@ -568,6 +648,11 @@ public final class Torrent {
         for fi in layoutFiles { refreshContainerLayout(fileIndex: fi) }
         for (p, reason) in toClose { p.close(reason: reason) }
         for p in keepAlive { p.enqueueKeepAlive() }
+        if !chokes.isEmpty || !haves.isEmpty {
+            for (p, choke) in chokes { p.setChoking(choke) }
+            for p in haveTargets { for h in haves { p.enqueueHave(h) } }
+            for p in chokes.map(\.0) + haveTargets { p.flush() }
+        }
         runDeferredCloses()
         toStart.forEach { $0.startConnect(loop: loop) }
         if doDHT { lookupDHT() }
@@ -1128,6 +1213,7 @@ public final class Torrent {
                     self.have[piece] = true
                     self.haveCount += 1
                     self.resumeDirty = true
+                    if self.reciprocates { self.verifiedForHave.append(piece) }
                 }
                 self.inProgress[piece] = nil
                 if let attempts = self.failedAttempts.removeValue(forKey: piece), let good = data.map(blockHashes) {
@@ -1519,6 +1605,16 @@ public final class Torrent {
         )
     }
 
+    /// The peers connected now, fastest first.
+    public func peerSnapshots() -> [PeerSnapshot] {
+        lock.lock(); defer { lock.unlock() }
+        return handshaked.compactMap { peersByID[$0] }.map { p in
+            let have = p.pendingHaveAll ? 1 : (p.bitfield.isEmpty ? 0 : Double(p.bitfield.lazy.filter { $0 }.count) / Double(p.bitfield.count))
+            return PeerSnapshot(address: p.address.description, client: p.clientName, downloadRate: p.rate, progress: have,
+                                isChoking: p.peerChoking)
+        }.sorted { $0.downloadRate != $1.downloadRate ? $0.downloadRate > $1.downloadRate : $0.address < $1.address }
+    }
+
     /// One line about the swarm, for logs and the command line harness.
     public var swarmSummary: String {
         lock.lock(); defer { lock.unlock() }
@@ -1612,6 +1708,6 @@ public final class Torrent {
             left = info.totalLength - haveBytes
         }
         return AnnounceRequest(infoHash: infoHash, peerID: peerID, port: 6881, downloaded: downloadedTotal,
-                               left: left, uploaded: 0, event: event)
+                               left: left, uploaded: uploadedTotal, event: event)
     }
 }

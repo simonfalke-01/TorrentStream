@@ -72,6 +72,23 @@ final class SourceKitTests: XCTestCase {
         XCTAssertNil(match("[Group] Kimi no Na wa Fan Edit - 05", d, 1, 1))
     }
 
+    /// Uncensored adult releases are on Sukebei, not Nyaa.
+    func testAdultShowsAlsoSearchSukebei() {
+        let o = Show(id: 113417, title: "Overflow", romaji: "Overflow", english: "Overflow", format: "ONA",
+                     status: "FINISHED", episodes: 8, isAdult: true)
+        let d = ShowDetails(show: o, seasons: [Self.season(o, 1, offset: 0)])
+        let qs = SourceFinder.queries(details: d, season: d.seasons[0], episode: d.seasons[0].episodes[7])
+        XCTAssertEqual(qs.filter { !$0.adult }.map(\.text), qs.filter(\.adult).map(\.text))
+        XCTAssertTrue(qs.filter(\.adult).allSatisfy { $0.category.id == "1_1" })
+        XCTAssertTrue(qs.first.map { !$0.adult } ?? false, "the episode's own Nyaa search stays first")
+        XCTAssertFalse(SourceFinder.queries(details: Self.frieren, season: Self.frieren.seasons[0],
+                                            episode: Self.frieren.seasons[0].episodes[0]).contains(where: \.adult))
+        XCTAssertNotNil(match("[HentaiHub] Overflow S01E08 1080p UNCENSORED OV WEB-DL AAC2.0 H.264 (English Dub)", d, 1, 8))
+        XCTAssertNotNil(match("[Doomdos] - Overflow - 08 [Uncensored] [Dub] [1080p OV WEB-DL]", d, 1, 8))
+        XCTAssertEqual(NyaaQuery(text: "Overflow", adult: true).url(base: NyaaClient.adultBaseURL, page: 1).host,
+                       "sukebei.nyaa.si")
+    }
+
     func testTraits() {
         let t = ReleaseTraits.parse("[Judas] Sousou no Frieren [BD 1080p][HEVC x265 10bit][Dual-Audio][Multi-Subs] (Batch)")
         XCTAssertEqual(t.resolution, 1080)
