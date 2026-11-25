@@ -175,6 +175,54 @@ final class TorrentKitTests: XCTestCase {
         torrent.setReciprocating(false)
     }
 
+    func testIncomingPeerDownloadsFromOurListener() throws {
+        let (data, content) = makeTorrent(files: [("clip.mp4", 200_000)], pieceLength: 16384)
+        let desc = try TorrentDescriptor.parse(torrentData: data)
+        let seeder = try FakeSeeder(info: desc.info!, content: content)
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: base) }
+        // The first client fetches everything from the fake seeder, then only it has the data.
+        let first = TorrentClient(downloadDirectory: base.appendingPathComponent("a"), useDHT: false, extraTrackers: [])
+        defer { first.shutdown() }
+        let a = try first.add(torrentData: data)
+        a.setReciprocating(true)
+        a.setWanted(true, fileIndex: 0)
+        a.addPeers([PeerAddress(ip: 0x7f00_0001, port: seeder.port)], source: "test")
+        var deadline = Date().addingTimeInterval(20)
+        while !(a.status().files.first?.isComplete ?? false) && Date() < deadline { Thread.sleep(forTimeInterval: 0.05) }
+        XCTAssertTrue(a.status().files.first?.isComplete ?? false)
+        seeder.stop()
+        let port = try XCTUnwrap(first.listeningPort)
+
+        // The second connects to the first's listener and is uploaded to.
+        let second = TorrentClient(downloadDirectory: base.appendingPathComponent("b"), useDHT: false, extraTrackers: [])
+        defer { second.shutdown() }
+        let b = try second.add(torrentData: data)
+        b.setWanted(true, fileIndex: 0)
+        b.addPeers([PeerAddress(ip: 0x7f00_0001, port: port)], source: "test")
+        var sawIncoming = false
+        deadline = Date().addingTimeInterval(20)
+        while !(b.status().files.first?.isComplete ?? false) && Date() < deadline {
+            if a.peerSnapshots().contains(where: \.isIncoming) { sawIncoming = true }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        XCTAssertTrue(sawIncoming || a.peerSnapshots().contains(where: \.isIncoming))
+        XCTAssertTrue(b.status().files.first?.isComplete ?? false)
+        XCTAssertEqual(try Data(contentsOf: XCTUnwrap(b.localURL(fileIndex: 0))), content)
+    }
+
+    func testRouterDescriptionGivesWANService() {
+        let xml = """
+        <root><device><serviceList><service><serviceType>urn:schemas-upnp-org:service:Layer3Forwarding:1</serviceType>
+        <controlURL>/l3f</controlURL></service><service>
+        <serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType><controlURL>/ctl/IPConn</controlURL>
+        </service></serviceList></device></root>
+        """
+        let found = PortMapper.wanService(xml, base: URL(string: "http://192.168.1.1:5000/rootDesc.xml")!)
+        XCTAssertEqual(found?.0, "urn:schemas-upnp-org:service:WANIPConnection:1")
+        XCTAssertEqual(found?.1.absoluteString, "http://192.168.1.1:5000/ctl/IPConn")
+    }
+
     func testStreamingFetchesOnlyReadaheadAndPrefetch() throws {
         // 256 pieces: with a 512 KB urgent window and 1 MB of near read-ahead the reader needs 64, the container-index
         // tail the last 128.

@@ -64,6 +64,8 @@ public struct PeerSnapshot: Hashable, Sendable {
     public let progress: Double
     /// Not sending to us right now.
     public let isChoking: Bool
+    /// It connected to us.
+    public let isIncoming: Bool
 }
 
 public struct FileStatus: Identifiable, Hashable {
@@ -314,6 +316,26 @@ public final class Torrent {
         lastChokeRound = 0
         verifiedForHave.removeAll()
         tickSoonLocked()
+    }
+
+    /// Lock held: whether a peer that just became interested can be unchoked before the next round.
+    func hasFreeUploadSlotLocked() -> Bool {
+        guard reciprocates, !paused else { return false }
+        return handshaked.compactMap { peersByID[$0] }.filter { !$0.amChoking }.count < Torrent.uploadSlots + 1
+    }
+
+    /// Incoming connections allowed past `maxPeers`: they cost nothing to find and often send the most.
+    static let incomingHeadroom = 30
+
+    /// Loop thread: a peer connected to our listener for this torrent. Returns false to turn it away.
+    func acceptIncoming(fd: Int32, address: PeerAddress, received: [UInt8]) -> Bool {
+        lock.lock()
+        guard !stopped, !paused, peers[address] == nil, !banned.contains(address),
+              peers.count < maxPeers + Torrent.incomingHeadroom else { lock.unlock(); return false }
+        let conn = connectLocked(address)
+        lock.unlock()
+        conn.adoptIncoming(fd: fd, received: received, loop: loop)
+        return true
     }
 
     /// Lock held: who to choke or unchoke now. Without reciprocating, everyone unchoked is choked again.
@@ -867,7 +889,8 @@ public final class Torrent {
         peersByID[id] = nil
         let wasConnected = handshaked.remove(id) != nil
         for (piece, _) in peer.metadataRequestedAt { metadataRequestedAt[piece] = nil }
-        if !stopped && !paused && !banned.contains(peer.address) {
+        // An incoming peer's address is a port it connected from; it can't be connected back to.
+        if !stopped && !paused && !banned.contains(peer.address) && !peer.isIncoming {
             // Useful peers are retried soon (right away when the app just came back and the socket was reclaimed);
             // dead ones much later.
             let now = Date.timeIntervalSinceReferenceDate
@@ -1611,7 +1634,7 @@ public final class Torrent {
         return handshaked.compactMap { peersByID[$0] }.map { p in
             let have = p.pendingHaveAll ? 1 : (p.bitfield.isEmpty ? 0 : Double(p.bitfield.lazy.filter { $0 }.count) / Double(p.bitfield.count))
             return PeerSnapshot(address: p.address.description, client: p.clientName, downloadRate: p.rate, progress: have,
-                                isChoking: p.peerChoking)
+                                isChoking: p.peerChoking, isIncoming: p.isIncoming)
         }.sorted { $0.downloadRate != $1.downloadRate ? $0.downloadRate > $1.downloadRate : $0.address < $1.address }
     }
 
@@ -1707,7 +1730,7 @@ public final class Torrent {
             for p in 0..<info.pieceCount where have[p] { haveBytes += Int64(info.pieceSize(p)) }
             left = info.totalLength - haveBytes
         }
-        return AnnounceRequest(infoHash: infoHash, peerID: peerID, port: 6881, downloaded: downloadedTotal,
+        return AnnounceRequest(infoHash: infoHash, peerID: peerID, port: client?.announcePort ?? 6881, downloaded: downloadedTotal,
                                left: left, uploaded: uploadedTotal, event: event)
     }
 }

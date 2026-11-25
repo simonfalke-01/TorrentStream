@@ -21,11 +21,17 @@ final class DHT {
         var inFlight: [PeerAddress: Date] = [:]
         var responded = 0
         var peers = Set<PeerAddress>()
+        /// Nodes that answered with a token, to announce ourselves to once the lookup ends.
+        var tokens: [PeerAddress: (id: Data, token: Data)] = [:]
         let onPeers: ([PeerAddress]) -> Void
         init(infoHash: Data, onPeers: @escaping ([PeerAddress]) -> Void) { self.infoHash = infoHash; self.onPeers = onPeers }
     }
 
     private let nodeID = Data.random(count: 20)
+    /// The port peers connect to us on; with one, each lookup ends by announcing it to the closest nodes, so peers
+    /// searching the DHT find us. Read on the DHT thread.
+    var announcePort: (() -> UInt16?)?
+    static let announceNodes = 8
     private var socket: UDPSocket?
     private let lock = NSLock()
     private var lookups: [Lookup] = []
@@ -169,14 +175,32 @@ final class DHT {
                 toSend.append((msg, n.address))
             }
         }
+        let port = announcePort?()
         lookups.removeAll { l in
             let done = (l.candidates.isEmpty && l.inFlight.isEmpty) || now.timeIntervalSince(l.started) > 45 || l.queried.count >= 400
-            if done { log("dht: lookup done, queried \(l.queried.count), responses \(l.responded), peers \(l.peers.count)") }
+            if done {
+                log("dht: lookup done, queried \(l.queried.count), responses \(l.responded), peers \(l.peers.count)")
+                if let port { toSend += announces(l, port: port) }
+            }
             return done
         }
         if transactions.count > 4000 { transactions.removeAll() }
         lock.unlock()
         for (m, a) in toSend { socket?.send(m, to: a) }
+    }
+
+    /// announce_peer to the closest nodes that gave a token. Lock held.
+    private func announces(_ l: Lookup, port: UInt16) -> [(Data, PeerAddress)] {
+        let closest = l.tokens.sorted { DHT.distance($0.value.id, l.infoHash).lexicographicallyPrecedes(DHT.distance($1.value.id, l.infoHash)) }
+            .prefix(DHT.announceNodes)
+        return closest.map { addr, entry in
+            let msg = BValue.dict([
+                "t": .bytes(makeTxid()), "y": .str("q"), "q": .str("announce_peer"),
+                "a": .dict(["id": .bytes(nodeID), "info_hash": .bytes(l.infoHash), "port": .int(Int64(port)),
+                            "token": .bytes(entry.token), "implied_port": .int(0)]),
+            ]).encoded()
+            return (msg, addr)
+        }
     }
 
     private func makeTxid() -> Data {
@@ -208,6 +232,7 @@ final class DHT {
         if let l = lookup {
             l.inFlight[from] = nil
             l.responded += 1
+            if let token = r["token"]?.data, let id = r["id"]?.data, id.count == 20 { l.tokens[from] = (id, token) }
             for v in r["values"]?.list ?? [] {
                 if let d = v.data, let p = PeerAddress(compact: d), l.peers.insert(p).inserted { newPeers.append(p) }
             }

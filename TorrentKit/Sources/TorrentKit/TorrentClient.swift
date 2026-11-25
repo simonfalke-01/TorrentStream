@@ -27,6 +27,10 @@ public final class TorrentClient {
     private var starvingTorrents = Set<ObjectIdentifier>()
     /// Single network thread shared by every torrent's peer connections.
     let loop = EventLoop()
+    /// Accepts peers that connect to us.
+    private var listener: PeerListener?
+    /// Forwards a public port on the home router to the listener.
+    private var mapper: PortMapper?
     private var skipsAttachments = true
 
     /// When a player opens a Matroska file whose attachments (embedded subtitle fonts, often several megabytes before
@@ -54,6 +58,35 @@ public final class TorrentClient {
         server = StreamServer(client: self, preferredPort: streamingPort)
         dht?.start()
         try? server.ensureRunning()
+        startListening()
+    }
+
+    /// The port peers connect to: the one the router forwards, else the one we listen on.
+    var announcePort: UInt16? {
+        lock.lock(); defer { lock.unlock() }
+        return mapper?.externalPort ?? listener?.port
+    }
+
+    /// The local port peers can connect to, if listening.
+    public var listeningPort: UInt16? { lock.lock(); defer { lock.unlock() }; return listener?.port }
+
+    /// The public port the router forwards to us, once mapped.
+    public var forwardedPort: UInt16? { lock.lock(); defer { lock.unlock() }; return mapper?.externalPort }
+
+    private func startListening() {
+        let portFile = downloadDirectory.appendingPathComponent("peer-port")
+        let saved = (try? String(contentsOf: portFile, encoding: .utf8)).flatMap { UInt16($0) } ?? 0
+        let l = PeerListener(client: self, loop: loop)
+        guard let port = l.open(preferred: saved) else { log("listener: no port"); return }
+        if port != saved { try? String(port).write(to: portFile, atomically: true, encoding: .utf8) }
+        let m = PortMapper(internalPort: port) { _ in }
+        lock.lock()
+        listener = l
+        mapper = m
+        lock.unlock()
+        dht?.announcePort = { [weak self] in self?.announcePort }
+        log("listener: peers connect on port \(port)")
+        if useDHT { m.refresh() }
     }
 
     deinit { loop.stop() }
@@ -134,6 +167,10 @@ public final class TorrentClient {
         backgroundedAt = nil
         lock.unlock()
         torrents.forEach { $0.reconnectAfterSuspension(suspended: suspended) }
+        // The listener comes back if iOS reclaimed it; the router mapping is renewed if it lapsed (or local network
+        // access was just allowed).
+        if let listener { loop.post { if listener.fd < 0 { listener.reopen() } } }
+        if useDHT { mapper?.refresh() }
     }
 
     public var streamingPort: UInt16 { server.port }
@@ -155,6 +192,7 @@ public final class TorrentClient {
         torrents.forEach { $0.stop() }
         dht?.stop()
         server.stop()
+        if let listener { loop.post { listener.close() } }
         // Let the torrents' posted cleanup run first.
         loop.post { [loop] in loop.stop() }
     }

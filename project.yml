@@ -34,8 +34,8 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.simonfalke.TorrentStream
         PRODUCT_NAME: TorrentStream
-        MARKETING_VERSION: "5.9"
-        CURRENT_PROJECT_VERSION: "20"
+        MARKETING_VERSION: "5.10"
+        CURRENT_PROJECT_VERSION: "21"
         TARGETED_DEVICE_FAMILY: "1,2"
         SWIFT_VERSION: "5.0"
         CODE_SIGN_STYLE: Automatic
@@ -68,7 +68,7 @@ targets:
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
           NSAllowsLocalNetworking: true
-        NSLocalNetworkUsageDescription: TorrentStream connects to BitTorrent peers that may be on your local network.
+        NSLocalNetworkUsageDescription: TorrentStream asks your router to let peers connect to it, which makes downloads faster, and connects to peers on your network.
         NSPhotoLibraryAddUsageDescription: TorrentStream saves downloaded videos to your photo library when you choose Save to Photos.
         CFBundleURLTypes:
           - CFBundleURLName: Magnet link

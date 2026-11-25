@@ -427,8 +427,7 @@ private struct PeerRow: View {
                 Text(peer.client.isEmpty ? "Unknown Client" : peer.client)
                     .font(.subheadline)
                     .lineLimit(1)
-                Text(peer.progress >= 1 ? "\(peer.address), has everything"
-                                        : "\(peer.address), has \(peer.progress.formatted(.percent.precision(.fractionLength(0))))")
+                Text(peerDetail)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -440,6 +439,12 @@ private struct PeerRow: View {
         }
         .monospacedDigit()
         .accessibilityElement(children: .combine)
+    }
+
+    /// "Has 40%, connected to you".
+    private var peerDetail: String {
+        let has = peer.progress >= 1 ? "Has everything" : "Has \(peer.progress.formatted(.percent.precision(.fractionLength(0))))"
+        return peer.isIncoming ? "\(has), connected to you" : has
     }
 }
 

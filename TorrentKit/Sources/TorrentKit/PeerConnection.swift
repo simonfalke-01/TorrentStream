@@ -103,6 +103,8 @@ final class PeerConnection: LoopHandler {
     /// We refuse its requests; unchoked only while a download reciprocates.
     var amChoking = true
     var uploadedBytes: Int64 = 0
+    /// The peer connected to our listener.
+    private(set) var isIncoming = false
     var utMetadataID: Int?
     var utPexID: Int?
     var maxRequests = 250
@@ -164,14 +166,24 @@ final class PeerConnection: LoopHandler {
         if phase != .closed && revents & Int16(POLLOUT) != 0 { flush() }
     }
 
-    private func finishConnect() {
-        var err: Int32 = 0
-        var len = socklen_t(MemoryLayout<Int32>.size)
-        getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len)
-        guard err == 0 else { close(reason: "connect: \(String(cString: strerror(err)))"); return }
-        guard let torrent = torrent else { close(reason: "torrent gone"); return }
-        rtt = max(0.02, Date.timeIntervalSinceReferenceDate - startedAt)
+    /// Takes over a socket our listener accepted, with what the peer sent so far (at least the start of its
+    /// handshake). Loop thread.
+    func adoptIncoming(fd: Int32, received: [UInt8], loop: EventLoop) {
+        guard phase == .idle, let torrent else { _ = Glue.close(fd); return }
+        self.fd = fd
+        isIncoming = true
+        startedAt = Date.timeIntervalSinceReferenceDate
         phase = .handshaking
+        if inbuf.count < received.count { inbuf = [UInt8](repeating: 0, count: max(64 * 1024, received.count)) }
+        inbuf.replaceSubrange(0..<received.count, with: received)
+        inLen = received.count
+        enqueue(Self.handshake(torrent))
+        loop.add(self)
+        if inLen >= 68 { processInput() }
+        flush()
+    }
+
+    private static func handshake(_ torrent: Torrent) -> [UInt8] {
         var hs = [UInt8]()
         hs.reserveCapacity(68)
         hs.append(19)
@@ -182,7 +194,18 @@ final class PeerConnection: LoopHandler {
         hs.append(contentsOf: reserved)
         hs.append(contentsOf: torrent.infoHash)
         hs.append(contentsOf: torrent.peerID)
-        enqueue(hs)
+        return hs
+    }
+
+    private func finishConnect() {
+        var err: Int32 = 0
+        var len = socklen_t(MemoryLayout<Int32>.size)
+        getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len)
+        guard err == 0 else { close(reason: "connect: \(String(cString: strerror(err)))"); return }
+        guard let torrent = torrent else { close(reason: "torrent gone"); return }
+        rtt = max(0.02, Date.timeIntervalSinceReferenceDate - startedAt)
+        phase = .handshaking
+        enqueue(Self.handshake(torrent))
         // Requests for what the player waits on go out with the handshake, a round trip before the peer's bitfield
         // and unchoke would allow them: peers that unchoke right away (most seeders) answer them at once. Our
         // bitfield has to come first.
@@ -294,7 +317,10 @@ final class PeerConnection: LoopHandler {
         switch id {
         case 0: torrent.peerChokedLocked(self)
         case 1: torrent.peerUnchokedLocked(self)
-        case 2: peerInterested = true
+        case 2:
+            peerInterested = true
+            // A free upload slot goes to it now rather than at the next choke round.
+            if amChoking && torrent.hasFreeUploadSlotLocked() { setChoking(false) }
         case 3: peerInterested = false
         case 4:
             guard payload.count >= 4 else { return nil }
@@ -348,6 +374,8 @@ final class PeerConnection: LoopHandler {
             "v": .str("TorrentStream 2.0"),
             "reqq": .int(500),
         ]
+        // Where we listen, so peers that learn of us through PEX can connect.
+        if let port = torrent.client?.announcePort { d["p"] = .int(Int64(port)) }
         if let size = torrent.metadataSizeIfKnown { d["metadata_size"] = .int(Int64(size)) }
         sendExtended(id: 0, payload: BValue.dict(d).encoded())
     }
