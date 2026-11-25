@@ -33,7 +33,9 @@ final class DownloadsModel: ObservableObject {
     private unowned let shows: ShowsModel
     private let fileURL: URL
     /// Releases being found, by show.
-    private var finders: [Int: Task<Void, Never>] = [:]
+    /// Releases being found, by record. A show's episodes without a chosen version go one at a time, so they can
+    /// share a season pack once one is found; a chosen version is found straight away.
+    private var finders: [String: (show: Int, chosen: Bool, token: UUID)] = [:]
     private var ticker: Task<Void, Never>?
     /// Torrent objects each download's file was marked wanted on, so it's marked once per torrent.
     private var marked: [String: ObjectIdentifier] = [:]
@@ -132,9 +134,8 @@ final class DownloadsModel: ObservableObject {
     /// Downloads a version the viewer picked, replacing the release an earlier download of the episode used.
     func download(_ d: ShowDetails, _ s: ShowSeason, _ e: ShowEpisode, version: EpisodeSource) {
         guard e.isAired else { return }
-        let r = version.result
-        let choice = DownloadChoice(title: r.title, infoHash: r.infoHash, magnet: r.magnet, torrentURL: r.torrentURL,
-                                    group: version.group, isBatch: version.isBatch)
+        let choice = Self.choice(version)
+        shows.prefer(version, show: d.show.id)
         let key = ShowsModel.key(d.show.id, s.id, e.number)
         if let old = library[key] {
             if let rel = old.release {
@@ -160,6 +161,11 @@ final class DownloadsModel: ObservableObject {
         }
         changed()
         findNext()
+    }
+
+    private static func choice(_ v: EpisodeSource) -> DownloadChoice {
+        DownloadChoice(title: v.result.title, infoHash: v.result.infoHash, magnet: v.result.magnet,
+                       torrentURL: v.result.torrentURL, group: v.group, isBatch: v.isBatch)
     }
 
     /// Holds a download where it is until it's resumed.
@@ -243,9 +249,15 @@ final class DownloadsModel: ObservableObject {
             library.update(key) { $0.state = $0.release == nil ? .queued : .downloading; $0.failure = nil }
             return true
         }
-        return library.add(DownloadRecord(id: key, show: d.show, seasonID: s.id, season: s.number, episode: e.number,
-                                          episodeTitle: e.title, thumbnailURL: e.thumbnailURL,
-                                          isMovie: d.show.isMovie || s.media.isMovie))
+        var rec = DownloadRecord(id: key, show: d.show, seasonID: s.id, season: s.number, episode: e.number,
+                                 episodeTitle: e.title, thumbnailURL: e.thumbnailURL,
+                                 isMovie: d.show.isMovie || s.media.isMovie)
+        // A version picked in Versions is the one downloaded.
+        if let picked = shows.chosenVersion(key) {
+            rec.choice = Self.choice(picked)
+            rec.priority = 1
+        }
+        return library.add(rec)
     }
 
     // MARK: removing
@@ -281,18 +293,35 @@ final class DownloadsModel: ObservableObject {
     // MARK: finding releases
 
     private func findNext() {
-        while let r = library.nextToFind(skipping: Set(finders.keys)) {
-            let show = r.show.id
-            finders[show] = Task { [weak self] in
-                await self?.find(r)
-                self?.finders[show] = nil
-                self?.findNext()
-            }
+        for r in library.records where r.state == .queued && r.choice != nil { startFinding(r) }
+        while let r = library.nextToFind(skipping: Set(finders.values.filter { !$0.chosen }.map(\.show))) {
+            startFinding(r)
         }
     }
 
-    private func find(_ r: DownloadRecord) async {
+    private func startFinding(_ r: DownloadRecord) {
         library.update(r.id) { $0.state = .finding }
+        guard let r = library[r.id] else { return }
+        let token = UUID()
+        finders[r.id] = (r.show.id, r.choice != nil, token)
+        Task { [weak self] in
+            await self?.find(r)
+            if self?.finders[r.id]?.token == token { self?.finders[r.id] = nil }
+            self?.findNext()
+        }
+    }
+
+    /// Whether the record still wants what `r` was looking for: not removed, and no other version chosen since.
+    private func stillWanted(_ r: DownloadRecord) -> Bool {
+        guard let now = library[r.id] else { return false }
+        return now.choice == r.choice && now.state != .queued
+    }
+
+    private func find(_ r: DownloadRecord) async {
+        // A version chosen since then is found instead.
+        func fail(_ key: String, _ message: String) {
+            if stillWanted(r) { self.fail(key, message) }
+        }
         guard let d = try? await shows.loadDetails(r.show) else {
             return fail(r.id, "Episodes couldn’t be loaded. Check your connection and try again.")
         }
@@ -323,8 +352,15 @@ final class DownloadsModel: ObservableObject {
                 return fail(r.id, PlaybackLauncher.message(for: error))
             }
         }
-        // Removed while its release was being found.
-        guard let now = library[r.id] else { return }
+        // Removed, or another version chosen, while its release was being found.
+        guard stillWanted(r), let now = library[r.id] else {
+            let h = found.release.infoHash.lowercased()
+            if library.others(using: found.release.infoHash).isEmpty,
+               !library.records.contains(where: { $0.choice?.infoHash?.lowercased() == h }) {
+                app.discardSource(found.torrent)
+            }
+            return
+        }
         // Paused while its release was being found: it's kept, and fetches once resumed.
         if now.state == .paused {
             library.update(r.id) { $0.release = found.release }

@@ -708,6 +708,18 @@ final class ShowsModel: ObservableObject {
         chosen[key] = source
         prepared[key] = nil
         planned[key] = nil
+        prefer(source, show: d.show.id)
+    }
+
+    /// The version picked for the episode and not played yet.
+    func chosenVersion(_ key: String) -> EpisodeSource? { chosen[key] }
+
+    /// The group of a version the viewer picked ranks first for the show's other episodes from now on.
+    func prefer(_ source: EpisodeSource, show id: Int) {
+        guard let g = source.group, groups[String(id)] != g else { return }
+        groups[String(id)] = g
+        sourceCache = sourceCache.filter { !$0.key.hasPrefix("\(id).") }
+        save()
     }
 
     /// Finds a file that plays the episode: the one prepared ahead, the one played before, the next file of the
