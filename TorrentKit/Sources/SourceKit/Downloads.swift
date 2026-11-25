@@ -182,9 +182,13 @@ public struct DownloadLibrary: Sendable {
     }
 
     /// The next record whose release should be found: highest priority, then the show's own order, oldest show first.
-    public var nextToFind: DownloadRecord? {
+    public var nextToFind: DownloadRecord? { nextToFind(skipping: []) }
+
+    /// The next record to find among shows other than `shows`, so shows are found side by side while a show's own
+    /// episodes go one at a time (and share a season pack once one is found).
+    public func nextToFind(skipping shows: Set<Int>) -> DownloadRecord? {
         let firstAdded = Dictionary(records.map { ($0.show.id, $0.addedAt) }, uniquingKeysWith: min)
-        return records.filter { $0.state == .queued }.min { a, b in
+        return records.filter { $0.state == .queued && !shows.contains($0.show.id) }.min { a, b in
             if a.priority != b.priority { return a.priority > b.priority }
             let fa = firstAdded[a.show.id] ?? a.addedAt, fb = firstAdded[b.show.id] ?? b.addedAt
             if a.show.id != b.show.id { return fa != fb ? fa < fb : a.show.id < b.show.id }

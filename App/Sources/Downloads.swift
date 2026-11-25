@@ -21,7 +21,8 @@ enum DownloadStatus: Equatable {
 /// release, the same way Play finds one; the file is then fetched in full in the background and its release is kept
 /// out of the streaming cache until the download is removed.
 ///
-/// Releases are found one at a time, and at most `maxActiveReleases` fetch at once, in the order shows were added
+/// Releases are found for up to `maxFinders` shows at once (a show's episodes one at a time), and up to
+/// `maxActiveReleases` fetch at once, in the order shows were added
 /// and then episode order, so the first episodes are ready first. While a player streams something that isn't on
 /// the device yet, other releases wait so it has the bandwidth.
 @MainActor
@@ -33,13 +34,15 @@ final class DownloadsModel: ObservableObject {
     private unowned let app: AppModel
     private unowned let shows: ShowsModel
     private let fileURL: URL
-    private var finder: Task<Void, Never>?
+    /// Releases being found, by show.
+    private var finders: [Int: Task<Void, Never>] = [:]
     private var ticker: Task<Void, Never>?
     /// Torrent objects each download's file was marked wanted on, so it's marked once per torrent.
     private var marked: [String: ObjectIdentifier] = [:]
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
 
-    private static let maxActiveReleases = 2
+    private static let maxActiveReleases = 4
+    private static let maxFinders = 3
     /// Space left free on the phone beyond what a download needs.
     private static let spareSpace: Int64 = 1_000_000_000
 
@@ -176,12 +179,13 @@ final class DownloadsModel: ObservableObject {
     // MARK: finding releases
 
     private func findNext() {
-        guard finder == nil, library.nextToFind != nil else { return }
-        finder = Task { [weak self] in
-            while let self, let r = self.library.nextToFind {
-                await self.find(r)
+        while finders.count < Self.maxFinders, let r = library.nextToFind(skipping: Set(finders.keys)) {
+            let show = r.show.id
+            finders[show] = Task { [weak self] in
+                await self?.find(r)
+                self?.finders[show] = nil
+                self?.findNext()
             }
-            self?.finder = nil
         }
     }
 

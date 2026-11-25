@@ -68,6 +68,9 @@ final class DownloadLibraryTests: XCTestCase {
         XCTAssertEqual(lib.nextToFind?.id, "154587.1.3")
         lib.update("154587.1.5") { $0.priority = 1 }
         XCTAssertEqual(lib.nextToFind?.id, "154587.1.5")
+        XCTAssertEqual(lib.nextToFind(skipping: [154587])?.id, nil, "shows being found are left to their own finder")
+        lib.add(record(mushishi, 1, 4, at: 30))
+        XCTAssertEqual(lib.nextToFind(skipping: [154587])?.id, "457.1.4")
     }
 
     func testSummaryAndShows() {
