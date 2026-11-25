@@ -34,6 +34,8 @@ struct ShowView: View {
     @State private var seasonID: Int?
     @State private var launch: EpisodeLaunch?
     @State private var versions: EpisodeTarget?
+    /// An episode whose download version is being picked.
+    @State private var downloadVersions: EpisodeTarget?
     @State private var loadError: String?
     @State private var synopsisExpanded = false
     @State private var confirmingRemoval = false
@@ -88,6 +90,13 @@ struct ShowView: View {
                 versions = nil
                 launch = EpisodeLaunch(show: target.details.show, seasonID: target.season.id,
                                        episode: target.episode.number, source: source)
+            }
+        }
+        .sheet(item: $downloadVersions) { target in
+            let key = ShowsModel.key(target.details.show.id, target.season.id, target.episode.number)
+            VersionsView(target: target, current: downloads.record(key)?.release?.infoHash, forDownload: true) { source in
+                downloadVersions = nil
+                downloads.download(target.details, target.season, target.episode, version: source)
             }
         }
         .confirmationDialog(main.isMovie ? "Remove the download of \(main.title)?" : "Remove every download of \(main.title)?",
@@ -193,7 +202,14 @@ struct ShowView: View {
                     DownloadControl(status: downloads.status(key), prominent: true,
                                     onDownload: { downloads.downloadMovie(d) },
                                     onRemove: { downloads.remove(key) },
-                                    onRetry: { downloads.retry(key) })
+                                    onRetry: { downloads.retry(key) },
+                                    onPause: { downloads.pause(key) },
+                                    onResume: { downloads.resume(key) },
+                                    onChooseVersion: {
+                                        if let s = d.seasons.first, let e = s.episodes.first(where: \.isAired) {
+                                            downloadVersions = EpisodeTarget(details: d, season: s, episode: e)
+                                        }
+                                    })
                 }
             }
 
@@ -328,7 +344,10 @@ struct ShowView: View {
                 DownloadControl(status: download,
                                 onDownload: { downloads.download(d, s, e) },
                                 onRemove: { downloads.remove(key) },
-                                onRetry: { downloads.retry(key) })
+                                onRetry: { downloads.retry(key) },
+                                onPause: { downloads.pause(key) },
+                                onResume: { downloads.resume(key) },
+                                onChooseVersion: { downloadVersions = EpisodeTarget(details: d, season: s, episode: e) })
                     .padding(.top, Space.s + (ShowEpisodeRow.thumbHeight - Metrics.touchTarget) / 2)
                     .offset(x: (Metrics.touchTarget - Metrics.indicator) / 2)
             }
@@ -347,11 +366,23 @@ struct ShowView: View {
                         Button { downloads.download(d, s, e) } label: {
                             Label("Download Episode", systemImage: "arrow.down.circle")
                         }
+                        Button { downloadVersions = EpisodeTarget(details: d, season: s, episode: e) } label: {
+                            Label("Download a Version…", systemImage: "square.stack")
+                        }
                     case .completed:
+                        Button { downloadVersions = EpisodeTarget(details: d, season: s, episode: e) } label: {
+                            Label("Download Another Version…", systemImage: "square.stack")
+                        }
                         Button(role: .destructive) { downloads.remove(key) } label: {
                             Label("Remove Download", systemImage: "trash")
                         }
+                    case .paused:
+                        Button { downloads.resume(key) } label: { Label("Resume Download", systemImage: "play") }
+                        Button(role: .destructive) { downloads.remove(key) } label: {
+                            Label("Cancel Download", systemImage: "xmark")
+                        }
                     default:
+                        Button { downloads.pause(key) } label: { Label("Pause Download", systemImage: "pause") }
                         Button(role: .destructive) { downloads.remove(key) } label: {
                             Label("Cancel Download", systemImage: "xmark")
                         }
@@ -660,6 +691,8 @@ struct VersionsView: View {
     let target: EpisodeTarget
     /// Info hash of the release playing now.
     var current: String? = nil
+    /// Picking what to download rather than what to play.
+    var forDownload = false
     let onSelect: (EpisodeSource) -> Void
 
     @EnvironmentObject var shows: ShowsModel
@@ -675,7 +708,7 @@ struct VersionsView: View {
     var body: some View {
         NavigationStack {
             content
-                .navigationTitle("Versions")
+                .navigationTitle(forDownload ? "Download a Version" : "Versions")
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
                     ToolbarItem(placement: .cancellationAction) {
@@ -713,7 +746,8 @@ struct VersionsView: View {
                 } header: {
                     Text(heading)
                 } footer: {
-                    Text("Picked for you from the fastest versions.")
+                    Text(forDownload ? "Tap a version to download it. It replaces any download of this episode."
+                                     : "Picked for you from the fastest versions.")
                 }
                 ForEach(groups(Array(list.dropFirst())), id: \.title) { group in
                     Section(group.title) {
@@ -774,7 +808,7 @@ struct VersionsView: View {
                     Image(systemName: "checkmark")
                         .font(.body.weight(.semibold))
                         .foregroundStyle(.tint)
-                        .accessibilityLabel("Playing")
+                        .accessibilityLabel(forDownload ? "Downloaded" : "Playing")
                 }
             }
             .contentShape(.rect)

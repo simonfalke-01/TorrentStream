@@ -122,35 +122,7 @@ struct LibraryView: View {
 
     // MARK: Downloads
 
-    /// Shows with episodes on the device. Each opens its page, where they play and are removed.
-    @ViewBuilder
-    private var downloadsContent: some View {
-        let list = downloads.downloadedShows
-        if list.isEmpty {
-            ContentUnavailableView("No Downloads", systemImage: "arrow.down.circle",
-                                   description: Text("Download episodes from a show’s page to watch them offline."))
-        } else {
-            ScrollView {
-                LazyVGrid(columns: columns, spacing: Space.l) {
-                    ForEach(list) { show in
-                        ShowPosterCard(show: show, detail: downloadDetail(show)) {
-                            launch = EpisodeLaunch(show: show)
-                        }
-                    }
-                }
-                .padding(.horizontal, Space.l)
-                .padding(.vertical, Space.s)
-            }
-        }
-    }
-
-    /// "3 Episodes", "Downloading", or "Downloaded" for a movie.
-    private func downloadDetail(_ show: Show) -> String {
-        let s = downloads.summary(show)
-        if s.pending > 0 { return "Downloading" }
-        if s.completed == 0 { return "Didn’t Finish" }
-        return show.isMovie ? "Downloaded" : Format.episodes(s.completed)
-    }
+    private var downloadsContent: some View { DownloadsPane() }
 
     // MARK: History
 

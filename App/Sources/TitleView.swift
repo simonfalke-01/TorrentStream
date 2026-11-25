@@ -9,6 +9,8 @@ extension View {
             switch route {
             case .title(let hash): TitleView(infoHash: hash)
             case .show(let show): ShowView(show: show)
+            case .downloads(let show): ShowDownloadsView(show: show)
+            case .download(let key): DownloadDetailView(key: key)
             }
         }
     }

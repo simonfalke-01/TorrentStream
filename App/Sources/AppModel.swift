@@ -60,11 +60,15 @@ enum Route: Hashable {
     case title(String)
     /// A show or movie from the catalog.
     case show(Show)
+    /// A show's episodes on the device.
+    case downloads(Show)
+    /// One download, by episode key.
+    case download(String)
 
     var hash: String {
         switch self {
         case .title(let h): return h
-        case .show: return ""
+        case .show, .downloads, .download: return ""
         }
     }
 }

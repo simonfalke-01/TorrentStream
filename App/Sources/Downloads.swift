@@ -41,6 +41,11 @@ final class DownloadsModel: ObservableObject {
     private var marked: [String: ObjectIdentifier] = [:]
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
 
+    /// Live transfer numbers, kept apart so only the download manager redraws every second.
+    let activity = DownloadActivity()
+    /// Releases told to upload while they fetch, so peers keep sending to them.
+    private var reciprocating: Set<String> = []
+
     private static let maxActiveReleases = 4
     private static let maxFinders = 3
     /// Space left free on the phone beyond what a download needs.
@@ -126,6 +131,105 @@ final class DownloadsModel: ObservableObject {
         return ShowsModel.key(d.show.id, s.id, e.number)
     }
 
+    /// Downloads a version the viewer picked, replacing the release an earlier download of the episode used.
+    func download(_ d: ShowDetails, _ s: ShowSeason, _ e: ShowEpisode, version: EpisodeSource) {
+        guard e.isAired else { return }
+        let r = version.result
+        let choice = DownloadChoice(title: r.title, infoHash: r.infoHash, magnet: r.magnet, torrentURL: r.torrentURL,
+                                    group: version.group, isBatch: version.isBatch)
+        let key = ShowsModel.key(d.show.id, s.id, e.number)
+        if let old = library[key] {
+            if let rel = old.release {
+                library.update(key) { $0.release = nil }
+                letGo(rel)
+            }
+            library.update(key) {
+                $0.state = .queued
+                $0.failure = nil
+                $0.choice = choice
+                $0.priority = 1
+                $0.completedAt = nil
+            }
+            fractions[key] = nil
+            marked[key] = nil
+        } else {
+            var rec = DownloadRecord(id: key, show: d.show, seasonID: s.id, season: s.number, episode: e.number,
+                                     episodeTitle: e.title, thumbnailURL: e.thumbnailURL,
+                                     isMovie: d.show.isMovie || s.media.isMovie)
+            rec.choice = choice
+            rec.priority = 1
+            _ = library.add(rec)
+        }
+        changed()
+        findNext()
+    }
+
+    /// Holds a download where it is until it's resumed.
+    func pause(_ key: String) {
+        guard let r = library[key], r.state.isPending else { return }
+        library.update(key) { $0.state = .paused }
+        changed()
+        _ = tick()
+    }
+
+    func resume(_ key: String) {
+        guard let r = library[key], r.state == .paused else { return }
+        library.update(key) { $0.state = $0.release == nil ? .queued : .downloading }
+        changed()
+        findNext()
+    }
+
+    func pauseAll() {
+        let keys = library.records.filter { $0.state.isPending }.map(\.id)
+        guard !keys.isEmpty else { return }
+        for k in keys { library.update(k) { $0.state = .paused } }
+        changed()
+        _ = tick()
+    }
+
+    func resumeAll() {
+        let keys = library.records.filter { $0.state == .paused }.map(\.id)
+        guard !keys.isEmpty else { return }
+        for k in keys { library.update(k) { $0.state = $0.release == nil ? .queued : .downloading } }
+        changed()
+        findNext()
+    }
+
+    /// Downloads not finished yet, in the order they fetch.
+    var unfinished: [DownloadRecord] {
+        Self.order(library.records.filter { $0.state != .completed })
+    }
+
+    /// Finished downloads of a show, in episode order.
+    func completed(show id: Int) -> [DownloadRecord] {
+        library.records(show: id).filter { $0.state == .completed }.sorted { ($0.season, $0.episode) < ($1.season, $1.episode) }
+    }
+
+    func record(_ key: String) -> DownloadRecord? { library[key] }
+
+    /// What a download takes on the device so far.
+    func bytes(_ r: DownloadRecord) -> (done: Int64, total: Int64?) {
+        guard let rel = r.release else { return (0, nil) }
+        let total = rel.length
+        if r.state == .completed { return (total ?? 0, total) }
+        let done = app.client.torrent(infoHashHex: rel.infoHash)?.downloadedBytes(fileIndex: rel.fileIndex)
+            ?? Int64((fractions[r.id] ?? 0) * Double(total ?? 0))
+        return (done, total)
+    }
+
+    /// Everything finished downloads take on the device.
+    var storedBytes: Int64 {
+        library.records.filter { $0.state == .completed }.reduce(0) { $0 + ($1.release?.length ?? 0) }
+    }
+
+    var freeBytes: Int64? { app.availableCapacity }
+
+    /// The peers a download's release is connected to, fastest first.
+    func peers(_ key: String) -> [PeerSnapshot] {
+        guard let h = library[key]?.release?.infoHash else { return [] }
+        return app.client.torrent(infoHashHex: h)?.peerSnapshots() ?? []
+    }
+
     func retry(_ key: String) {
         guard let r = library[key], r.state == .failed else { return }
         library.update(key) { $0.state = $0.release == nil ? .queued : .downloading; $0.failure = nil }
@@ -198,7 +302,17 @@ final class DownloadsModel: ObservableObject {
             return fail(r.id, "This episode is no longer listed.")
         }
         let found: (torrent: Torrent, file: TorrentFile, release: DownloadRelease)
-        if let pack = packHolding(d, s, e, isMovie: r.isMovie) {
+        if let choice = r.choice {
+            do {
+                let res = try await shows.resolve(d, s, e, choice: choice)
+                found = (res.torrent, res.file,
+                         DownloadRelease(infoHash: res.torrent.infoHashHex, fileIndex: res.file.index, magnet: res.source.magnet,
+                                         torrentURL: res.source.torrentURL, group: res.source.group,
+                                         isBatch: res.source.isBatch, length: res.file.length))
+            } catch {
+                return fail(r.id, "This version couldn’t be opened. Choose another version and try again.")
+            }
+        } else if let pack = packHolding(d, s, e, isMovie: r.isMovie) {
             found = pack
         } else {
             do {
@@ -212,7 +326,13 @@ final class DownloadsModel: ObservableObject {
             }
         }
         // Removed while its release was being found.
-        guard library[r.id] != nil else { return }
+        guard let now = library[r.id] else { return }
+        // Paused while its release was being found: it's kept, and fetches once resumed.
+        if now.state == .paused {
+            library.update(r.id) { $0.release = found.release }
+            changed()
+            return
+        }
         let missing = found.file.length - (found.torrent.downloadedBytes(fileIndex: found.file.index) ?? 0)
         let need = missing + remainingBytes() + Self.spareSpace
         if let free = app.availableCapacity, free > 0, need > free {
@@ -262,7 +382,7 @@ final class DownloadsModel: ObservableObject {
     // MARK: fetching
 
     private func startTicking() {
-        guard ticker == nil, library.records.contains(where: { $0.state == .downloading }) else { return }
+        guard ticker == nil, library.records.contains(where: { $0.state == .downloading || $0.state == .paused }) else { return }
         ticker = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self, self.tick() else { break }
@@ -276,7 +396,12 @@ final class DownloadsModel: ObservableObject {
     /// anything is still downloading.
     private func tick() -> Bool {
         let downloading = library.records.filter { $0.state == .downloading }
-        guard !downloading.isEmpty else { return false }
+        holdPaused(downloading)
+        guard !downloading.isEmpty else {
+            stopReciprocating(except: [])
+            activity.update([:])
+            return library.records.contains { $0.state == .paused && $0.release != nil && fractions[$0.id] == nil }
+        }
         let streaming = app.isStreamingFromNetwork
         let ordered = Self.order(downloading)
         var active: [String] = []
@@ -302,6 +427,10 @@ final class DownloadsModel: ObservableObject {
                   let t = isActive ? app.sourceTorrent(rel.infoHash) : app.client.torrent(infoHashHex: rel.infoHash)
             else { continue }
             if isActive {
+                if !reciprocating.contains(rel.infoHash) {
+                    t.setReciprocating(true)
+                    reciprocating.insert(rel.infoHash)
+                }
                 if marked[r.id] != ObjectIdentifier(t) {
                     t.setWanted(true, fileIndex: rel.fileIndex)
                     marked[r.id] = ObjectIdentifier(t)
@@ -334,6 +463,16 @@ final class DownloadsModel: ObservableObject {
             && !app.isPlaying(hash: h) {
             app.client.torrent(infoHashHex: h)?.pause()
         }
+        let still = Set(library.records.filter { $0.state == .downloading }.compactMap { $0.release?.infoHash })
+        stopReciprocating(except: still)
+        var stats: [String: DownloadActivity.Stat] = [:]
+        for h in still {
+            guard let t = app.client.torrent(infoHashHex: h) else { continue }
+            let st = t.status()
+            stats[h] = .init(rate: t.isPaused ? 0 : st.downloadRate, peers: st.connectedPeers,
+                             waiting: t.isPaused)
+        }
+        activity.update(stats)
         if next != fractions { fractions = next }
         if stateChanged {
             changed()
@@ -341,6 +480,33 @@ final class DownloadsModel: ObservableObject {
             findNext()
         }
         return library.records.contains { $0.state == .downloading }
+    }
+
+    /// Paused downloads stop fetching: their file isn't wanted, and a release nothing else fetches or plays pauses.
+    private func holdPaused(_ downloading: [DownloadRecord]) {
+        let busy = Set(downloading.compactMap { $0.release?.infoHash })
+        var next = fractions
+        for r in library.records where r.state == .paused {
+            guard let rel = r.release, let t = app.client.torrent(infoHashHex: rel.infoHash) else { continue }
+            if marked[r.id] != nil {
+                if !downloading.contains(where: { $0.release?.infoHash == rel.infoHash && $0.release?.fileIndex == rel.fileIndex }) {
+                    t.setWanted(false, fileIndex: rel.fileIndex)
+                }
+                marked[r.id] = nil
+            }
+            if !busy.contains(rel.infoHash) && !app.isPlaying(hash: rel.infoHash) && !t.isPaused { t.pause() }
+            if let done = t.downloadedBytes(fileIndex: rel.fileIndex), let length = rel.length {
+                next[r.id] = (Double(done) / Double(max(1, length)) * 200).rounded(.down) / 200
+            }
+        }
+        if next != fractions { fractions = next }
+    }
+
+    private func stopReciprocating(except keep: Set<String>) {
+        for h in reciprocating.subtracting(keep) {
+            app.client.torrent(infoHashHex: h)?.setReciprocating(false)
+            reciprocating.remove(h)
+        }
     }
 
     /// Shows in the order their first download was added, then season and episode order.
@@ -396,6 +562,27 @@ final class DownloadsModel: ObservableObject {
     }
 }
 
+/// Each fetching release's speed and peers, by info hash. Updated every second while downloads run.
+@MainActor
+final class DownloadActivity: ObservableObject {
+    struct Stat: Equatable {
+        /// Bytes per second.
+        var rate: Double
+        var peers: Int
+        /// Held back so a stream has the bandwidth.
+        var waiting: Bool
+    }
+
+    @Published private(set) var stats: [String: Stat] = [:]
+
+    func update(_ new: [String: Stat]) {
+        if new != stats { stats = new }
+    }
+
+    /// Every fetching release together.
+    var totalRate: Double { stats.values.reduce(0) { $0 + $1.rate } }
+}
+
 // MARK: - Download control
 
 /// An episode's download button: an arrow to start, a ring while it comes in, a filled arrow once it's on the
@@ -407,6 +594,9 @@ struct DownloadControl: View {
     let onDownload: () -> Void
     let onRemove: () -> Void
     let onRetry: () -> Void
+    var onPause: (() -> Void)? = nil
+    var onResume: (() -> Void)? = nil
+    var onChooseVersion: (() -> Void)? = nil
 
     var body: some View {
         Group {
@@ -437,21 +627,45 @@ struct DownloadControl: View {
             EmptyView()
         case .waiting:
             Section("Waiting to Download") {
+                pauseItem
+                versionItem
                 Button(role: .destructive, action: onRemove) { Label("Cancel Download", systemImage: "xmark") }
             }
-        case .downloading(let f), .paused(let f):
+        case .downloading(let f):
             Section("Downloading, \(f.formatted(.percent.precision(.fractionLength(0))))") {
+                pauseItem
+                versionItem
+                Button(role: .destructive, action: onRemove) { Label("Cancel Download", systemImage: "xmark") }
+            }
+        case .paused(let f):
+            Section("Paused, \(f.formatted(.percent.precision(.fractionLength(0))))") {
+                if let onResume { Button(action: onResume) { Label("Resume Download", systemImage: "play") } }
+                versionItem
                 Button(role: .destructive, action: onRemove) { Label("Cancel Download", systemImage: "xmark") }
             }
         case .completed:
             Section("Downloaded") {
+                versionItem
                 Button(role: .destructive, action: onRemove) { Label("Remove Download", systemImage: "trash") }
             }
         case .failed(let reason):
             Section(reason ?? "The download didn’t finish.") {
                 Button(action: onRetry) { Label("Try Again", systemImage: "arrow.clockwise") }
+                versionItem
                 Button(role: .destructive, action: onRemove) { Label("Cancel Download", systemImage: "xmark") }
             }
+        }
+    }
+
+    @ViewBuilder
+    private var pauseItem: some View {
+        if let onPause { Button(action: onPause) { Label("Pause Download", systemImage: "pause") } }
+    }
+
+    @ViewBuilder
+    private var versionItem: some View {
+        if let onChooseVersion {
+            Button(action: onChooseVersion) { Label("Choose Another Version…", systemImage: "square.stack") }
         }
     }
 
@@ -459,7 +673,8 @@ struct DownloadControl: View {
         switch status {
         case .notDownloaded: return "Download"
         case .waiting: return "Waiting to download"
-        case .downloading(let f), .paused(let f): return "Downloading, \(f.formatted(.percent.precision(.fractionLength(0))))"
+        case .downloading(let f): return "Downloading, \(f.formatted(.percent.precision(.fractionLength(0))))"
+        case .paused(let f): return "Paused, \(f.formatted(.percent.precision(.fractionLength(0))))"
         case .completed: return "Downloaded"
         case .failed: return "Download failed"
         }
