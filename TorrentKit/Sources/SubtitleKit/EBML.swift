@@ -18,6 +18,7 @@ enum MKV {
     static let trackEntry: UInt32 = 0xAE
     static let trackNumber: UInt32 = 0xD7
     static let codecID: UInt32 = 0x86
+    static let codecPrivate: UInt32 = 0x63A2
     static let language: UInt32 = 0x22B59C
     static let languageIETF: UInt32 = 0x22B59D
     static let name: UInt32 = 0x536E
@@ -48,6 +49,10 @@ enum MKV {
     static let tags: UInt32 = 0x1254_C367
     static let chapters: UInt32 = 0x1043_A770
     static let attachments: UInt32 = 0x1941_A469
+    static let attachedFile: UInt32 = 0x61A7
+    static let fileName: UInt32 = 0x466E
+    static let fileMimeType: UInt32 = 0x4660
+    static let fileData: UInt32 = 0x465C
 
     /// Elements that end an unknown-size cluster when they appear in its place.
     static let segmentChildren: Set<UInt32> = [seekHead, info, tracks, cluster, cues, tags, chapters, attachments, ebml, segment]

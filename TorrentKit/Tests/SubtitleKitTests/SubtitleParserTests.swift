@@ -215,9 +215,9 @@ final class SubtitleParserTests: XCTestCase {
         """
         let cues = parse(ass, .ass)
         XCTAssertEqual(cues, [
-            SubtitleCue(start: 1, end: 2, text: "Earlier"),
-            SubtitleCue(start: 5, end: 6, text: "Same line\nOther speaker"),
-            SubtitleCue(start: 5, end: 7, text: "Different end"),
+            SubtitleCue(start: 1, end: 2, text: "Earlier", style: "Default"),
+            SubtitleCue(start: 5, end: 6, text: "Same line\nOther speaker", style: "Default"),
+            SubtitleCue(start: 5, end: 7, text: "Different end", style: "Default"),
         ])
     }
 
@@ -230,7 +230,7 @@ final class SubtitleParserTests: XCTestCase {
         Format: Marked, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         Dialogue: Marked=0,0:00:01.00,0:00:02.00,*Default,NTP,0000,0000,0000,!Effect,SSA, line
         """
-        XCTAssertEqual(parse(ssa, .ass), [SubtitleCue(start: 1, end: 2, text: "SSA, line")])
+        XCTAssertEqual(parse(ssa, .ass), [SubtitleCue(start: 1, end: 2, text: "SSA, line", style: "*Default")])
 
         let reordered = """
         [Events]
@@ -238,7 +238,7 @@ final class SubtitleParserTests: XCTestCase {
         Dialogue: 0:00:03.00,0:00:04.00,Text first,Default
         """
         // Text is matched by name even when it isn't the last column.
-        XCTAssertEqual(parse(reordered, .ass), [SubtitleCue(start: 3, end: 4, text: "Text first")])
+        XCTAssertEqual(parse(reordered, .ass), [SubtitleCue(start: 3, end: 4, text: "Text first", style: "Default")])
     }
 
     func testASSStyleWords() {

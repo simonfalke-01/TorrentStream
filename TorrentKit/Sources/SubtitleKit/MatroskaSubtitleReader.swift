@@ -13,6 +13,7 @@ public actor MatroskaSubtitleReader {
     private static let lookback: Double = 10
     private static let maxElementRead: Int64 = 16 * 1024 * 1024
     private static let maxBlockRead: Int64 = 1024 * 1024
+    private static let maxAttachmentsRead: Int64 = 96 * 1024 * 1024
     private static let defaultDuration: Double = 5
 
     private struct Encoding {
@@ -27,6 +28,8 @@ public actor MatroskaSubtitleReader {
         let info: SubtitleTrackInfo
         /// Frame encodings in decoding order (highest ContentEncodingOrder first).
         let encodings: [Encoding]
+        /// CodecPrivate: for ASS, the script header with the styles.
+        let codecPrivate: [UInt8]
     }
 
     private struct Layout {
@@ -37,6 +40,7 @@ public actor MatroskaSubtitleReader {
         let tracks: [Int: Track]
         let infos: [SubtitleTrackInfo]
         let cuesOffset: Int64?
+        let attachmentsOffset: Int64?
     }
 
     private struct CueEntry { let offset: Int64; let time: Int64 }
@@ -97,6 +101,38 @@ public actor MatroskaSubtitleReader {
         var result = found.filter { $0.end > from && $0.start <= to }
         if t.info.format == .ass { result = ASSScript.mergeSimultaneous(result) }
         return SubtitleParser.sorted(result)
+    }
+
+    /// The script header of an ASS track (resolution and styles); nil for other tracks.
+    public func assHeader(track: Int) async throws -> ASSHeader? {
+        let l = try await loadLayout()
+        guard let t = l.tracks[track], t.info.format == .ass, !t.codecPrivate.isEmpty else { return nil }
+        return ASSHeader.parse(String(decoding: t.codecPrivate, as: UTF8.self))
+    }
+
+    /// Fonts attached to the file (TrueType, OpenType and collections), which ASS styles name. Empty when the file
+    /// has none; throws `dataUnavailable` while they aren't downloaded.
+    public func fonts() async throws -> [(name: String, data: Data)] {
+        let l = try await loadLayout()
+        guard let offset = l.attachmentsOffset,
+              let b = try await element(at: offset, id: MKV.attachments, limit: Self.maxAttachmentsRead) else { return [] }
+        var out: [(name: String, data: Data)] = []
+        for file in EBML.children(b, in: 0..<b.count) where file.id == MKV.attachedFile {
+            var name = "", mime = ""
+            var data: Range<Int>?
+            for c in EBML.children(b, in: file.data) {
+                switch c.id {
+                case MKV.fileName: name = EBML.string(b[c.data])
+                case MKV.fileMimeType: mime = EBML.string(b[c.data]).lowercased()
+                case MKV.fileData: data = c.data
+                default: break
+                }
+            }
+            let ext = (name as NSString).pathExtension.lowercased()
+            guard let data, mime.contains("font") || ["ttf", "otf", "ttc", "otc"].contains(ext) else { continue }
+            out.append((name, Data(b[data])))
+        }
+        return out
     }
 
     // MARK: bytes
@@ -170,6 +206,7 @@ public actor MatroskaSubtitleReader {
         var infoBytes: [UInt8]?
         var tracksBytes: [UInt8]?
         var cuesOffset: Int64?
+        var attachmentsOffset: Int64?
         // True once the walk reached the first Cluster or the end of what can be walked.
         var walkComplete = true
         pos = segStart
@@ -182,6 +219,7 @@ public actor MatroskaSubtitleReader {
                 case MKV.info: infoBytes = try await payload(h, limit: Self.maxElementRead)
                 case MKV.tracks: tracksBytes = try await payload(h, limit: Self.maxElementRead)
                 case MKV.cues: cuesOffset = h.offset
+                case MKV.attachments: attachmentsOffset = h.offset
                 case MKV.cluster: firstCluster = h.offset; break walk
                 default: break
                 }
@@ -209,7 +247,8 @@ public actor MatroskaSubtitleReader {
         }
         let l = Layout(segmentStart: segStart, segmentEnd: segEnd, scale: scale,
                        tracks: Dictionary(tracks.map { ($0.info.number, $0) }, uniquingKeysWith: { a, _ in a }),
-                       infos: tracks.map(\.info), cuesOffset: cuesOffset ?? seeks[MKV.cues])
+                       infos: tracks.map(\.info), cuesOffset: cuesOffset ?? seeks[MKV.cues],
+                       attachmentsOffset: attachmentsOffset ?? seeks[MKV.attachments])
         layout = l
         return l
     }
@@ -220,9 +259,9 @@ public actor MatroskaSubtitleReader {
     }
 
     /// Payload of the element with `id` at an absolute offset; nil if something else is there.
-    private func element(at offset: Int64, id: UInt32) async throws -> [UInt8]? {
+    private func element(at offset: Int64, id: UInt32, limit: Int64 = MatroskaSubtitleReader.maxElementRead) async throws -> [UInt8]? {
         guard let h = try await header(at: offset), h.id == id else { return nil }
-        return try await payload(h, limit: Self.maxElementRead)
+        return try await payload(h, limit: limit)
     }
 
     private static func parseSeekHead(_ b: [UInt8], segmentStart: Int64, into seeks: inout [UInt32: Int64]) {
@@ -243,6 +282,7 @@ public actor MatroskaSubtitleReader {
             var number = 0, codec = "", isDefault = true, isForced = false
             var language: String?, ietf: String?, name: String?
             var encodings: [Encoding] = []
+            var codecPrivate: [UInt8] = []
             for c in EBML.children(b, in: entry.data) {
                 switch c.id {
                 case MKV.trackNumber: number = Int(clamping: EBML.uint(b[c.data]))
@@ -253,6 +293,7 @@ public actor MatroskaSubtitleReader {
                 case MKV.flagDefault: isDefault = EBML.uint(b[c.data]) != 0
                 case MKV.flagForced: isForced = EBML.uint(b[c.data]) != 0
                 case MKV.contentEncodings: encodings = Self.parseEncodings(b, c.data)
+                case MKV.codecPrivate: codecPrivate = Array(b[c.data])
                 default: break
                 }
             }
@@ -263,7 +304,10 @@ public actor MatroskaSubtitleReader {
             let lang = [ietf, language].lazy.compactMap { $0 }.first { !$0.isEmpty } ?? "eng"
             let info = SubtitleTrackInfo(number: number, codecID: codec, format: format, language: lang,
                                          name: name.flatMap { $0.isEmpty ? nil : $0 }, isDefault: isDefault, isForced: isForced)
-            out.append(Track(info: info, encodings: frameEncodings))
+            // CodecPrivate may be compressed too (ContentEncodingScope bit 2).
+            let privateEncodings = encodings.filter { $0.scope & 2 != 0 }.sorted { $0.order > $1.order }
+            let header = privateEncodings.isEmpty ? codecPrivate : (decode(codecPrivate, privateEncodings) ?? [])
+            out.append(Track(info: info, encodings: frameEncodings, codecPrivate: header))
         }
         return out
     }
@@ -569,8 +613,12 @@ public actor MatroskaSubtitleReader {
     }
 
     private func decode(_ frame: [UInt8], _ track: Track) -> [UInt8]? {
+        decode(frame, track.encodings)
+    }
+
+    private func decode(_ frame: [UInt8], _ encodings: [Encoding]) -> [UInt8]? {
         var data = frame
-        for e in track.encodings {
+        for e in encodings {
             switch e.algo {
             case 3: data = e.settings + data
             case 0:

@@ -61,6 +61,7 @@ final class VideoOutput: NSObject, VLCDrawable, VLCPictureInPictureDrawable {
     }
 
     func shutdown() {
+        uncover(animated: false)
         stopOverlay()
         burner.setActive(false)
         detachBurner()
@@ -73,6 +74,7 @@ final class VideoOutput: NSObject, VLCDrawable, VLCPictureInPictureDrawable {
         view.addSubview(subview)
         subview.frame = view.bounds
         subview.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        if let cover { view.bringSubviewToFront(cover) }
     }
 
     func bounds() -> CGRect { view.bounds }
@@ -300,6 +302,34 @@ final class VideoOutput: NSObject, VLCDrawable, VLCPictureInPictureDrawable {
             return .flushed
         }
         return .failed(renderer.error?.localizedDescription ?? "no error given")
+    }
+
+    // MARK: holding the picture
+
+    private var cover: UIView?
+
+    /// Holds the picture as it is now above the video, so switching the video off and on again (leaving the app
+    /// and coming back) shows the last picture instead of black while libVLC builds a new output.
+    func coverPicture() {
+        guard cover == nil else { return }
+        let source = (displayLayer?.delegate as? UIView) ?? view
+        guard source.window != nil, let snapshot = source.snapshotView(afterScreenUpdates: false) else { return }
+        snapshot.frame = view.convert(source.bounds, from: source)
+        snapshot.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        snapshot.isUserInteractionEnabled = false
+        view.addSubview(snapshot)
+        cover = snapshot
+    }
+
+    func uncover(animated: Bool = true) {
+        guard let c = cover else { return }
+        cover = nil
+        guard animated else {
+            c.removeFromSuperview()
+            return
+        }
+        UIView.animate(withDuration: 0.2, delay: 0, options: [.beginFromCurrentState, .allowUserInteraction],
+                       animations: { c.alpha = 0 }, completion: { _ in c.removeFromSuperview() })
     }
 
     // MARK: subtitles in PiP

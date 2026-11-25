@@ -30,6 +30,55 @@ final class MatroskaReaderTests: XCTestCase {
         XCTAssertEqual(again, tracks)
     }
 
+    func testASSHeaderAndCueStyle() async throws {
+        let reader = FixtureSource(MKVFixture().data).reader()
+        let header = try await reader.assHeader(track: 3)
+        XCTAssertEqual(header?.playResX, 384)
+        XCTAssertEqual(header?.playResY, 288)
+        XCTAssertEqual(header?.style(named: "Default")?.fontName, "Arial")
+        let noHeader = try await reader.assHeader(track: 2)
+        XCTAssertNil(noHeader)
+        let cues = try await reader.cues(track: 3, from: 33.9, to: 33.9)
+        XCTAssertEqual(cues.map(\.style), ["Default"])
+        let fonts = try await reader.fonts()
+        XCTAssertTrue(fonts.isEmpty)
+    }
+
+    func testASSHeaderParse() {
+        let script = """
+        [Script Info]
+        PlayResX: 1920
+        PlayResY: 1080
+
+        [V4+ Styles]
+        Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+        Style: Default,Open Sans Semibold,74,&H00FFFFFF,&H000000FF,&H00020713,&H64000000,-1,0,0,0,100,100,0,0,1,3.6,1.5,2,120,120,64,1
+        Style: Top,Open Sans,60,&H0000FFFF,&H000000FF,&H00000000,&H00000000,0,-1,0,0,100,100,0,0,3,2,0,8,10,10,30,1
+        """
+        let h = ASSHeader.parse(script)
+        XCTAssertEqual(h.playResX, 1920)
+        XCTAssertEqual(h.playResY, 1080)
+        let d = h.style(named: "*default")
+        XCTAssertEqual(d?.fontName, "Open Sans Semibold")
+        XCTAssertEqual(d?.fontSize, 74)
+        XCTAssertEqual(d?.primaryColour, 0x00FF_FFFF)
+        XCTAssertEqual(d?.outlineColour, 0x0002_0713)
+        XCTAssertEqual(d?.backColour, 0x6400_0000)
+        XCTAssertEqual(d?.bold, true)
+        XCTAssertEqual(d?.outline, 3.6)
+        XCTAssertEqual(d?.marginV, 64)
+        let top = h.style(named: "Top")
+        XCTAssertEqual(top?.italic, true)
+        XCTAssertEqual(top?.borderStyle, 3)
+        XCTAssertEqual(top?.alignment, 8)
+        XCTAssertEqual(h.style(named: "Missing")?.name, "Default")
+
+        let ssa = ASSHeader.parse("[V4 Styles]\nFormat: Name, Alignment\nStyle: Old,6\n")
+        XCTAssertEqual(ssa.style(named: "Old")?.alignment, 8)
+        XCTAssertEqual(ASSHeader.colour("&HFF&"), 0xFF)
+        XCTAssertEqual(ASSHeader.colour("255"), 255)
+    }
+
     func testWebMDocTypeAccepted() async throws {
         let reader = FixtureSource(MKVFixture { $0.docType = "webm" }.data).reader()
         let count = try await reader.tracks().count

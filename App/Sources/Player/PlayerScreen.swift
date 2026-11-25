@@ -3,6 +3,7 @@ import TorrentKit
 import CatalogKit
 import SourceKit
 import SkipKit
+import SubtitleKit
 
 /// Full-screen player. Owns the request playing now so the next episode, another episode or another version
 /// can take its place without leaving.
@@ -442,7 +443,7 @@ private struct PlayerChrome: View {
                     // area and leave a black strip over the home indicator.
                     .clipped()
                     .animation(Motion.role(Motion.standard, reduce: reduceMotion), value: zoom)
-                if let line = carried.text, engine.hasFirstFrame, elsewhere == nil {
+                if let line = carried.line, engine.hasFirstFrame, elsewhere == nil {
                     carriedLine(line, screen: size, zoom: zoom)
                 }
             }
@@ -459,12 +460,27 @@ private struct PlayerChrome: View {
         .accessibilityHidden(true)
     }
 
-    /// A line libVLC skipped over at a seek, drawn where libVLC draws its own: centered near the foot of the
-    /// picture, white with a dark edge, sized to the picture and the subtitle size setting.
-    private func carriedLine(_ text: String, screen size: CGSize, zoom: CGFloat) -> some View {
+    /// A line libVLC skipped over at a seek, drawn as libVLC draws its own: an ASS line in its style (font, colours,
+    /// outline, placement), anything else centered near the foot of the picture, white with a dark edge, sized to
+    /// the picture and the subtitle size setting.
+    @ViewBuilder
+    private func carriedLine(_ line: CarriedSubtitle.Line, screen size: CGSize, zoom: CGFloat) -> some View {
         let v = engine.videoSize
         let fit = v.width > 0 && v.height > 0 ? min(size.width / v.width, size.height / v.height) : 1
         let pictureHeight = (v.height > 0 ? v.height * fit : size.height) * zoom
+        let pictureWidth = (v.width > 0 ? v.width * fit : size.width) * zoom
+        if let style = line.style, line.playRes.height > 0 {
+            StyledSubtitleLine(text: line.text, style: style, playRes: line.playRes,
+                               picture: CGRect(x: (size.width - pictureWidth) / 2, y: (size.height - pictureHeight) / 2,
+                                               width: pictureWidth, height: pictureHeight))
+                .frame(width: size.width, height: size.height)
+                .allowsHitTesting(false)
+        } else {
+            plainCarriedLine(line.text, screen: size, pictureHeight: pictureHeight)
+        }
+    }
+
+    private func plainCarriedLine(_ text: String, screen size: CGSize, pictureHeight: CGFloat) -> some View {
         let pictureBottom = min(size.height, (size.height + pictureHeight) / 2)
         let saved = UserDefaults.standard.integer(forKey: SettingsKey.subtitleSize)
         let scale = CGFloat(SubtitleSize(rawValue: saved)?.rawValue ?? SubtitleSize.medium.rawValue) / 100

@@ -134,13 +134,23 @@ final class SecondarySubtitles: ObservableObject {
 /// one. The app draws that line itself, from the same track, until it ends.
 @MainActor
 final class CarriedSubtitle: ObservableObject {
-    @Published private(set) var text: String?
+    /// What to draw: the text, and for an ASS track the style libVLC draws it in, so the line looks the same.
+    struct Line: Equatable {
+        let text: String
+        let style: ASSStyle?
+        /// The script's coordinate space (PlayResX, PlayResY), which the style's sizes are in.
+        let playRes: CGSize
+    }
+
+    @Published private(set) var line: Line?
 
     private static let tag = "player.subtitle.carry"
     private var reader: MatroskaSubtitleReader?
     private var torrent: Torrent?
     private var fileIndex = 0
     private var cues: [SubtitleCue] = []
+    private var header: ASSHeader?
+    private var headers: [Int: ASSHeader] = [:]
     private var task: Task<Void, Never>?
     private var time: Double = 0
     private var landedAt: Double?
@@ -151,8 +161,23 @@ final class CarriedSubtitle: ObservableObject {
         let index = request.file.index
         self.torrent = torrent
         fileIndex = index
-        reader = MatroskaSubtitleReader(fileLength: request.file.length, decompress: { SecondarySubtitles.inflate($0) }) { offset, length in
+        let reader = MatroskaSubtitleReader(fileLength: request.file.length, decompress: { SecondarySubtitles.inflate($0) }) { offset, length in
             torrent.availableData(fileIndex: index, offset: offset, length: length)
+        }
+        self.reader = reader
+        // The fonts the styles name come with the file, near its start; libVLC reads them from the same place.
+        Task.detached(priority: .utility) {
+            for _ in 0..<30 {
+                if Task.isCancelled { return }
+                do {
+                    SubtitleFonts.add(try await reader.fonts().map(\.data))
+                    return
+                } catch MatroskaError.dataUnavailable {
+                    try? await Task.sleep(for: .seconds(2))
+                } catch {
+                    return
+                }
+            }
         }
     }
 
@@ -172,19 +197,25 @@ final class CarriedSubtitle: ObservableObject {
         task?.cancel()
         task = nil
         cues = []
-        if text != nil { text = nil }
+        if line != nil { line = nil }
         torrent?.clearWants(tag: Self.tag)
         landedAt = time
         guard let track, let reader, keyframe <= time + 0.05 else { return }
         if let bytes, let torrent { torrent.want(fileIndex: fileIndex, ranges: [bytes], urgency: .soon, tag: Self.tag) }
+        header = headers[track]
         task = Task { [weak self] in
+            if self?.header == nil, let h = try? await reader.assHeader(track: track) {
+                guard !Task.isCancelled, let self else { return }
+                self.headers[track] = h
+                self.header = h
+            }
             // Lines last a few seconds; past that there's nothing left to carry.
             for _ in 0..<10 {
                 let found = (try? await reader.cues(track: track, from: time - delay, to: time - delay)) ?? []
                 guard !Task.isCancelled, let self else { return }
                 let carried = found
                     .filter { $0.start + delay < keyframe - 0.05 && $0.end + delay > time }
-                    .map { SubtitleCue(start: $0.start + delay, end: $0.end + delay, text: $0.text) }
+                    .map { SubtitleCue(start: $0.start + delay, end: $0.end + delay, text: $0.text, style: $0.style) }
                 if !carried.isEmpty || found.contains(where: { $0.start + delay >= keyframe - 0.05 }) {
                     self.torrent?.clearWants(tag: Self.tag)
                     self.cues = carried
@@ -203,17 +234,22 @@ final class CarriedSubtitle: ObservableObject {
         guard !cues.isEmpty else { return }
         // Moved back before the spot without a landing (a reopen still on its way): the line no longer belongs.
         if let at = landedAt, time < at - 1 { cues = [] }
-        let now = cues.filter { $0.start <= time && time < $0.end }.map(\.text)
-        let joined = now.isEmpty ? nil : now.joined(separator: "\n")
-        if joined != text { text = joined }
-        if joined == nil, cues.allSatisfy({ $0.end <= time }) { cues = [] }
+        let now = cues.filter { $0.start <= time && time < $0.end }
+        var next: Line?
+        if let first = now.first {
+            let style = header?.style(named: first.style)
+            let res = header.map { CGSize(width: $0.playResX, height: $0.playResY) } ?? .zero
+            next = Line(text: now.map(\.text).joined(separator: "\n"), style: style, playRes: res)
+        }
+        if next != line { line = next }
+        if next == nil, cues.allSatisfy({ $0.end <= time }) { cues = [] }
     }
 
     func clear() {
         task?.cancel()
         task = nil
         cues = []
-        if text != nil { text = nil }
+        if line != nil { line = nil }
         torrent?.clearWants(tag: Self.tag)
     }
 }

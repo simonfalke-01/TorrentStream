@@ -275,9 +275,10 @@ final class PlaybackEngine: ObservableObject {
         // VLC buffers this much media at start and after every seek before showing a frame. The torrent engine
         // does the buffering, so VLC's own only adds delay.
         media.addOption(":network-caching=400")
-        // A stall (a slow peer) makes libVLC raise its buffering by up to clock-jitter for the rest of the input,
-        // so every later start and seek would wait longer. The torrent engine absorbs stalls; keep VLC's at 400 ms.
-        media.addOption(":clock-jitter=0")
+        // A late packet (a slow peer) moves libVLC's clock back by up to clock-jitter; anything later than that resets
+        // the clock. At 0 every late packet reset it, which threw off subtitle timing: lines showed for a moment and
+        // went. Two seconds absorbs the usual torrent hiccups while keeping later starts and seeks quick.
+        media.addOption(":clock-jitter=2000")
         // The stream's URL has no file name, so VLC would probe demuxers by priority (MP4 first, then the rest
         // reading the head each time). Name the right one, with any other as fallback.
         if let demux = Self.demuxer(forExtension: fileExtension) { media.addOption(":demux=\(demux),any") }
@@ -958,8 +959,37 @@ final class PlaybackEngine: ObservableObject {
         guard !isPictureInPicture, !output.isPiPEngaged, !isOnTV, videoTrackAway == nil,
               let track = player.videoTracks.first(where: { $0.isSelected }) else { return }
         PlaybackTrace.shared.mark("background: video off")
+        coverTimer?.invalidate()
+        coverTimer = nil
+        // The picture as it was stays up until the video is back, rather than black while it restarts.
+        output.coverPicture()
         videoTrackAway = track.trackId
         player.deselectAllVideoTracks()
+    }
+
+    private var coverTimer: Timer?
+
+    /// Takes the held picture away once the video shows a new one (or after a few seconds regardless).
+    private func revealWhenPictureReturns() {
+        coverTimer?.invalidate()
+        let media = player.media
+        let baseline = media?.statistics.displayedPictures ?? 0
+        let began = Date()
+        coverTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30, repeats: true) { [weak self] timer in
+            MainActor.assumeIsolated {
+                guard let self, self.videoTrackAway == nil else {
+                    timer.invalidate()
+                    return
+                }
+                let now = self.player.media
+                let shown = now?.statistics.displayedPictures ?? 0
+                let fresh = now === media ? shown > baseline : shown > 0
+                guard fresh || self.didFinish || Date().timeIntervalSince(began) > 4 else { return }
+                timer.invalidate()
+                self.coverTimer = nil
+                self.output.uncover()
+            }
+        }
     }
 
     func appWillEnterForeground() {
@@ -973,6 +1003,7 @@ final class PlaybackEngine: ObservableObject {
             PlaybackTrace.shared.mark(String(format: "foreground: stream server restarted; reopening at %.1fs", currentTime))
             videoTrackAway = nil
             restart(from: currentTime, paused: !wantsToPlay)
+            revealWhenPictureReturns()
             return
         }
         guard let id = videoTrackAway else { return }
@@ -982,10 +1013,12 @@ final class PlaybackEngine: ObservableObject {
         if !wantsToPlay, hasPlayed, !didFinish, !restarting {
             PlaybackTrace.shared.mark(String(format: "foreground: paused with video off; reopening to the picture at %.1fs", currentTime))
             restart(from: currentTime, paused: true)
+            revealWhenPictureReturns()
             return
         }
         PlaybackTrace.shared.mark("foreground: video on")
         restoreVideoTrack(id)
+        revealWhenPictureReturns()
     }
 
     private func restoreVideoTrack(_ id: String) {

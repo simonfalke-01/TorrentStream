@@ -5,11 +5,14 @@ public struct SubtitleCue: Hashable, Sendable {
     public var start: Double
     public var end: Double
     public var text: String
+    /// The ASS style the line is drawn in, by name (nil for SRT and WebVTT).
+    public var style: String?
 
-    public init(start: Double, end: Double, text: String) {
+    public init(start: Double, end: Double, text: String, style: String? = nil) {
         self.start = start
         self.end = end
         self.text = text
+        self.style = style
     }
 }
 
