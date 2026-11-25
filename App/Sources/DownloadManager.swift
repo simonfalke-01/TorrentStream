@@ -35,7 +35,7 @@ struct DownloadsPane: View {
                     }
                 }
                 if !shows.isEmpty {
-                    Section("Downloaded") {
+                    Section {
                         ForEach(shows) { show in
                             NavigationLink(value: Route.downloads(show)) {
                                 DownloadedShowRow(show: show)
@@ -46,6 +46,8 @@ struct DownloadsPane: View {
                                 }
                             }
                         }
+                    } header: {
+                        Text("Downloaded")
                     } footer: {
                         StorageFooter()
                     }
@@ -211,6 +213,7 @@ private struct DownloadTitle: View {
     }
 }
 
+@MainActor
 enum DownloadText {
     /// "S1 E5, The Title", or nil for a movie.
     static func episode(_ r: DownloadRecord, details d: ShowDetails?) -> String? {
@@ -221,7 +224,6 @@ enum DownloadText {
     }
 
     /// One line on what a download is doing now.
-    @MainActor
     static func status(_ r: DownloadRecord, downloads: DownloadsModel, stat: DownloadActivity.Stat?) -> String {
         let b = downloads.bytes(r)
         let amount = b.total.map { "\(Format.bytes(b.done)) of \(Format.bytes($0))" }
