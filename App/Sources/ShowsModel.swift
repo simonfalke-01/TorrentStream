@@ -128,6 +128,8 @@ final class ShowsModel: ObservableObject {
     private var sourceCache: [String: (at: Date, list: [EpisodeSource])] = [:]
     /// Next episodes already found and partly loaded.
     private var prepared: [String: ResolvedEpisode] = [:]
+    /// Versions the viewer chose for episodes, played the next time they're played.
+    @Published private(set) var chosen: [String: EpisodeSource] = [:]
     private var rowsFetchedAt: Date?
     private var scheduleFetchedAt: Date?
     private var skipCache: [String: [SkipSegment]] = [:]
@@ -694,6 +696,20 @@ final class ShowsModel: ObservableObject {
         savedSources[Self.key(d.show.id, s.id, e.number)]
     }
 
+    /// The version Play will use: one the viewer chose, else the one played before.
+    func currentVersion(_ d: ShowDetails, _ s: ShowSeason, _ e: ShowEpisode) -> String? {
+        let key = Self.key(d.show.id, s.id, e.number)
+        return chosen[key]?.result.infoHash ?? savedSources[key]?.infoHash
+    }
+
+    /// Makes `source` the version the episode plays from next, without playing it.
+    func choose(_ source: EpisodeSource, _ d: ShowDetails, _ s: ShowSeason, _ e: ShowEpisode) {
+        let key = Self.key(d.show.id, s.id, e.number)
+        chosen[key] = source
+        prepared[key] = nil
+        planned[key] = nil
+    }
+
     /// Finds a file that plays the episode: the one prepared ahead, the one played before, the next file of the
     /// season pack being watched, else the best release found (unless `searching` is false).
     func resolve(_ d: ShowDetails, _ s: ShowSeason, _ e: ShowEpisode, source: EpisodeSource?, searching: Bool = true,
@@ -701,6 +717,9 @@ final class ShowsModel: ObservableObject {
         guard e.isAired else { throw ShowError.notAired }
         let key = Self.key(d.show.id, s.id, e.number)
         let isMovie = d.show.isMovie || s.media.isMovie
+        // A version the viewer chose plays instead of anything picked automatically.
+        let pickedByViewer = source == nil ? chosen[key] : nil
+        let source = source ?? pickedByViewer
         if source == nil {
             if let rel = downloads?.release(forKey: key) {
                 PlaybackTrace.shared.mark("resolve: playing the download")
@@ -765,6 +784,8 @@ final class ShowsModel: ObservableObject {
                 continue
             }
             PlaybackTrace.shared.mark("resolve: playing \(f.displayPath) (\(f.length / 1_000_000) MB, pieces \(info.pieceLength / 1024) KB)")
+            // Played once, it's the release played before from now on.
+            if pickedByViewer != nil { chosen[key] = nil }
             let saved = SavedSource(infoHash: t.infoHashHex, fileIndex: f.index, magnet: c.result.magnet ?? t.magnetLink,
                                     torrentURL: c.result.torrentURL, group: c.group, isBatch: c.isBatch)
             if source == nil, savedSources[key] == nil {

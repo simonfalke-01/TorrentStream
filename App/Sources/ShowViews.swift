@@ -86,10 +86,10 @@ struct ShowView: View {
         .onDisappear { if let d = details { shows.stopWarming(d) } }
         .fullScreenCover(item: $launch, onDismiss: { if let d = details { shows.warm(d) } }) { PlaybackLauncher(launch: $0) }
         .sheet(item: $versions) { target in
-            VersionsView(target: target, current: shows.savedSource(target.details, target.season, target.episode)?.infoHash) { source in
+            VersionsView(target: target, current: shows.currentVersion(target.details, target.season, target.episode)) { source in
+                // Chosen, not played: Play uses it next.
                 versions = nil
-                launch = EpisodeLaunch(show: target.details.show, seasonID: target.season.id,
-                                       episode: target.episode.number, source: source)
+                shows.choose(source, target.details, target.season, target.episode)
             }
         }
         .sheet(item: $downloadVersions) { target in
@@ -747,7 +747,7 @@ struct VersionsView: View {
                     Text(heading)
                 } footer: {
                     Text(forDownload ? "Tap a version to download it. It replaces any download of this episode."
-                                     : "Picked for you from the fastest versions.")
+                                     : "Picked for you from the fastest versions. The one you tap plays next time.")
                 }
                 ForEach(groups(Array(list.dropFirst())), id: \.title) { group in
                     Section(group.title) {
