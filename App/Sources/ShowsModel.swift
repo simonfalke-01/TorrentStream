@@ -960,7 +960,8 @@ final class ShowsModel: ObservableObject {
         let files = info.files.filter { !$0.isPadding }
         let list = files.map { EpisodeFilePicker.File(index: $0.index, path: $0.displayPath, length: $0.length) }
         guard let index = EpisodeFilePicker.pick(list, season: s.number, episode: e.number, absolute: e.absolute,
-                                                 seasonEpisodes: s.media.episodes ?? s.episodes.count, isMovie: isMovie)
+                                                 seasonEpisodes: s.media.episodes ?? s.episodes.count, isMovie: isMovie,
+                                                 special: SourceMatcher.isSideEntry(s))
         else { return nil }
         return files.first { $0.index == index }
     }

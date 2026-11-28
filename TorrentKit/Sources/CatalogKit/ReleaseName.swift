@@ -20,6 +20,11 @@ public struct ReleaseInfo: Hashable, Sendable {
     public var isBatch = false
     /// Named like a fansub release: "[Group] Title - 01".
     public var isAnimeStyle = false
+    /// An OVA, OAD or special rather than an episode of the series: "Title OVA 02", "Title - Specials 01-02",
+    /// "Title S00E03". The marker isn't part of `title`.
+    public var isSpecial = false
+    /// A pack that says it holds the specials too: "Title (11 EPs + 4 OVA)", "Title S01 + OVA".
+    public var includesSpecials = false
 
     public init(title: String) { self.title = title }
 
@@ -32,6 +37,9 @@ public enum ReleaseName {
         "mkv", "mp4", "m4v", "mov", "avi", "webm", "ts", "m2ts", "wmv", "flv", "mpg", "mpeg", "ogv", "rmvb",
         "mp3", "m4a", "flac", "aac", "ogg", "opus", "wav", "srt", "ass", "ssa", "vtt", "sub", "torrent",
     ]
+
+    /// What release names call episodes outside the series' numbering.
+    static let specialWord = #"(?:OVAs?|OADs?|Specials?|SPs?)"#
 
     /// Words that end a title in scene names: quality, source, codec and audio tags.
     private static let junk = #"(?i)\b(2160p|1080p|1080i|720p|576p|480p|4k|uhd|web[ -]?dl|web[ -]?rip|web|blu[ -]?ray|bdrip|brrip|bdremux|bd|hdtv|dvdrip|dvd|remux|x264|x265|h[ .]?264|h[ .]?265|hevc|avc|av1|10 ?bit|8 ?bit|hdr10|hdr|dovi|aac\S*|ac3|e?ac3|ddp?[0-9. ]*|dts\S*|truehd|atmos|flac|opus|dual[ -]audio|multi[ -]?audio|multi[ -]?subs?|eng[ -]?subs?|proper|repack|internal|amzn|nf|dsnp|hmax|atvp|cr|uncensored|batch|complete)\b"#
@@ -67,6 +75,19 @@ public enum ReleaseName {
                 info.episode = r[1].flatMap(Int.init); info.lastEpisode = r[2].flatMap(Int.init); info.isBatch = true
                 continue
             }
+            // "(OVA)", "[Specials 01-02]": what the release is. "(11 EPs + 4 OVA)": what it holds besides.
+            if let r = matches("(?i)^" + specialWord + #"(?:\s*(\d{1,3})(?:\s*[-~]\s*(\d{1,3}))?)?$"#, in: t).first {
+                info.isSpecial = true
+                if info.episode == nil, let a = r[1].flatMap(Int.init) {
+                    info.episode = a
+                    if let b = r[2].flatMap(Int.init) { info.lastEpisode = b; info.isBatch = true }
+                }
+                continue
+            }
+            if t.range(of: #"(?i)\b"# + specialWord + #"\b"#, options: .regularExpression) != nil {
+                info.includesSpecials = true
+                continue
+            }
             let isTechnical = t.range(of: junk, options: .regularExpression) != nil
                 || t.range(of: #"^[0-9A-Fa-f]{8}$"#, options: .regularExpression) != nil
             if !isTechnical, t.range(of: #"\p{L}{3}"#, options: .regularExpression) != nil, tag[0]?.hasPrefix("(") == true {
@@ -75,9 +96,23 @@ public enum ReleaseName {
         }
         s = s.replacingOccurrences(of: #"[\[({][^\])}]*[\])}]"#, with: " ", options: .regularExpression)
         s = sceneSpaces(s)
+        // "Title S01 + OVA", "Title & Specials", "Title incl. OVA": the pack holds them; not part of the title.
+        let holds = #"(?i)(?:\s*[+&]|\s+(?:with|incl\.?|including|and))\s*(?:\d{1,3}\s*)?"# + specialWord + #"\b"#
+        if s.range(of: holds, options: .regularExpression) != nil {
+            info.includesSpecials = true
+            s = s.replacingOccurrences(of: holds, with: " ", options: .regularExpression)
+        }
+        // "Title OVA 02", "Title - Specials 01-02", "Title SP3", "Title OAD - 05", not at the very start ("Special 7").
+        let special = matches(#"(?i)(?:^|\s)"# + specialWord + #"\s*(?:[-–]\s*)?(\d{1,3})(?:v\d)?(?:\s*[-~]\s*(\d{1,3})(?:v\d)?)?(?=\s|$)"#,
+                              in: s, ranges: true).first { !clean(String(s[..<$0.range.lowerBound])).isEmpty }
 
         var title = s
-        if let m = matches(#"(?i)\bS(\d{1,2})[ ._-]?E(\d{1,4})(?:-?E(\d{1,4}))?\b"#, in: s, ranges: true).first {
+        if s.range(of: #"(?i)\bS(\d{1,2})[ ._-]?E(\d{1,4})\b"#, options: .regularExpression) == nil, let m = special {
+            info.isSpecial = true
+            info.episode = m.groups[1].flatMap(Int.init)
+            if let last = m.groups[2].flatMap(Int.init) { info.lastEpisode = last; info.isBatch = true }
+            title = String(s[..<m.range.lowerBound])
+        } else if let m = matches(#"(?i)\bS(\d{1,2})[ ._-]?E(\d{1,4})(?:-?E(\d{1,4}))?\b"#, in: s, ranges: true).first {
             info.season = m.groups[1].flatMap(Int.init); info.episode = m.groups[2].flatMap(Int.init)
             if let last = m.groups[3].flatMap(Int.init), last > (info.episode ?? 0) { info.lastEpisode = last }
             title = String(s[..<m.range.lowerBound])
@@ -119,14 +154,30 @@ public enum ReleaseName {
                 title = before
             }
         }
+        // "Title OVA", "Title Specials" with no number, or an OVA with its own name ("Title OVA Lost Girls").
+        if let m = matches(#"(?i)\s"# + specialWord + #"\s*$"#, in: title, ranges: true).last,
+           !clean(String(title[..<m.range.lowerBound])).isEmpty {
+            info.isSpecial = true
+            title = cutAtJunk(String(title[..<m.range.lowerBound]))
+        } else if cutAtJunk(s).range(of: #"(?i)\b(?:OVAs?|OADs?)\b"#, options: .regularExpression) != nil {
+            // Also "Title S2 - OVA", where the season tag took the marker off the title.
+            info.isSpecial = true
+        }
+
         // "Title S2", "Title Season 2", "Title 2nd Season".
-        if let m = matches(#"(?i)\s(?:S|Season\s*)(\d{1,2})\s*$"#, in: title, ranges: true).last {
+        if let m = matches(#"(?i)\s(?:S|Season\s*)(\d{1,2})[\s\-–:]*$"#, in: title, ranges: true).last {
             info.season = info.season ?? Int(m.groups[1]!)
             title = String(title[..<m.range.lowerBound])
-        } else if let m = matches(#"(?i)\s(\d{1,2})(?:st|nd|rd|th)\s+season\s*$"#, in: title, ranges: true).last {
+        } else if let m = matches(#"(?i)\s(\d{1,2})(?:st|nd|rd|th)\s+season[\s\-–:]*$"#, in: title, ranges: true).last {
             info.season = info.season ?? Int(m.groups[1]!)
+            title = String(title[..<m.range.lowerBound])
+        } else if info.isSpecial, info.season == nil,
+                  let m = matches(#"\s([2-9])[\s\-–:]*$"#, in: title, ranges: true).last {
+            // A special of a sequel: "Title 2 - OVA", "Title 3 - OVA 01".
+            info.season = Int(m.groups[1]!)
             title = String(title[..<m.range.lowerBound])
         }
+        if info.season == 0 { info.isSpecial = true }
 
         info.title = clean(title)
         if info.season != nil && info.episode == nil { info.isBatch = true }

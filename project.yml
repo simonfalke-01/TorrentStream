@@ -34,8 +34,8 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.simonfalke.TorrentStream
         PRODUCT_NAME: TorrentStream
-        MARKETING_VERSION: "5.13"
-        CURRENT_PROJECT_VERSION: "24"
+        MARKETING_VERSION: "5.14"
+        CURRENT_PROJECT_VERSION: "25"
         TARGETED_DEVICE_FAMILY: "1,2"
         SWIFT_VERSION: "5.0"
         CODE_SIGN_STYLE: Automatic

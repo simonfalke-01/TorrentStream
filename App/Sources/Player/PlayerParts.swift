@@ -83,22 +83,24 @@ struct PlaybackPoster: View {
     let posterURL: URL?
 
     var body: some View {
-        ZStack {
-            Color.black
-            if let stillURL {
-                PipelineImage(url: stillURL)
-                    .aspectRatio(16 / 9, contentMode: .fit)
-                    .clipped()
-            } else if let posterURL {
-                PipelineImage(url: posterURL)
-                    .blur(radius: 40)
-                    .opacity(0.5)
-                    .clipped()
+        // Laid over a color, which takes exactly the space offered: a filled image reports its overflowing size,
+        // and as a sibling it would widen whatever holds it, pushing controls off screen.
+        Color.black
+            .overlay {
+                if let stillURL {
+                    PipelineImage(url: stillURL)
+                        .aspectRatio(16 / 9, contentMode: .fit)
+                        .clipped()
+                } else if let posterURL {
+                    PipelineImage(url: posterURL)
+                        .blur(radius: 40)
+                        .opacity(0.5)
+                }
             }
-        }
-        .ignoresSafeArea()
-        .allowsHitTesting(false)
-        .accessibilityHidden(true)
+            .clipped()
+            .ignoresSafeArea()
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
     }
 }
 

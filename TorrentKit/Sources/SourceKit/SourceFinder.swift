@@ -206,6 +206,9 @@ public final class SourceFinder: @unchecked Sendable {
         if details.show.isMovie || season.media.isMovie {
             return [NyaaQuery(text: seasonName, category: category)]
         }
+        if SourceMatcher.isSideEntry(season) {
+            return sideQueries(details: details, season: season, names: [season.media.romaji ?? season.media.title])
+        }
         let token = episodeToken(season: season, episode: episode)
         var texts = ["\(seasonName) \(token)"]
         if season.number > 1, baseName != seasonName { texts.append("\(baseName) \(token)") }
@@ -213,6 +216,24 @@ public final class SourceFinder: @unchecked Sendable {
         texts.append(seasonName)
         return unique(texts).map { NyaaQuery(text: $0, category: category) }
     }
+
+    /// What an OVA or special is filed under: its own name without the "OVA" AniList adds (releases say "Specials",
+    /// "OVA 02" or "S00E02" instead, and Nyaa wants every word of a search), then the series' name, then the
+    /// name's core ("Nukitashi" for "Nukitashi THE ANIMATION"), each with the words releases mark specials by.
+    /// An entry whose own name differs from the series' ("Shingeki no Kyojin: Lost Girls") is also searched as is.
+    static func sideQueries(details: ShowDetails, season: ShowSeason, names: [String]) -> [NyaaQuery] {
+        let own = names.map { searchWords(ShowNames.withoutSideMarker($0)) }.filter { !$0.isEmpty }
+        let parent = (details.parent.map { [$0.romaji ?? $0.title, $0.english].compactMap { $0 } } ?? [])
+            .map { searchWords(ShowNames.seasonless($0)) }.filter { !$0.isEmpty }
+        let cores = (own + parent).map { searchWords(ShowNames.core($0)) }.filter { !$0.isEmpty }
+        var texts = unique(own + parent.prefix(1) + cores).prefix(3).map { "\($0) \(specialWords)" }
+        let parentKeys = Set(parent.map { ReleaseName.normalize($0) })
+        texts += own.prefix(1).filter { !parentKeys.contains(ReleaseName.normalize($0)) }
+        return unique(texts).map { NyaaQuery(text: $0, category: category) }
+    }
+
+    /// Nyaa reads `|` as "or" and a trailing `*` as any ending: "OVA", "OVAs", "Specials", "SP01", "S00E01".
+    static let specialWords = "(OVA*|OAD*|special*|SP*|S00*)"
 
     static func fallbackQueries(details: ShowDetails, season: ShowSeason, episode: ShowEpisode) -> [NyaaQuery] {
         withSukebei(nyaaFallbackQueries(details: details, season: season, episode: episode), details: details, season: season)
@@ -224,6 +245,9 @@ public final class SourceFinder: @unchecked Sendable {
         let words = unique(names.map { searchWords(ShowNames.seasonless($0)) }).filter { !$0.isEmpty }
         if details.show.isMovie || season.media.isMovie {
             return words.prefix(2).map { NyaaQuery(text: $0, category: category) }
+        }
+        if SourceMatcher.isSideEntry(season) {
+            return words.prefix(2).map { NyaaQuery(text: "\(searchWords(ShowNames.withoutSideMarker($0))) \(specialWords)", category: category) }
         }
         let token = episodeToken(season: season, episode: episode)
         return words.prefix(2).map { NyaaQuery(text: "\($0) \(token)", category: category) }
@@ -307,6 +331,43 @@ public enum ShowNames {
         }
         return s
     }
+
+    /// The season a name says it is: "2nd Season", "Season 2", "S2", "II", or a trailing "2". Nil for none.
+    public static func seasonNumber(_ name: String) -> Int? {
+        let s = name.trimmingCharacters(in: .whitespaces)
+        let patterns = [#"(?i)\b(\d{1,2})(?:st|nd|rd|th)\s+season\b"#, #"(?i)\bseason\s*(\d{1,2})\b"#,
+                        #"(?i)\bs(\d{1,2})\s*$"#, #"\s([2-9])\s*$"#]
+        for p in patterns {
+            if let r = s.range(of: p, options: .regularExpression),
+               let n = Int(s[r].filter(\.isNumber)) { return n }
+        }
+        let roman = ["ii": 2, "iii": 3, "iv": 4, "v": 5, "vi": 6]
+        if let last = s.split(separator: " ").last.map({ $0.lowercased() }), let n = roman[last] { return n }
+        return nil
+    }
+
+    private static let sideSuffix = #"(?i)[\s:\-–]*\b(ovas?|oads?|specials?|sp|picture drama|recaps?)\b\s*$"#
+
+    /// The name without the "OVA", "OVAs", "Specials" or "OAD" that AniList ends a side entry's name with.
+    public static func withoutSideMarker(_ name: String) -> String {
+        var s = seasonless(name)
+        while let r = s.range(of: sideSuffix, options: .regularExpression), r.lowerBound > s.startIndex {
+            s = seasonless(String(s[..<r.lowerBound]))
+        }
+        return s
+    }
+
+    /// The heart of a name, which short release names keep: no subtitle after a colon, no "The Animation".
+    /// Empty when that leaves the name as it was or nothing distinctive.
+    public static func core(_ name: String) -> String {
+        var s = name
+        if let colon = s.range(of: ": ") { s = String(s[..<colon.lowerBound]) }
+        s = s.replacingOccurrences(of: #"(?i)\s*\bthe animation\b"#, with: "", options: .regularExpression)
+            .trimmingCharacters(in: .whitespaces)
+        let normalized = ReleaseName.normalize(s)
+        guard normalized != ReleaseName.normalize(name), normalized.count >= 4 else { return "" }
+        return s
+    }
 }
 
 /// Decides whether a release name plays a given episode of a show.
@@ -325,6 +386,9 @@ public enum SourceMatcher {
         let r = ReleaseName.parse(name)
         let titles = [r.title] + r.altTitles
         guard !r.title.isEmpty else { return nil }
+        if isSideEntry(season) && !details.show.isMovie {
+            return matchSide(r, titles: titles, details: details, season: season, episode: episode)
+        }
 
         // Which entry of the show the name looks like, and how closely.
         var best: (season: Int, sim: Double) = (0, 0)
@@ -347,7 +411,7 @@ public enum SourceMatcher {
             // "Show OAD - 05" or "Show Movie" share the name but aren't the series.
             let extra = titles.joined(separator: " ")
             let own = season.media.names.joined(separator: " ")
-            if extra.range(of: sideStory, options: .regularExpression) != nil,
+            if r.isSpecial || extra.range(of: sideStory, options: .regularExpression) != nil,
                own.range(of: sideStory, options: .regularExpression) == nil { return nil }
         }
 
@@ -385,6 +449,46 @@ public enum SourceMatcher {
         }
         if let x = r.season { return x == wanted ? Match(release: r, isBatch: true) : nil }
         return best.season == wanted && best.sim >= 0.8 ? Match(release: r, isBatch: true) : nil
+    }
+
+    /// An OVA or special: AniList files it as an entry of its own, while releases mostly go by the series' name and
+    /// mark it ("Series - Specials 01-02", "Series S00E01-E04", "Series OVA"), or come in a pack of the series that
+    /// says it holds it ("Series (11 EPs + 4 OVA)").
+    public static func isSideEntry(_ season: ShowSeason) -> Bool {
+        ["OVA", "SPECIAL"].contains(season.media.format ?? "")
+    }
+
+    static func matchSide(_ r: ReleaseInfo, titles: [String], details: ShowDetails, season: ShowSeason,
+                          episode: ShowEpisode) -> Match? {
+        let own = season.media.names
+        // The names it shares with its series: its own without "OVA", where that differs, and the series'.
+        let ownKeys = Set(own.map(ReleaseName.normalize))
+        var shared = own.map(ShowNames.withoutSideMarker).filter { !ownKeys.contains(ReleaseName.normalize($0)) }
+        if let p = details.parent { shared += p.names + p.names.map(ShowNames.seasonless) }
+        let simOwn = similarity(titles, own)
+        let simShared = shared.isEmpty ? 0 : similarity(titles, shared)
+        guard max(simOwn, simShared) >= 0.5 else { return nil }
+        // A season number must be the series' own ("Title 2 - OVA" belongs to the second season), or part of a name.
+        let seriesSeason = details.parent.flatMap { $0.names.compactMap(ShowNames.seasonNumber).max() } ?? 1
+        if let x = r.season, x != 0, x != seriesSeason, !(x == 1 && simOwn > simShared + 0.001),
+           !(own + shared).contains(where: { ReleaseName.normalize($0).split(separator: " ").contains(Substring(String(x))) }) {
+            return nil
+        }
+        // Named after this entry rather than the series ("Hellsing Ultimate - 03", "Lost Girls - 01").
+        let named = simOwn > simShared + 0.001
+        let isPack = r.episode == nil || r.lastEpisode != nil || r.isBatch
+        if !r.isSpecial && !named {
+            // The series' own release: only a pack that says it holds the specials.
+            return isPack && r.includesSpecials && simShared >= 0.8 ? Match(release: r, isBatch: true) : nil
+        }
+        if !r.isSpecial && simOwn < 0.75 { return nil }
+        let n = episode.number
+        if let a = r.episode, let b = r.lastEpisode {
+            return (min(a, b)...max(a, b)).contains(n) ? Match(release: r, isBatch: true) : nil
+        }
+        if let a = r.episode, !r.isBatch { return a == n ? Match(release: r, isBatch: false) : nil }
+        // No number: the entry's one episode, or all of them.
+        return Match(release: r, isBatch: season.episodes.count > 1)
     }
 
     static func similarity(_ titles: [String], _ names: [String]) -> Double {

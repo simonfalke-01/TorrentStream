@@ -172,12 +172,16 @@ public struct ShowDetails: Codable, Hashable, Identifiable, Sendable {
     public var show: Show
     public var seasons: [ShowSeason]
     public var fetchedAt: Date
+    /// The series an OVA, special or movie standing alone belongs to (AniList's parent, else its prequel). Releases
+    /// often go by the series' name: "Series - Specials 01-02". Nil for a series, and in copies saved before this.
+    public var parent: Show?
     public var id: Int { show.id }
 
-    public init(show: Show, seasons: [ShowSeason], fetchedAt: Date = Date()) {
+    public init(show: Show, seasons: [ShowSeason], fetchedAt: Date = Date(), parent: Show? = nil) {
         self.show = show
         self.seasons = seasons
         self.fetchedAt = fetchedAt
+        self.parent = parent
     }
 
     public func season(id: Int) -> ShowSeason? { seasons.first { $0.id == id } }
@@ -481,7 +485,8 @@ public final class ShowCatalog: @unchecked Sendable {
         guard Self.seasonFormats.contains(start.show.format ?? "") else {
             // Movies, OVAs and specials stand alone.
             let count = start.show.isMovie ? 1 : max(1, start.show.episodes ?? start.show.airedEpisodes)
-            return ShowDetails(show: start.show, seasons: [season(start, number: 1, offset: 0, count: count)])
+            let parent = (start.parent ?? start.prequel).flatMap { known[$0]?.show }
+            return ShowDetails(show: start.show, seasons: [season(start, number: 1, offset: 0, count: count)], parent: parent)
         }
         let resolved = known
         async let back = walk(from: start, known: resolved, forward: false)
@@ -602,6 +607,8 @@ public final class ShowCatalog: @unchecked Sendable {
         var show: Show
         var prequel: Int?
         var sequel: Int?
+        /// The series this entry is a side story of.
+        var parent: Int?
         /// Episode number to title and thumbnail, from streaming services.
         var streaming: [Int: (title: String?, thumbnail: URL?)]
     }
@@ -704,8 +711,14 @@ public final class ShowCatalog: @unchecked Sendable {
             return (type == "PREQUEL" ? sorted.last : sorted.first)?["id"] as? Int
         }
         let streaming = streamingEpisodes(m["streamingEpisodes"] as? [[String: Any]] ?? [], count: show.episodes)
-        return Node(show: show, prequel: related("PREQUEL"), sequel: related("SEQUEL"), streaming: streaming)
+        let parent = edges.first {
+            $0["relationType"] as? String == "PARENT"
+                && animeFormats.contains((($0["node"] as? [String: Any])?["format"] as? String) ?? "")
+        }.flatMap { ($0["node"] as? [String: Any])?["id"] as? Int }
+        return Node(show: show, prequel: related("PREQUEL"), sequel: related("SEQUEL"), parent: parent, streaming: streaming)
     }
+
+    private static let animeFormats: Set<String> = ["TV", "TV_SHORT", "ONA", "OVA", "SPECIAL", "MOVIE"]
 
     private static func startKey(_ m: [String: Any]) -> Int {
         let d = m["startDate"] as? [String: Any]
