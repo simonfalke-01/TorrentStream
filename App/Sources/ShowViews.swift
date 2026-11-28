@@ -39,6 +39,7 @@ struct ShowView: View {
     @State private var loadError: String?
     @State private var synopsisExpanded = false
     @State private var confirmingRemoval = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var details: ShowDetails? { shows.details[shows.rootID(show)] }
     /// The first season once loaded, which names the show.
@@ -69,6 +70,10 @@ struct ShowView: View {
 
                 moreLikeThis
                     .padding(.bottom, Space.xxl)
+
+                information
+                    .padding(.horizontal, Space.l)
+                    .padding(.bottom, Space.xxl)
             }
             .frame(maxWidth: Metrics.contentMaxWidth)
             .frame(maxWidth: .infinity)
@@ -81,6 +86,8 @@ struct ShowView: View {
         }
         .task { await load() }
         .task { await shows.loadRecommendations(show) }
+        // Once the show is known by its first season, which keys the rating.
+        .task(id: details?.id) { if details != nil { await shows.loadContentRating(main) } }
         .refreshable { await load(force: true) }
         // What this page readied goes quiet once it's left; back from the player, it's readied again.
         .onDisappear { if let d = details { shows.stopWarming(d) } }
@@ -132,22 +139,30 @@ struct ShowView: View {
             .padding(.top, Space.s)
     }
 
-    /// Year, length and genre, set apart by space rather than punctuation.
+    /// Genres, year, length and rating on one quiet line under the title, set apart by space rather than punctuation,
+    /// the rating outlined the way TV listings set it. Wraps rather than truncates at large text sizes.
     @ViewBuilder
     private var metadata: some View {
         let parts = metadataParts
-        if !parts.isEmpty {
-            HStack(spacing: Space.m) {
+        let rating = shows.contentRating(main)
+        if !parts.isEmpty || rating != nil {
+            WrappingHStack(spacing: Space.m, lineSpacing: Space.xxs) {
                 ForEach(parts, id: \.self) { Text($0) }
+                if let rating { RatingBadge(rating: rating) }
             }
             .font(.subheadline)
             .foregroundStyle(.secondary)
             .accessibilityElement(children: .combine)
+            .animation(Motion.role(Motion.standard, reduce: reduceMotion), value: rating)
         }
     }
 
+    private var genres: [String] { main.genres.isEmpty ? show.genres : main.genres }
+
     private var metadataParts: [String] {
         var out: [String] = []
+        // Two at most; the Information section lists them all.
+        if !genres.isEmpty { out.append(genres.prefix(2).joined(separator: ", ")) }
         if let y = main.year { out.append(String(y)) }
         if let d = details {
             if d.show.isMovie {
@@ -258,24 +273,14 @@ struct ShowView: View {
     @ViewBuilder
     private var about: some View {
         let overview = (show.overview?.isEmpty == false ? show.overview : main.overview) ?? ""
-        let genres = main.genres.isEmpty ? show.genres : main.genres
-        if !overview.isEmpty || !genres.isEmpty {
-            VStack(alignment: .leading, spacing: Space.s) {
-                if !overview.isEmpty {
-                    Text(overview)
-                        .font(.subheadline)
-                        .lineLimit(synopsisExpanded ? nil : 3)
-                        .contentShape(.rect)
-                        .onTapGesture { withAnimation(Motion.standard) { synopsisExpanded.toggle() } }
-                        .accessibilityAddTraits(.isButton)
-                        .accessibilityHint(synopsisExpanded ? "Shows less" : "Shows the full synopsis")
-                }
-                if !genres.isEmpty {
-                    Text(genres.prefix(4).joined(separator: ", "))
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                }
-            }
+        if !overview.isEmpty {
+            Text(overview)
+                .font(.subheadline)
+                .lineLimit(synopsisExpanded ? nil : 3)
+                .contentShape(.rect)
+                .onTapGesture { withAnimation(Motion.standard) { synopsisExpanded.toggle() } }
+                .accessibilityAddTraits(.isButton)
+                .accessibilityHint(synopsisExpanded ? "Shows less" : "Shows the full synopsis")
         }
     }
 
@@ -437,6 +442,54 @@ struct ShowView: View {
                 .scrollTargetBehavior(.viewAligned)
             }
         }
+    }
+
+    // MARK: information
+
+    /// Genres, tags and rating in full, last on the page like the Information section of a TV listing: reference to
+    /// look up, not something to read before Play. Label over value, no chips.
+    @ViewBuilder
+    private var information: some View {
+        let tags = main.listedTags
+        let rating = shows.contentRating(main)
+        if !genres.isEmpty || !tags.isEmpty || rating != nil {
+            VStack(alignment: .leading, spacing: Space.m) {
+                Text("Information")
+                    .font(.title3.bold())
+                    .accessibilityAddTraits(.isHeader)
+                VStack(alignment: .leading, spacing: Space.m) {
+                    if !genres.isEmpty {
+                        informationRow("Genres") { Text(genres.joined(separator: ", ")) }
+                    }
+                    if !tags.isEmpty {
+                        informationRow("Tags") { Text(tags.map(\.name).joined(separator: ", ")) }
+                    }
+                    if let rating {
+                        informationRow("Rated") {
+                            HStack(spacing: Space.s) {
+                                RatingBadge(rating: rating)
+                                Text(rating.summary)
+                            }
+                            .accessibilityElement(children: .ignore)
+                            .accessibilityLabel("\(rating.badge), \(rating.summary)")
+                        }
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private func informationRow<Value: View>(_ label: String, @ViewBuilder value: () -> Value) -> some View {
+        VStack(alignment: .leading, spacing: Space.xxs) {
+            Text(label)
+                .font(.footnote.weight(.semibold))
+            value()
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .combine)
     }
 
     // MARK: menu
@@ -615,10 +668,14 @@ struct ShowPosterCard: View {
                         Text(detail)
                             .font(.caption)
                             .foregroundStyle(.secondary)
-                    } else if showsCaption, let caption = show.caption {
-                        Text(caption)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                    } else if showsCaption, show.caption != nil || show.isAdult == true {
+                        // Search is the one list adult titles join, so they're marked there.
+                        HStack(spacing: Space.s) {
+                            if let caption = show.caption { Text(caption) }
+                            if show.isAdult == true { RatingBadge(rating: .adult) }
+                        }
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                     }
                 }
             }

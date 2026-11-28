@@ -1,5 +1,6 @@
 import SwiftUI
 import TorrentKit
+import CatalogKit
 
 // MARK: - Design tokens
 
@@ -21,6 +22,8 @@ enum Radius {
     static let medium: CGFloat = 12
     /// Floating glass panels in the player.
     static let large: CGFloat = 24
+    /// Outlined marks set in text: "4K", "PG-13".
+    static let badge: CGFloat = 3
 }
 
 /// Named motion roles. Routine changes stay under 250 ms and never bounce.
@@ -192,6 +195,22 @@ struct AfterDelay<Content: View>: View {
     }
 }
 
+/// A short mark in a thin rounded outline, the way TV listings set ratings and formats: "4K", "PG-13". Takes the
+/// surrounding text color, with a quieter outline, and never a fill.
+struct OutlinedBadge: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(.caption2.weight(.semibold))
+            .lineLimit(1)
+            .fixedSize()
+            .padding(.horizontal, Space.xs)
+            .padding(.vertical, 1)
+            .overlay(RoundedRectangle(cornerRadius: Radius.badge, style: .continuous).strokeBorder(.secondary, lineWidth: 1))
+    }
+}
+
 /// Outlined resolution tag: "4K", "1080p".
 struct QualityBadge: View {
     let resolution: String
@@ -199,12 +218,71 @@ struct QualityBadge: View {
     private var text: String { resolution == "2160p" ? "4K" : resolution }
 
     var body: some View {
-        Text(text)
-            .font(.caption2.weight(.semibold))
-            .padding(.horizontal, Space.xs)
-            .padding(.vertical, 1)
-            .overlay(RoundedRectangle(cornerRadius: 3, style: .continuous).stroke(.secondary, lineWidth: 1))
-            .accessibilityLabel(resolution == "2160p" ? "4K" : resolution)
+        OutlinedBadge(text: text)
+            .accessibilityLabel(text)
+    }
+}
+
+/// Who a show is for, as an outlined mark: "PG-13", or "18+" for adult shows.
+struct RatingBadge: View {
+    let rating: ContentRating
+
+    var body: some View {
+        OutlinedBadge(text: rating.badge)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(rating.spokenLabel)
+    }
+}
+
+/// Lays short items out in a row, carrying on to the next line when out of room, each line centred on its tallest
+/// item. For lines of metadata that must stay whole at large text sizes rather than truncate.
+struct WrappingHStack: Layout {
+    var spacing: CGFloat = Space.m
+    var lineSpacing: CGFloat = Space.xxs
+
+    private struct Line {
+        var items: [(index: Int, size: CGSize)] = []
+        var width: CGFloat = 0
+        var height: CGFloat = 0
+    }
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let all = lines(maxWidth: proposal.width ?? .infinity, subviews)
+        let width = all.map(\.width).max() ?? 0
+        let height = all.map(\.height).reduce(0, +) + lineSpacing * CGFloat(max(0, all.count - 1))
+        return CGSize(width: width, height: height)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var y = bounds.minY
+        for line in lines(maxWidth: bounds.width, subviews) {
+            var x = bounds.minX
+            for item in line.items {
+                subviews[item.index].place(at: CGPoint(x: x, y: y + (line.height - item.size.height) / 2),
+                                           anchor: .topLeading, proposal: ProposedViewSize(item.size))
+                x += item.size.width + spacing
+            }
+            y += line.height + lineSpacing
+        }
+    }
+
+    private func lines(maxWidth: CGFloat, _ subviews: Subviews) -> [Line] {
+        var out: [Line] = []
+        var line = Line()
+        for index in subviews.indices {
+            var size = subviews[index].sizeThatFits(.unspecified)
+            // An item wider than the whole line wraps within it.
+            if size.width > maxWidth { size = subviews[index].sizeThatFits(ProposedViewSize(width: maxWidth, height: nil)) }
+            if !line.items.isEmpty && line.width + spacing + size.width > maxWidth {
+                out.append(line)
+                line = Line()
+            }
+            line.width += (line.items.isEmpty ? 0 : spacing) + size.width
+            line.height = max(line.height, size.height)
+            line.items.append((index, size))
+        }
+        if !line.items.isEmpty { out.append(line) }
+        return out
     }
 }
 

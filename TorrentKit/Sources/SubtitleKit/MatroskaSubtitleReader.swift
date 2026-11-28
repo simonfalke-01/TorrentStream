@@ -89,18 +89,34 @@ public actor MatroskaSubtitleReader {
     /// Cues of one track overlapping [from, to] seconds, sorted by start. Uses the Cues index to start near `from`
     /// and otherwise scans clusters from the first one; stops quietly at data that isn't downloaded yet.
     public func cues(track: Int, from: Double, to: Double) async throws -> [SubtitleCue] {
-        let l = try await loadLayout()
-        guard let t = l.tracks[track], to >= from else { return [] }
-        let startTicks = ticks(from - Self.lookback, l), endTicks = ticks(to, l)
-        let found: [SubtitleCue]
-        if let index = try await loadCueIndex(l) {
-            found = try await scanIndexed(index, track: track, startTicks: startTicks, endTicks: endTicks, l)
-        } else {
-            found = try await scanSequentially(track: track, startTicks: startTicks, endTicks: endTicks, l)
-        }
-        var result = found.filter { $0.end > from && $0.start <= to }
+        guard let (t, found) = try await scan(track: track, from: from, to: to) else { return [] }
+        var result = found.filter { !$0.text.isEmpty && $0.end > from && $0.start <= to }
         if t.info.format == .ass { result = ASSScript.mergeSimultaneous(result) }
         return SubtitleParser.sorted(result)
+    }
+
+    /// Every event of an ASS track overlapping [from, to] seconds as it is stored (`raw`: ReadOrder, Layer, Style,
+    /// Name, MarginL, MarginR, MarginV, Effect, Text), signs and songs included, for libass to draw. Sorted by start.
+    public func assEvents(track: Int, from: Double, to: Double) async throws -> [SubtitleCue] {
+        guard let (t, found) = try await scan(track: track, from: from, to: to), t.info.format == .ass else { return [] }
+        return found.filter { $0.raw != nil && $0.end > from && $0.start <= to }.sorted { $0.start < $1.start }
+    }
+
+    /// The CodecPrivate of an ASS track as text: the script's [Script Info], styles and the events' Format line.
+    public func assScriptHeader(track: Int) async throws -> String? {
+        let l = try await loadLayout()
+        guard let t = l.tracks[track], t.info.format == .ass, !t.codecPrivate.isEmpty else { return nil }
+        return String(decoding: t.codecPrivate, as: UTF8.self)
+    }
+
+    private func scan(track: Int, from: Double, to: Double) async throws -> (Track, [SubtitleCue])? {
+        let l = try await loadLayout()
+        guard let t = l.tracks[track], to >= from else { return nil }
+        let startTicks = ticks(from - Self.lookback, l), endTicks = ticks(to, l)
+        if let index = try await loadCueIndex(l) {
+            return (t, try await scanIndexed(index, track: track, startTicks: startTicks, endTicks: endTicks, l))
+        }
+        return (t, try await scanSequentially(track: track, startTicks: startTicks, endTicks: endTicks, l))
     }
 
     /// The script header of an ASS track (resolution and styles); nil for other tracks.
@@ -596,19 +612,23 @@ public actor MatroskaSubtitleReader {
         let start = Double(clusterTime + Int64(relative)) * l.scale / 1e9
         let end = duration.map { start + Double($0) * l.scale / 1e9 } ?? start + Self.defaultDuration
         let text = SubtitleText.normalizeNewlines(String(decoding: frame, as: UTF8.self))
-        let cue: SubtitleCue?
+        var cue: SubtitleCue?
         switch track.info.format {
         case .srt: cue = SubtitleCue(start: start, end: end, text: SubtitleMarkup.plainSRT(text))
         case .vtt: cue = SubtitleCue(start: start, end: end, text: SubtitleMarkup.plainVTT(text))
         case .ass:
             let fields = text.split(separator: ",", maxSplits: 8, omittingEmptySubsequences: false)
             if fields.count == 9 {
+                // Signs and songs have no dialogue text but are kept, with the event as stored, for libass.
+                let style = fields[2].trimmingCharacters(in: .whitespaces)
                 cue = ASSScript.cue(start: start, end: end, style: fields[2], text: fields[8])
+                    ?? SubtitleCue(start: start, end: end, text: "", style: style.isEmpty ? nil : style)
             } else {
                 cue = SubtitleCue(start: start, end: end, text: SubtitleMarkup.plainASS(text))
             }
+            cue?.raw = String(decoding: frame, as: UTF8.self)
         }
-        guard let c = cue, !c.text.isEmpty else { return nil }
+        guard let c = cue, !c.text.isEmpty || c.raw != nil else { return nil }
         return (track.info.number, c)
     }
 

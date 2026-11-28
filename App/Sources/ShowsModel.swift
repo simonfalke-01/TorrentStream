@@ -116,6 +116,8 @@ final class ShowsModel: ObservableObject {
     @Published private(set) var scheduleFailed = false
     /// When each show was added to My List, by root id.
     @Published private(set) var addedAt: [Int: Date] = [:]
+    /// MyAnimeList's rating of each show, by root id, once looked up.
+    @Published private(set) var ratings: [Int: ContentRating] = [:]
 
     private unowned let app: AppModel
     /// Episodes kept on the device, which play from there.
@@ -136,6 +138,9 @@ final class ShowsModel: ObservableObject {
     private var rowsFetchedAt: Date?
     private var scheduleFetchedAt: Date?
     private var skipCache: [String: [SkipSegment]] = [:]
+    /// Shows with no rating to find, this session, and ones being looked up.
+    private var unrated: Set<Int> = []
+    private var ratingLookups: Set<Int> = []
     private var detailsTasks: [Int: Task<ShowDetails, Error>] = [:]
     /// Shows whose episode names and stills were looked up this session, so a cached copy gets them once.
     private var enriched: Set<Int> = []
@@ -159,6 +164,8 @@ final class ShowsModel: ObservableObject {
         var roots: [String: Int] = [:]
         var addedAt: [String: Date]? = nil
         var planned: [String: PlannedSource]? = nil
+        /// Root id to `ContentRating` raw value; unknown values are dropped on reading.
+        var ratings: [String: String]? = nil
     }
 
     private struct SavedRows: Codable {
@@ -265,6 +272,32 @@ final class ShowsModel: ObservableObject {
         return list
     }
 
+    /// The rating a show's page shows: AniList's adult flag, else MyAnimeList's rating once looked up.
+    func contentRating(_ show: Show) -> ContentRating? {
+        let root = rootID(show)
+        return ContentRating.shown(mal: ratings[root], isAdult: details[root]?.show.isAdult ?? show.isAdult)
+    }
+
+    /// Looks up MyAnimeList's rating of a show whose page is open, once. Nothing waits on it; when the services are
+    /// busy or unreachable it's tried again the next time the page opens.
+    func loadContentRating(_ show: Show) async {
+        let root = rootID(show)
+        let main = details[root]?.show ?? show
+        // An adult show is shown as 18+ whatever MyAnimeList says.
+        guard main.isAdult != true, ratings[root] == nil, !unrated.contains(root), ratingLookups.insert(root).inserted else { return }
+        defer { ratingLookups.remove(root) }
+        do {
+            if let rating = try await catalog.contentRating(malID: main.malID, anilistID: root) {
+                ratings[root] = rating
+                save()
+            } else {
+                unrated.insert(root)
+            }
+        } catch {
+            // Tried again next time.
+        }
+    }
+
     /// Seasons and episodes. A copy from memory or disk is returned at once unless an episode has aired since it
     /// was fetched; an old copy is then refreshed in the background (the page updates when it arrives). A stale
     /// copy is also returned when the catalog can't be reached.
@@ -272,7 +305,8 @@ final class ShowsModel: ObservableObject {
     func loadDetails(_ show: Show, force: Bool = false) async throws -> ShowDetails {
         let root = rootID(show)
         if !force, let d = cachedDetails(show), !Self.hasAiredSinceFetch(d) {
-            if !isFresh(d) {
+            // Copies saved before tags were read get them in the background.
+            if !isFresh(d) || d.show.tags == nil {
                 refreshDetails(show)
             } else if !enriched.contains(root), Self.missesEpisodeInfo(d) {
                 Task { await enrich(d) }
@@ -1045,6 +1079,7 @@ final class ShowsModel: ObservableObject {
         s.roots = Dictionary(uniqueKeysWithValues: roots.map { (String($0.key), $0.value) })
         s.addedAt = Dictionary(uniqueKeysWithValues: addedAt.map { (String($0.key), $0.value) })
         s.planned = planned.filter { Date().timeIntervalSince($0.value.at) < Self.planLifetime }
+        s.ratings = Dictionary(uniqueKeysWithValues: ratings.map { (String($0.key), $0.value.rawValue) })
         if let data = try? JSONEncoder().encode(s) { try? data.write(to: stateURL, options: .atomic) }
     }
 
@@ -1058,6 +1093,10 @@ final class ShowsModel: ObservableObject {
             roots = Dictionary(uniqueKeysWithValues: s.roots.compactMap { k, v in Int(k).map { ($0, v) } })
             addedAt = Dictionary(uniqueKeysWithValues: (s.addedAt ?? [:]).compactMap { k, v in Int(k).map { ($0, v) } })
             planned = (s.planned ?? [:]).filter { Date().timeIntervalSince($0.value.at) < Self.planLifetime }
+            ratings = Dictionary(uniqueKeysWithValues: (s.ratings ?? [:]).compactMap { k, v -> (Int, ContentRating)? in
+                guard let id = Int(k), let rating = ContentRating(rawValue: v) else { return nil }
+                return (id, rating)
+            })
         }
         if let data = try? Data(contentsOf: rowsURL), let r = try? JSONDecoder().decode(SavedRows.self, from: data) {
             rows = r.rows

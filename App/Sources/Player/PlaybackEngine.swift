@@ -132,6 +132,13 @@ final class PlaybackEngine: ObservableObject {
     var streamPort: (() -> UInt16)?
     /// The streaming listener's generation; a stream opened under an older one is dead.
     var streamGeneration: (() -> Int)?
+    /// Whether the bytes for the next few seconds from a time are downloaded; nil while that isn't known.
+    var hasDataAt: ((Double) -> Bool?)?
+    /// Recovery from playback that says it plays but doesn't move: 1 re-seeked, 2 reopened.
+    private var stallStep = 0
+    private var stallActedAt = Date.distantPast
+    /// Since when standing still would count as a stall: a play or a reopen starts the count again.
+    private var stallFrom = Date()
     private var openedGeneration = 0
     private let player: VLCMediaPlayer
     private var url: URL
@@ -405,7 +412,7 @@ final class PlaybackEngine: ObservableObject {
         ticks += 1
         let state = player.state
         let t = player.time.intValue
-        if t != lastTime { lastTime = t; lastChange = Date() }
+        if t != lastTime { lastTime = t; lastChange = Date(); stallStep = 0 }
         let idle = Date().timeIntervalSince(lastChange)
         if state != lastState {
             lastState = state
@@ -428,6 +435,7 @@ final class PlaybackEngine: ObservableObject {
                 player.pause()
             } else if current && (state == .playing || state == .paused) {
                 restarting = false
+                stallFrom = Date()
                 if reapplyDelays {
                     reapplyDelays = false
                     player.currentVideoSubTitleDelay = Int(subtitleDelay * 1_000_000)
@@ -476,6 +484,7 @@ final class PlaybackEngine: ObservableObject {
 
         let playing = player.isPlaying
         if checkPlayRequest(playing: playing, state: state, time: t) { return }
+        if checkStall(playing: playing, state: state, idle: idle) { return }
         // What the controls show: what was asked for until libVLC catches up, else what libVLC reports.
         var shown = playing
         if restarting { shown = !restartPaused } else if playRequest != nil { shown = true }
@@ -570,6 +579,32 @@ final class PlaybackEngine: ObservableObject {
             playRequest = nil
         }
         return false
+    }
+
+    /// Playback that says it plays while its time stands still, with the bytes it needs already here: libVLC's
+    /// input can stay wedged like that after the video comes back from the background or a seek, and pause and
+    /// play don't free it; a seek does. Seeks to the spot first, then reopens the stream there. True if it reopened.
+    private func checkStall(playing: Bool, state: VLCMediaPlayerState, idle: TimeInterval) -> Bool {
+        guard wantsToPlay, hasPlayed, !restarting, !didFinish, playing || state == .playing || isPlaying,
+              stallStep < 2, duration > 0, Date().timeIntervalSince(stallActedAt) > 4 else { return false }
+        let still = min(idle, Date().timeIntervalSince(stallFrom))
+        guard still > 3 else { return false }
+        let here = hasDataAt?(currentTime)
+        // Waiting on the swarm is a wait, not a wedge: one nudge at most.
+        guard still > (here == true ? 3 : 10), here == true || stallStep == 0 else { return false }
+        stallStep += 1
+        stallActedAt = Date()
+        let at = seekTarget ?? currentTime
+        if stallStep == 1 {
+            PlaybackTrace.shared.mark(String(format: "stalled at %.1fs for %.1fs (data %@); seeking to the spot",
+                                             at, still, here == true ? "here" : here == false ? "missing" : "unknown"))
+            move(to: at, fast: false)
+            markSeek(at)
+            return false
+        }
+        PlaybackTrace.shared.mark(String(format: "still stalled at %.1fs; reopening", at))
+        restart(from: at)
+        return true
     }
 
     /// The picture can freeze while the sound plays on: the display layer fails (a failed layer drops every
@@ -696,6 +731,7 @@ final class PlaybackEngine: ObservableObject {
     func play() {
         if didFinish { replay(); return }
         wantsToPlay = true
+        stallFrom = Date()
         activateAudioSession()
         pauseRequestedAt = nil
         resumeAfterInterruption = false

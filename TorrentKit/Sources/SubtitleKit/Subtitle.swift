@@ -7,12 +7,15 @@ public struct SubtitleCue: Hashable, Sendable {
     public var text: String
     /// The ASS style the line is drawn in, by name (nil for SRT and WebVTT).
     public var style: String?
+    /// For an ASS event read from Matroska, the event as stored, which libass takes as it is.
+    public var raw: String?
 
-    public init(start: Double, end: Double, text: String, style: String? = nil) {
+    public init(start: Double, end: Double, text: String, style: String? = nil, raw: String? = nil) {
         self.start = start
         self.end = end
         self.text = text
         self.style = style
+        self.raw = raw
     }
 }
 

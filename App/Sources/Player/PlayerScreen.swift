@@ -112,6 +112,10 @@ private struct PlayerContainer: View {
                 return client.streamingPort
             }
             e.streamGeneration = { [client = model.client] in client.streamingServerGeneration }
+            e.hasDataAt = { [weak p, torrent = request.torrent, index = request.file.index] t in
+                guard let r = p?.bytes(from: t, to: t + 4, limit: 48 << 20) else { return nil }
+                return torrent.hasData(fileIndex: index, offset: r.lowerBound, length: r.upperBound - r.lowerBound)
+            }
             e.start()
             e.showOnTV(ExternalDisplay.shared.isConnected)
             secondary.prepare(request)
@@ -375,6 +379,7 @@ private struct PlayerChrome: View {
             secondary.update(time: engine.currentTime)
             carried.update(time: engine.currentTime)
         }
+        .onChange(of: engine.videoSize, initial: true) { _, size in carried.videoSize = size }
         .onChange(of: engine.landing, initial: true) { _, landing in carrySubtitle(landing) }
         .onChange(of: engine.currentSubtitle) {
             // The track libVLC chose as the file opened: the line at the spot is that track's.
@@ -469,10 +474,21 @@ private struct PlayerChrome: View {
         let fit = v.width > 0 && v.height > 0 ? min(size.width / v.width, size.height / v.height) : 1
         let pictureHeight = (v.height > 0 ? v.height * fit : size.height) * zoom
         let pictureWidth = (v.width > 0 ? v.width * fit : size.width) * zoom
-        if let style = line.style, line.playRes.height > 0 {
+        let pictureX = (size.width - pictureWidth) / 2
+        let pictureY = (size.height - pictureHeight) / 2
+        if let drawn = line.picture, drawn.frame.width > 0, drawn.frame.height > 0 {
+            // Drawn by libass for the video frame, as libVLC draws it: placed on the picture as it is on screen.
+            let sx = pictureWidth / drawn.frame.width
+            let sy = pictureHeight / drawn.frame.height
+            Image(decorative: drawn.image, scale: 1)
+                .resizable()
+                .frame(width: drawn.rect.width * sx, height: drawn.rect.height * sy)
+                .offset(x: pictureX + drawn.rect.minX * sx, y: pictureY + drawn.rect.minY * sy)
+                .frame(width: size.width, height: size.height, alignment: .topLeading)
+                .allowsHitTesting(false)
+        } else if let style = line.style, line.playRes.height > 0 {
             StyledSubtitleLine(text: line.text, style: style, playRes: line.playRes,
-                               picture: CGRect(x: (size.width - pictureWidth) / 2, y: (size.height - pictureHeight) / 2,
-                                               width: pictureWidth, height: pictureHeight))
+                               picture: CGRect(x: pictureX, y: pictureY, width: pictureWidth, height: pictureHeight))
                 .frame(width: size.width, height: size.height)
                 .allowsHitTesting(false)
         } else {

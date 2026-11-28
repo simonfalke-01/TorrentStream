@@ -34,13 +34,16 @@ public struct Show: Codable, Hashable, Identifiable, Sendable {
     public var nextAiringAt: Date?
     /// AniList's adult flag, once read from AniList. Its releases are also on Sukebei.
     public var isAdult: Bool?
+    /// AniList's tags, read with a show's details. Nil when not read yet, as in lists and copies saved before tags.
+    public var tags: [ShowTag]?
 
     public init(id: Int, title: String, malID: Int? = nil, romaji: String? = nil, english: String? = nil,
                 synonyms: [String] = [], format: String? = nil, status: String? = nil, episodes: Int? = nil,
                 duration: Int? = nil, year: Int? = nil, score: Int? = nil, overview: String? = nil, genres: [String] = [],
                 posterURL: URL? = nil, bannerURL: URL? = nil, nextEpisode: Int? = nil, nextAiringAt: Date? = nil,
-                isAdult: Bool? = nil) {
+                isAdult: Bool? = nil, tags: [ShowTag]? = nil) {
         self.isAdult = isAdult
+        self.tags = tags
         self.id = id
         self.title = title
         self.malID = malID
@@ -61,6 +64,9 @@ public struct Show: Codable, Hashable, Identifiable, Sendable {
         self.nextAiringAt = nextAiringAt
     }
 
+    /// Tags worth listing on the show's page.
+    public var listedTags: [ShowTag] { ShowTag.listed(tags ?? [], adultShow: isAdult == true) }
+
     public var isMovie: Bool { format == "MOVIE" }
     public var isAiring: Bool { status == "RELEASING" }
     public var isUpcoming: Bool { status == "NOT_YET_RELEASED" }
@@ -76,6 +82,40 @@ public struct Show: Codable, Hashable, Identifiable, Sendable {
         if isUpcoming { return 0 }
         if isAiring, let next = nextEpisode { return max(0, next - 1) }
         return episodes ?? (isMovie ? 1 : 0)
+    }
+}
+
+/// An AniList tag: a theme, setting or trait of a show, ranked by how strongly it applies.
+public struct ShowTag: Codable, Hashable, Sendable {
+    public var name: String
+    /// 0...100.
+    public var rank: Int
+    /// Gives away part of the story.
+    public var isSpoiler: Bool
+    /// Describes sexual content.
+    public var isAdult: Bool
+
+    public init(name: String, rank: Int, isSpoiler: Bool = false, isAdult: Bool = false) {
+        self.name = name
+        self.rank = rank
+        self.isSpoiler = isSpoiler
+        self.isAdult = isAdult
+    }
+
+    /// Tags ranked below this barely apply.
+    public static let minimumRank = 50
+    public static let listLimit = 8
+
+    /// What a show's page lists: no spoilers, adult tags only for adult shows, nothing that barely applies,
+    /// strongest first, each name once.
+    public static func listed(_ tags: [ShowTag], adultShow: Bool, limit: Int = listLimit) -> [ShowTag] {
+        var seen = Set<String>()
+        let kept = tags.enumerated().filter { _, t in
+            !t.isSpoiler && (adultShow || !t.isAdult) && t.rank >= minimumRank && seen.insert(t.name.lowercased()).inserted
+        }
+        return Array(kept.sorted { a, b in
+            a.element.rank != b.element.rank ? a.element.rank > b.element.rank : a.offset < b.offset
+        }.map(\.element).prefix(max(0, limit)))
     }
 }
 
@@ -191,7 +231,7 @@ public struct ShowRow: Codable, Hashable, Identifiable, Sendable {
 
 /// Anime shows and movies from AniList: browse rows, search, and seasons with their episodes.
 public final class ShowCatalog: @unchecked Sendable {
-    private let session: URLSession
+    let session: URLSession
     let skipCache = SkipTimesCache()
     private static let endpoint = URL(string: "https://graphql.anilist.co")!
     /// Formats that make up the seasons of a show.
@@ -206,6 +246,9 @@ public final class ShowCatalog: @unchecked Sendable {
     title { romaji english } synonyms description(asHtml: false) genres \
     coverImage { extraLarge large } bannerImage nextAiringEpisode { episode airingAt } startDate { year }
     """
+
+    /// `fields` and the tags a show's page lists, for the entries that make up its seasons.
+    static let detailFields = "\(fields) tags { name rank isAdult isGeneralSpoiler isMediaSpoiler }"
 
     /// Rows for the home screen.
     public func browse(now: Date = Date()) async throws -> [ShowRow] {
@@ -581,7 +624,7 @@ public final class ShowCatalog: @unchecked Sendable {
 
     /// An entry with what it links to (for walking seasons) and its streaming episode list.
     private static let nodeFields = """
-    \(fields) streamingEpisodes { title thumbnail } \
+    \(detailFields) streamingEpisodes { title thumbnail } \
     relations { edges { relationType node { id format status nextAiringEpisode { airingAt } startDate { year month day } } } }
     """
 
@@ -591,7 +634,7 @@ public final class ShowCatalog: @unchecked Sendable {
         let query = """
         query ($id: Int) {
           m: Media(id: $id, type: ANIME) {
-            \(Self.fields)
+            \(Self.detailFields)
             streamingEpisodes { title thumbnail }
             relations { edges { relationType node { \(Self.nodeFields) } } }
           }
@@ -861,8 +904,18 @@ public final class ShowCatalog: @unchecked Sendable {
             bannerURL: (m["bannerImage"] as? String).flatMap(URL.init(string:)),
             nextEpisode: next?["episode"] as? Int,
             nextAiringAt: (next?["airingAt"] as? Int).map { Date(timeIntervalSince1970: TimeInterval($0)) },
-            isAdult: m["isAdult"] as? Bool
+            isAdult: m["isAdult"] as? Bool,
+            tags: (m["tags"] as? [[String: Any]]).map(tags)
         )
+    }
+
+    /// AniList tags as read, spoilers marked rather than dropped.
+    static func tags(_ list: [[String: Any]]) -> [ShowTag] {
+        list.compactMap { t in
+            guard let name = (t["name"] as? String)?.trimmingCharacters(in: .whitespaces), !name.isEmpty else { return nil }
+            let spoiler = t["isGeneralSpoiler"] as? Bool == true || t["isMediaSpoiler"] as? Bool == true
+            return ShowTag(name: name, rank: integer(t["rank"]) ?? 0, isSpoiler: spoiler, isAdult: t["isAdult"] as? Bool == true)
+        }
     }
 
     static func isLatin(_ s: String) -> Bool {

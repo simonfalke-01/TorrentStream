@@ -134,15 +134,19 @@ final class SecondarySubtitles: ObservableObject {
 /// one. The app draws that line itself, from the same track, until it ends.
 @MainActor
 final class CarriedSubtitle: ObservableObject {
-    /// What to draw: the text, and for an ASS track the style libVLC draws it in, so the line looks the same.
+    /// What to draw. For an ASS track, `picture` is the line as libass draws it (as libVLC does); without libass,
+    /// `style` is the style to draw `text` in.
     struct Line: Equatable {
         let text: String
         let style: ASSStyle?
         /// The script's coordinate space (PlayResX, PlayResY), which the style's sizes are in.
         let playRes: CGSize
+        var picture: ASSPicture?
     }
 
     @Published private(set) var line: Line?
+    /// The video's size in pixels, the frame libVLC draws subtitles for.
+    var videoSize: CGSize = .zero
 
     private static let tag = "player.subtitle.carry"
     private var reader: MatroskaSubtitleReader?
@@ -151,6 +155,10 @@ final class CarriedSubtitle: ObservableObject {
     private var cues: [SubtitleCue] = []
     private var header: ASSHeader?
     private var headers: [Int: ASSHeader] = [:]
+    private var renderer: ASSRenderer?
+    private var renderers: [Int: ASSRenderer] = [:]
+    private var fonts: [(name: String, data: Data)]?
+    private var renders = 0
     private var task: Task<Void, Never>?
     private var time: Double = 0
     private var landedAt: Double?
@@ -166,11 +174,17 @@ final class CarriedSubtitle: ObservableObject {
         }
         self.reader = reader
         // The fonts the styles name come with the file, near its start; libVLC reads them from the same place.
-        Task.detached(priority: .utility) {
+        Task.detached(priority: .utility) { [weak self] in
             for _ in 0..<30 {
                 if Task.isCancelled { return }
                 do {
-                    SubtitleFonts.add(try await reader.fonts().map(\.data))
+                    let found = try await reader.fonts()
+                    SubtitleFonts.add(found.map(\.data))
+                    await MainActor.run {
+                        guard let self else { return }
+                        self.fonts = found
+                        for r in self.renderers.values { r.add(fonts: found) }
+                    }
                     return
                 } catch MatroskaError.dataUnavailable {
                     try? await Task.sleep(for: .seconds(2))
@@ -197,25 +211,37 @@ final class CarriedSubtitle: ObservableObject {
         task?.cancel()
         task = nil
         cues = []
+        renders += 1
         if line != nil { line = nil }
         torrent?.clearWants(tag: Self.tag)
         landedAt = time
         guard let track, let reader, keyframe <= time + 0.05 else { return }
         if let bytes, let torrent { torrent.want(fileIndex: fileIndex, ranges: [bytes], urgency: .soon, tag: Self.tag) }
         header = headers[track]
+        renderer = renderers[track]
         task = Task { [weak self] in
             if self?.header == nil, let h = try? await reader.assHeader(track: track) {
                 guard !Task.isCancelled, let self else { return }
                 self.headers[track] = h
                 self.header = h
             }
+            if self?.renderer == nil, ASSRenderer.isAvailable, let script = try? await reader.assScriptHeader(track: track),
+               let made = ASSRenderer(header: script) {
+                guard !Task.isCancelled, let self else { return }
+                if let fonts = self.fonts { made.add(fonts: fonts) }
+                self.renderers[track] = made
+                self.renderer = made
+            }
             // Lines last a few seconds; past that there's nothing left to carry.
             for _ in 0..<10 {
-                let found = (try? await reader.cues(track: track, from: time - delay, to: time - delay)) ?? []
+                // With libass, every event as stored, signs included, as libVLC would have drawn them.
+                let libass = self?.renderer != nil
+                let found = (try? await (libass ? reader.assEvents(track: track, from: time - delay, to: time - delay)
+                                                : reader.cues(track: track, from: time - delay, to: time - delay))) ?? []
                 guard !Task.isCancelled, let self else { return }
                 let carried = found
                     .filter { $0.start + delay < keyframe - 0.05 && $0.end + delay > time }
-                    .map { SubtitleCue(start: $0.start + delay, end: $0.end + delay, text: $0.text, style: $0.style) }
+                    .map { SubtitleCue(start: $0.start + delay, end: $0.end + delay, text: $0.text, style: $0.style, raw: $0.raw) }
                 if !carried.isEmpty || found.contains(where: { $0.start + delay >= keyframe - 0.05 }) {
                     self.torrent?.clearWants(tag: Self.tag)
                     self.cues = carried
@@ -235,20 +261,39 @@ final class CarriedSubtitle: ObservableObject {
         // Moved back before the spot without a landing (a reopen still on its way): the line no longer belongs.
         if let at = landedAt, time < at - 1 { cues = [] }
         let now = cues.filter { $0.start <= time && time < $0.end }
-        var next: Line?
-        if let first = now.first {
-            let style = header?.style(named: first.style)
-            let res = header.map { CGSize(width: $0.playResX, height: $0.playResY) } ?? .zero
-            next = Line(text: now.map(\.text).joined(separator: "\n"), style: style, playRes: res)
+        if now.isEmpty {
+            renders += 1
+            if line != nil { line = nil }
+            if cues.allSatisfy({ $0.end <= time }) { cues = [] }
+            return
         }
-        if next != line { line = next }
-        if next == nil, cues.allSatisfy({ $0.end <= time }) { cues = [] }
+        let text = now.map(\.text).filter { !$0.isEmpty }.joined(separator: "\n")
+        let style = header?.style(named: now.first { !$0.text.isEmpty }?.style)
+        let res = header.map { CGSize(width: $0.playResX, height: $0.playResY) } ?? .zero
+        guard let renderer, now.contains(where: { $0.raw != nil }) else {
+            let next = text.isEmpty ? nil : Line(text: text, style: style, playRes: res)
+            if next != line { line = next }
+            return
+        }
+        renders += 1
+        let ticket = renders
+        let frame = videoSize.width > 0 && videoSize.height > 0 ? videoSize : CGSize(width: 1920, height: 1080)
+        renderer.render(events: now, at: time, frame: frame) { [weak self] picture in
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guard let self, self.renders == ticket else { return }
+                    let next = picture.map { Line(text: text, style: style, playRes: res, picture: $0) }
+                    if next != self.line { self.line = next }
+                }
+            }
+        }
     }
 
     func clear() {
         task?.cancel()
         task = nil
         cues = []
+        renders += 1
         if line != nil { line = nil }
         torrent?.clearWants(tag: Self.tag)
     }
